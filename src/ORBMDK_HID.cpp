@@ -371,8 +371,6 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
         return -1;
     }
 
-    HidTrace("DAPCommand: cmd=0x%02X outLen=%zu (V1 HID)", cmd[0], cmdLen);
-
     // 上限必须是**实际输出缓冲区**的大小，不是 DAP_BUFFER_SIZE(512)：
     // reportOut 只有 HID_MAX_PACKET_SIZE(65) 字节，下一行的
     // memcpy(&reportOut[1], cmd, cmdLen) 在 cmdLen ∈ [65, 511] 时会栈溢出。
@@ -457,10 +455,6 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
             LOG_HID_DEBUG("HID response report ID = 0x%02X (expected 0x%02X)",
                           reportIn[0], CMD_REPORT_ID);
         }
-        HidTrace("DAPCommand: cmd=0x%02X -> resp %zu bytes [%02X %02X %02X %02X]",
-                 cmd[0], copyLen,
-                 (copyLen > 0) ? reportIn[0] : 0, (copyLen > 1) ? reportIn[1] : 0,
-                 (copyLen > 2) ? reportIn[2] : 0, (copyLen > 3) ? reportIn[3] : 0);
     }
 
     return 0;
@@ -661,7 +655,11 @@ int DAP_TransferBlock(int dapId, uint16_t count, uint8_t request,
         cmd.insert(cmd.end(), data, data + count * 4);
     }
 
-    uint8_t resp[64 * 4 + 4] = {};
+    // 响应缓冲按**最大可能的块传输**开：V2 Bulk 一次往返可带 ~250 字
+    // （5 + 250*4 = 1005 字节），旧值 64*4+4=260 会把 V2 的块传输截断到
+    // 63 字，白白浪费了 Bulk 的大包能力。V1 HID 下命令长度本身被下面的
+    // HID_MAX_PACKET_SIZE 校验挡住，缓冲开大无副作用。
+    uint8_t resp[1024] = {};
     size_t respLen = sizeof(resp);
 
     int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 5000);

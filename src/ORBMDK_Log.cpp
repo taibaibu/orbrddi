@@ -21,10 +21,13 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <share.h>   // _fsopen / _SH_DENYNO（共享模式常驻句柄）
 
 namespace {
 
-const char* const kLevelName[]       = { "DEBUG", "INFO", "WARN", "ERROR", "NONE" };
+/* 顺序必须与 ORBMDK_LogLevel 一一对应（按 level 直接索引） */
+const char* const kLevelName[]       = { "DEBUG", "INFO", "TESTSPEED", "VERBOSE",
+                                         "REV1", "REV2", "REV3", "WARN", "ERROR", "NONE" };
 const char* const kEnvLevel          = "ORBMDK_LOG_LEVEL";
 const char* const kEnvFile           = "ORBMDK_LOG_FILE";
 const char* const kLevelFileName     = "ORBMDK_LOG_LEVEL";
@@ -36,6 +39,8 @@ bool        g_levelForced  = false;       // SetLevel 之后不再读文件/环�
 ULONGLONG   g_levelStamp   = 0;
 std::string g_filePath;
 bool        g_filePathResolved = false;
+FILE*       g_file         = nullptr;  // 常驻句柄：开一次、追加多行（不再逐行开/关）
+std::string g_fileOpenFor;             // g_file 当前对应的路径（路径变了要重开）
 ORBMDK_LogSinkFn g_sink    = nullptr;
 void*       g_sinkContext  = nullptr;
 
@@ -118,9 +123,26 @@ const std::string& _filePath()
 }
 
 /**
- * 追加一行并**立即关闭**：宿主 µVision 会独占日志文件，
- * 不关句柄的话外部诊断工具读不到（历史问题，别再改回长持有）。
+ * 追加一行到**常驻句柄**。
+ *
+ * 历史实现是"每行 fopen + fputs + fclose"（理由是宿主 µVision 会独占日志文件，
+ * 不关句柄外部诊断工具读不到）。代价太大：性能诊断开启时每秒几十条，每次
+ * open/close 都要走一遍文件系统（%TEMP% 上还有杀软实时扫描），实测能把整段
+ * 烧录时间的一大半算到"测量"自己头上 —— 测量本身成了被测对象。
+ *
+ * 现在改成**共享模式常驻句柄**（_fsopen + _SH_DENYNO）：外部工具在宿主运行
+ * 期间照样能打开读取，而进程内只开一次。每行仍 fflush，保证外部读到的是
+ * 最新内容、异常退出也不丢已经写进去的内容。
  */
+void _closeFile()
+{
+    if (g_file) {
+        fclose(g_file);
+        g_file = nullptr;
+    }
+    g_fileOpenFor.clear();
+}
+
 void _appendLine(const char* line)
 {
     const std::string& path = _filePath();
@@ -128,13 +150,18 @@ void _appendLine(const char* line)
         return;
     }
 
-    FILE* f = nullptr;
-    if (fopen_s(&f, path.c_str(), "a") != 0 || !f) {
-        return;
+    if (!g_file || g_fileOpenFor != path) {
+        _closeFile();
+        g_file = _fsopen(path.c_str(), "a", _SH_DENYNO);
+        if (!g_file) {
+            return;
+        }
+        g_fileOpenFor = path;
     }
-    fputs(line, f);
-    fputc('\n', f);
-    fclose(f);
+
+    fputs(line, g_file);
+    fputc('\n', g_file);
+    fflush(g_file);      // 立即可见：外部工具随读随到
 }
 
 /** 统一格式化：[ORBMDK][时间][级别][模块][pid:tid] 消息（超长显式标记截断） */
@@ -205,21 +232,51 @@ void ORBMDK_LogWrite(int level, const char* module, const char* fmt, ...)
         sinkContext = g_sinkContext;
     }
 
-    // 锁外输出：宿主的日志回调很可能再调回本模块，锁内调用会自锁。
-    printf("%s\n", line.c_str());
-    OutputDebugStringA(line.c_str());
-
+    // 只送宿主回调，且在**锁外**调用（回调很可能再调回本模块，锁内会自锁）。
+    //
+    // 这里不再 printf / OutputDebugStringA：诊断开启时日志是高频的，每行都往
+    // 控制台和 DebugView 送一遍，"把文本送出去"本身就能吃掉可观的时间（UV4 里
+    // 还会连带触发宿主 UI 刷新）。要看文本就读日志文件 / 用 DebugView 挂别的进程。
     if (sink) {
         sink(sinkContext, line.c_str(), level);
     }
+}
+
+/**
+ * 只落日志文件：不送 stdout / DebugView / 宿主回调（见头文件说明）。
+ */
+void ORBMDK_LogWriteFileOnly(int level, const char* module, const char* fmt, ...)
+{
+    if (level < ORBMDK_LOG_DEBUG || level > ORBMDK_LOG_ERROR) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    if (level < _resolveLevel()) {
+        return;                            // ★ 过滤在格式化之前，零开销
+    }
+
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    _format(buf, sizeof(buf), level, module, fmt, args);
+    va_end(args);
+
+    _appendLine(buf);
 }
 
 void ORBMDK_LogTrace(const char* module, const char* fmt, ...)
 {
     std::lock_guard<std::mutex> guard(g_lock);
 
-    // 命令级日志：不参与级别过滤（排障线索），只落文件。
-    // 级别显示为 INFO，与历史格式（[ORBMDK][INFO][BULK] ...）兼容。
+    // 命令级日志：**同样受级别阈值约束** —— 低于阈值直接丢弃（格式化之前返回，零开销）。
+    // 级别显示为 INFO，与历史格式（[ORBMDK][INFO][BULK] ...）兼容，因此只有阈值设为
+    // INFO/DEBUG 时才输出；默认 ERROR 下完全不落盘（此前无条件落盘是日志膨胀的主因）。
+    if (ORBMDK_LOG_INFO < _resolveLevel()) {
+        return;
+    }
+
     char buf[1024];
     va_list args;
     va_start(args, fmt);
@@ -252,6 +309,7 @@ void ORBMDK_LogSetFile(const char* path)
         g_filePath.clear();
         g_filePathResolved = false;        // 空 = 下次重新解析（回到默认路径）
     }
+    _closeFile();                          // 路径变了：下次写入按新路径重开
 }
 
 void ORBMDK_LogSetCallback(ORBMDK_LogSinkFn fn, void* context)
@@ -268,6 +326,6 @@ void ORBMDK_LogShutdown(void)
     g_sink = nullptr;
     g_sinkContext = nullptr;
 
-    // 文件是"写后即关"，没有需要 fclose 的常驻句柄；这里保留统一收尾入口，
-    // 由 DllMain(DLL_PROCESS_DETACH) 调用（宿主可随时卸载本 DLL）。
+    // 常驻句柄必须在这里关闭：宿主会随时卸载本 DLL，句柄要跟着走。
+    _closeFile();
 }

@@ -32,7 +32,8 @@ using namespace ORBMDK;
 //   —— 它们与 ORBMDK_HID.cpp 的 HID_Log 是两套逻辑重复的实现（§8.2）。
 //
 // 排障开关（对所有模块一致，免重启、免命令行）：
-//   %TEMP%\ORBMDK_LOG_LEVEL   0=DEBUG 1=INFO 2=WARN 3=ERROR（最多 1 秒生效）
+//   %TEMP%\ORBMDK_LOG_LEVEL   0=DEBUG 1=INFO 2=TESTSPEED 3=VERBOSE 4=REV1
+//                             5=REV2 6=REV3 7=WARN 8=ERROR（最多 1 秒生效）
 //   环境变量 ORBMDK_LOG_LEVEL / ORBMDK_LOG_FILE（进程启动读一次，文件优先）
 // ============================================================================
 #define ORBMDK_LOG_MODULE "RDDI"
@@ -109,6 +110,11 @@ static constexpr int kSingleDapId    = 0;
 // 上限同时受 ORBMDK_HID_DAPCommand 的长度校验约束（见 ORBMDK_HID.cpp）。
 static constexpr int kMaxBlockWords = 14;
 
+// V2 Bulk 下单次块传输的字数**硬上限**。仅受 ORBMDK_HID.cpp 的 DAP_TransferBlock
+// 内部 1024 字节响应缓冲约束（(1024 - 5) / 4 = 254），取 250 留裕量。
+// 实际字数由 BlockWordsLimit() 按当前出包长度动态决定，不固定用它。
+static constexpr int kMaxBlockWordsHardLimit = 250;
+
 // 块传输总开关，**默认开启**，实际是否使用由运行时自动探测决定。
 //
 // 背景：DAP_RegWriteRepeat / DAP_RegReadRepeat 原先逐字调用 DAP_Transfer，
@@ -133,6 +139,33 @@ static bool BlockTransferEnabled()
         return true;                // 默认开启，由自动探测决定实际路径
     }();
     return enabled;
+}
+
+// ---------------------------------------------------------------------------
+// 单次块传输能携带的字数（运行时决定，烧录吞吐的主杠杆）
+//
+//   V2 Bulk：一条命令必须塞进"一个出包"里才会被固件立即派发（见
+//            _bulkPacketSize / _calibrateOutPacket）。出包长度由开机自标定得到，
+//            通常是 64（FS）或 508 左右（HS）。可用字数 = (出包 - 5) / 4，
+//            HS 下约 125 字，是 V1 上限（14）的近 9 倍。
+//   V1 HID：报告负载固定 64 字节，(64 - 5) / 4 = 14，与历史一致。
+//
+// 出包长度 ≤ 64 时本函数自然退回 14，无需额外分支。
+// ---------------------------------------------------------------------------
+static int BlockWordsLimit()
+{
+    const int pkt = ORBMDK_USB_Bulk_GetMaxCommandBytes();   // 0 = HID / 未连接
+    if (pkt > 0) {
+        int words = (pkt - 5) / 4;                          // 5 = DAP_TransferBlock 命令头
+        if (words > kMaxBlockWordsHardLimit) {
+            words = kMaxBlockWordsHardLimit;
+        }
+        if (words < 1) {
+            words = 1;
+        }
+        return words;
+    }
+    return kMaxBlockWords;
 }
 
 // ============================================================================
@@ -495,10 +528,6 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
                 *pHandle = 0;
                 return RDDI_FAILED;
             }
-            LOG_INFO("RDDI_Open: transport = %s",
-                     ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE
-                         ? "CMSIS-DAP v2 (USB Bulk)"
-                         : "CMSIS-DAP v1 (HID)");
         }
     }
 
@@ -550,7 +579,6 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
             char bulkProduct[128] = {};
             if (ORBMDK_USB_Bulk_GetProductName(bulkProduct, sizeof(bulkProduct)) == 0) {
                 ctx->productName = bulkProduct;
-                LOG_INFO("RDDI_Open: V2 product name = '%s'", ctx->productName.c_str());
             } else {
                 LOG_WARN("RDDI_Open: V2 interface string unavailable, keeping '%s'",
                          ctx->productName.c_str());
@@ -563,19 +591,12 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
             char bulkSerial[128] = {};
             if (ORBMDK_USB_Bulk_GetSerialNumber(bulkSerial, sizeof(bulkSerial)) == 0) {
                 ctx->serialNumber = bulkSerial;
-                LOG_INFO("RDDI_Open: V2 serial = '%s'", ctx->serialNumber.c_str());
             }
 
-            // 设备自报的固件串**只写日志**，不进 ctx、不向宿主暴露：
+            // 设备自报的固件串**不进 ctx、不向宿主暴露**：
             // 它是 "2.1.0"（主版本 2），会让 AGDI 切到"多 DAP"分支（见
             // kDriverFirmwareVersion 的说明）。真正返回给 Identify(idNo=4) 的
             // 是驱动自持的那一份，在函数末尾统一赋值。
-            {
-                char devFw[64] = {};
-                ORBMDK::DAP_GetInfo(DAP_INFO_FIRMWARE, devFw, sizeof(devFw));
-                LOG_INFO("RDDI_Open: device DAP_Info firmware = '%s' (log only, not exposed)",
-                         devFw);
-            }
         }
     }
 
@@ -583,15 +604,12 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
     // "是否走多 DAP 分支"的开关，绝不能让设备自报的 "2.1.0"（主版本 2）漏出去。
     // 对照实验见 COMPAT_ANALYSIS §17.5。
     ctx->firmwareVersion = kDriverFirmwareVersion;
-    LOG_INFO("RDDI_Open: firmware version exposed to host = '%s'",
-             ctx->firmwareVersion.c_str());
 
     // 插入 map（堆分配，地址稳定）
     gContexts.emplace(handle, std::move(ctx));
 
     *pHandle = handle;
 
-    LOG_INFO("RDDI_Open: OK, handle=%d", handle);
     return RDDI_SUCCESS;
 }
 
@@ -734,9 +752,6 @@ RDDI_FUNC int DAP_GetNumberOfDAPs(const RDDIHandle handle, int *noOfDAPs)
 
 RDDI_FUNC int DAP_GetDAPIDList(const RDDIHandle handle, int *DAP_ID_Array, size_t sizeOfArray)
 {
-    LOG_INFO("DAP_GetDAPIDList: enter, handle=%d, array=%p, sizeOfArray=%llu",
-             handle, (void *)DAP_ID_Array, (unsigned long long)sizeOfArray);
-
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -748,29 +763,18 @@ RDDI_FUNC int DAP_GetDAPIDList(const RDDIHandle handle, int *DAP_ID_Array, size_
         return RDDI_BADARG;
     }
 
-    // ⚠️ sizeOfArray 的两种解释都必须接受 —— AGDI 两种都真的会传。
-    //
-    //   * 官方实现按**字节数**解释（反汇编里 `shr esi, 2` 换算成元素个数，
-    //     见 COMPAT_ANALYSIS §10.3(6)），此时传 0x100（256 字节）。
-    //   * 但 AGDI 在"多 DAP"分支里会传**元素个数**（实测传 1）。
-    //
-    // 旧实现写死 `sizeOfArray < sizeof(int) → RDDI_BADARG`：传 1 时直接失败，
-    // 而且是**静默**失败（不发任何 USB 命令、也不写输出参数），现场表现为
+    // ⚠️ sizeOfArray 的两种解释都必须接受（官方按**字节数**、AGDI 的"多 DAP"
+    // 分支按**元素个数**，见 COMPAT_ANALYSIS §10.3(6)）。旧实现写死
+    // `sizeOfArray < sizeof(int) → RDDI_BADARG`：传 1 时直接失败，而且是
+    // **静默**失败（不发任何 USB 命令、也不写输出参数），现场表现为
     // "CMSIS_DAP_Connect 成功之后立刻 Disconnect/Close，Debug Settings 里
-    // 显示 RDDI-DAP Error"。≥ sizeof(int) 按字节数解释，1..sizeof(int)-1
-    // 按元素个数解释，两种解释下都不会越界。
-    const size_t maxEntries = (sizeOfArray >= sizeof(int))
-                                  ? (sizeOfArray / sizeof(int))
-                                  : sizeOfArray;
+    // 显示 RDDI-DAP Error"。本函数只回一个 DAP ID，不做容量换算。
 
     // 与 DAP_GetNumberOfDAPs 保持一致：连接目标之前即可返回，单 DAP，ID = 0。
     // 注意 DAP_ID 会被后续 DAP_ReadReg / DAP_WriteReg 当作 CMSIS-DAP 的
     // "DAP Index" 字节使用，必须是**索引**而不是 IDCODE（写 IDCODE 会让
     // 低字节变成非法的 DAP Index）。
     DAP_ID_Array[0] = kSingleDapId;
-    LOG_INFO("DAP_GetDAPIDList: sizeOfArray=%llu -> maxEntries=%llu, returned=%d, id[0]=%d",
-             (unsigned long long)sizeOfArray, (unsigned long long)maxEntries,
-             (maxEntries > 0) ? 1 : 0, kSingleDapId);
 
     return RDDI_SUCCESS;
 }
@@ -1602,6 +1606,7 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
     return RDDI_SUCCESS;
 }
 
+
 // ---------------------------------------------------------------------------
 // DAP_RegWriteRepeat / DAP_RegReadRepeat —— 烧录主力路径
 //
@@ -1637,10 +1642,11 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
     // 首次使用时探测固件是否支持 ID_DAP_TRANSFER_BLOCK；不支持则自动回退
     EnsureBlockTransferProbed(ctx, dapId);
 
+    const int wordsLimit = BlockWordsLimit();
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
-        if (chunk > kMaxBlockWords) {
-            chunk = kMaxBlockWords;
+        if (chunk > wordsLimit) {
+            chunk = wordsLimit;
         }
 
         if (ctx->blockTransferSupported) {
@@ -1694,10 +1700,11 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
     // 首次使用时探测固件是否支持 ID_DAP_TRANSFER_BLOCK；不支持则自动回退
     EnsureBlockTransferProbed(ctx, dapId);
 
+    const int wordsLimit = BlockWordsLimit();
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
-        if (chunk > kMaxBlockWords) {
-            chunk = kMaxBlockWords;
+        if (chunk > wordsLimit) {
+            chunk = wordsLimit;
         }
 
         if (ctx->blockTransferSupported) {
@@ -1801,8 +1808,6 @@ static int TransportInterfaceCount(void)
             cached = v;
         }
     }
-    LOG_INFO("interface count = %d (kTransportInterfaceCount=%d, ORBMDK_IFACES)",
-             cached, kTransportInterfaceCount);
     return cached;
 }
 
@@ -1823,8 +1828,6 @@ RDDI_FUNC int CMSIS_DAP_Detect(const RDDIHandle handle, int *noOfIFs)
     // ⚠️ 绝不能返回 0：AGDI 看到 0 会直接以 EU02（"No Debug Unit Found"）中止
     // 整个初始化（见 §4.6）。没有设备时也报 1，让用户能进对话框看到错误。
     *noOfIFs = TransportInterfaceCount();
-    LOG_INFO("CMSIS_DAP_Detect: noOfIFs=%d (0=CMSIS-DAP v2/Bulk, 1=CMSIS-DAP v1/HID)",
-             *noOfIFs);
     return RDDI_SUCCESS;
 }
 
@@ -1917,8 +1920,6 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
         return RDDI_INVHANDLE;
     }
 
-    LOG_INFO("CMSIS_DAP_ConfigureInterface: ifNo=%d, cfg='%s'", ifNo, str ? str : "(null)");
-
     // ★ 这里就是"用户在对话框里选了哪个适配器"的落点（AGDI 把选中项的 ifNo
     //   原样传进来，反汇编 0x10022AA8）。据此把传输层切到对应模式：
     //     ifNo 0 -> CMSIS-DAP v2 (Bulk)    ifNo 1 -> CMSIS-DAP v1 (HID)
@@ -1933,11 +1934,6 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
                       "- NOT falling back to the other transport",
                       ifNo, (ifNo == 1) ? "CMSIS-DAP v1/HID" : "CMSIS-DAP v2/Bulk", sel);
             return RDDI_FAILED;
-        } else {
-            LOG_INFO("CMSIS_DAP_ConfigureInterface: transport = %s",
-                     ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE
-                         ? "CMSIS-DAP v2 (USB Bulk)"
-                         : "CMSIS-DAP v1 (HID)");
         }
     } else {
         LOG_WARN("CMSIS_DAP_ConfigureInterface: ifNo=%d out of range, transport unchanged",
@@ -2051,7 +2047,23 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
     // 宣称未验证的能力等于骗宿主。（Keil 的 Port 下拉框并不按能力位限制，
     // 因此需要试 JTAG 时照样可选：本层会按 ConfigureInterface 的 Port= 走 JTAG 路径。）
     // JTAG 在真机上验证通过后，把 `| INFO_CAPS_JTAG` 加回来。
-    *cap_info = INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS;
+    //
+    // SWO 位（Bit2/Bit3）是 AGDI trace 配置块的**门控位**（反汇编见 Todo.md §18.8）：
+    //   0x10022A2F  test caps, 0x04   ; INFO_CAPS_SWO_UART
+    //   0x10022A53  test caps, 0x08   ; INFO_CAPS_SWO_MANCHESTER
+    // 两位都置 0 时，AGDI 找不到可用的 Trace Port，会把传输兜底写成 None
+    // （配置串 `Trace=Off;TraceBaudrate=0;TraceTransport=None;`），界面上的
+    // `Trace Enable` 勾选因此不产生任何效果。
+    //
+    // Read 传输只需上面两位之一，**不**要求 Identify(idNo=4) 主版本 >= 2，
+    // 也**不**要求 INFO_CAPS_SWO_STREAMING_TRACE(0x40) —— 故这里**不**置 0x40，
+    // 避免 AGDI 在 0x1002287A 选到本层尚未实现的 Streaming 路径（Todo.md §18.5）。
+    //
+    // 注意：这两位只有在 SWO 数据通路（CMSIS_DAP_SWO_Control / Baudrate / Data /
+    // Status）确实可跑时才成立，否则等于宣称未验证能力。
+    *cap_info = INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS
+              | INFO_CAPS_SWO_UART
+              | INFO_CAPS_SWO_MANCHESTER;
 
     return RDDI_SUCCESS;
 }
@@ -2157,9 +2169,6 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
     // （官方 AGDI 不调用 DAP_HostStatus，必须由本层驱动，见 SetHostLed 说明）
     SetHostLed(ctx, kHostLedConnect, true);
 
-    LOG_INFO("DetectTargetDapIdList: mode=%d transferStatus=%d idcode=0x%08X -> count=%d",
-             mode, status, idcode, (int)ctx->dapIdList.size());
-
     // ------------------------------------------------------------------
     // 块传输能力探测：放在这里是因为**只有这里能确定目标已连接**。
     //
@@ -2176,8 +2185,6 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
 
 RDDI_FUNC int CMSIS_DAP_DetectNumberOfDAPs(const RDDIHandle handle, int *numDAPs)
 {
-    LOG_INFO("CMSIS_DAP_DetectNumberOfDAPs: enter, handle=%d", handle);
-
     if (numDAPs) {
         *numDAPs = 0;  // 失败时也要写输出参数
     }
@@ -2195,7 +2202,6 @@ RDDI_FUNC int CMSIS_DAP_DetectNumberOfDAPs(const RDDIHandle handle, int *numDAPs
 
     *numDAPs = DetectTargetDapIdList(ctx, nullptr, nullptr);
 
-    LOG_INFO("CMSIS_DAP_DetectNumberOfDAPs: noOfDAPs=%d", *numDAPs);
     return RDDI_SUCCESS;
 }
 
@@ -2216,9 +2222,6 @@ RDDI_FUNC int CMSIS_DAP_DetectNumberOfDAPs(const RDDIHandle handle, int *numDAPs
 RDDI_FUNC int CMSIS_DAP_DetectDAPIDList(const RDDIHandle handle, int *DAP_ID_Array,
                                           size_t sizeOfArray)
 {
-    LOG_INFO("CMSIS_DAP_DetectDAPIDList: enter, handle=%d, array=%p, requested=%llu",
-             handle, (void *)DAP_ID_Array, (unsigned long long)sizeOfArray);
-
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         LOG_INFO("CMSIS_DAP_DetectDAPIDList: invalid handle -> RDDI_INVHANDLE");
@@ -2252,9 +2255,6 @@ RDDI_FUNC int CMSIS_DAP_DetectDAPIDList(const RDDIHandle handle, int *DAP_ID_Arr
         DAP_ID_Array[i] = static_cast<int>(ctx->dapIdList[i]);
     }
 
-    LOG_INFO("CMSIS_DAP_DetectDAPIDList: requested=%llu, available=%llu, returned=%llu, id[0]=0x%08X",
-             (unsigned long long)sizeOfArray, (unsigned long long)ctx->dapIdList.size(),
-             (unsigned long long)count, (unsigned)ctx->dapIdList[0]);
     return RDDI_SUCCESS;
 }
 
@@ -2403,7 +2403,6 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
             return RDDI_DAP_ERROR;
         }
         mode = DAP_CONNECT_JTAG;
-        LOG_INFO("CMSIS_DAP_Connect: JTAG 建链完成，IDCODE=0x%08X", jtagIdcode);
     }
     if (mode < 0 || mode > 2) {
         LOG_ERROR("CMSIS_DAP_Connect: connect failed, mode=%d", mode);
@@ -2495,9 +2494,12 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
     if (IsWritablePointer(connectedInterface)) {
         *connectedInterface = mode;  // 1=SWD, 2=JTAG
     } else if (connectedInterface) {
-        LOG_WARN("CMSIS_DAP_Connect: out-pointer %p is not writable "
-                 "(AGDI passes the selected interface index here) -> write skipped",
-                 (void *)connectedInterface);
+        // 不是故障：这是 AGDI 的固定行为（该参数传的是"选中项索引"，不是指针），
+        // 我们按契约跳过写入即可。因此降到 DEBUG —— 之前用 WARN 会在**每次**
+        // Connect 时刷一行，污染默认日志与 Keil 日志窗口（见 COMPAT_ANALYSIS §15）。
+        LOG_DEBUG("CMSIS_DAP_Connect: out-pointer %p is not writable "
+                  "(AGDI passes the selected interface index here) -> write skipped",
+                  (void *)connectedInterface);
     }
 
     // 设置连接状态
@@ -2648,8 +2650,6 @@ RDDI_FUNC int CMSIS_DAP_JTAG_Configure(const RDDIHandle handle, int count, uint8
         // 未扫过链时无法定位 DP：先按位置 0 处理（JtagInitSequence 会按 IDCODE 自动判定）
         if (ctx->jtagDpIndex < 0 || ctx->jtagDpIndex >= n) ctx->jtagDpIndex = 0;
         ctx->jtagCurIr = 0;
-        LOG_INFO("CMSIS_DAP_JTAG_Configure: count=%d IR[0]=%d 全链IR=%d位",
-                 n, static_cast<int>(ir_len[0]), ctx->jtagChainIrBits);
     }
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
@@ -2694,10 +2694,6 @@ RDDI_FUNC int CMSIS_DAP_JTAG_Sequence(const RDDIHandle handle, int num, uint8_t 
 
 RDDI_FUNC int CMSIS_DAP_JTAG_GetIDCODEs(const RDDIHandle handle, int *count, uint32_t *idcodes)
 {
-    LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: enter, handle=%d, count=%p, idcodes=%p",
-             handle, (void *)count, (void *)idcodes);
-    LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: enter, handle=%d, count=%p, idcodes=%p",
-             handle, (void *)count, (void *)idcodes);
     // 输出参数必须先写入 —— 这里尤其关键：
     // AGDI 把 *count 当作"**设备数量**"使用（反汇编 0x1002C918 → 0x1002C91F，
     // 位于设备探测例程 0x1002c890，其出参直接决定 Debug Settings 里
@@ -2747,9 +2743,6 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIDCODEs(const RDDIHandle handle, int *count, uin
             ++n;
         }
         *count = n;
-        LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: %d IDCODE(s) from target scan, id[0]=0x%08X "
-                 "(idcodes=%s)", n, (unsigned)ctx->dapIdList[0],
-                 idcodes ? "provided" : "NULL");
         return RDDI_SUCCESS;
     }
 
@@ -2804,8 +2797,6 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIRLengths(const RDDIHandle handle, int *count, u
             lengths[i] = ctx->jtagIrLens[i];
         }
     }
-    LOG_INFO("CMSIS_DAP_JTAG_GetIRLengths: count=%d, ir[0]=%u ir[1]=%u",
-             ctx->jtagDevCount, (unsigned)ctx->jtagIrLens[0], (unsigned)ctx->jtagIrLens[1]);
     return RDDI_SUCCESS;
 }
 
@@ -2992,7 +2983,6 @@ RDDI_FUNC int CMSIS_DAP_GetNumberOfDevices(const RDDIHandle handle, int *count)
     }
 
     *count = static_cast<int>(ctx->dapIdList.size());
-    LOG_INFO("CMSIS_DAP_GetNumberOfDevices: count=%d", *count);
     return RDDI_SUCCESS;
 }
 
@@ -3098,7 +3088,6 @@ RDDI_FUNC int CMSIS_DAP_DetectNumberOfDevices(const RDDIHandle handle, int *coun
     }
 
     *count = static_cast<int>(ctx->dapIdList.size());
-    LOG_INFO("CMSIS_DAP_DetectNumberOfDevices: count=%d", *count);
     return RDDI_SUCCESS;
 }
 
@@ -3121,9 +3110,6 @@ RDDI_FUNC int CMSIS_DAP_DetectNumberOfDevices(const RDDIHandle handle, int *coun
 // ---------------------------------------------------------------------------
 RDDI_FUNC int CMSIS_DAP_GetDeviceIDList(const RDDIHandle handle, int *idArray, size_t sizeOfArray)
 {
-    LOG_INFO("CMSIS_DAP_GetDeviceIDList: enter, handle=%d, array=%p, sizeOfArray=%llu",
-             handle, (void *)idArray, (unsigned long long)sizeOfArray);
-
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         LOG_ERROR("CMSIS_DAP_GetDeviceIDList: invalid handle");
@@ -3177,8 +3163,6 @@ RDDI_FUNC int CMSIS_DAP_GetDeviceIDList(const RDDIHandle handle, int *idArray, s
         idArray[i] = static_cast<int>(ctx->dapIdList[i]);
     }
 
-    LOG_INFO("CMSIS_DAP_GetDeviceIDList: maxEntries=%d, returned=%d, id[0]=0x%08X",
-             maxEntries, n, (unsigned)ctx->dapIdList[0]);
     return RDDI_SUCCESS;
 }
 

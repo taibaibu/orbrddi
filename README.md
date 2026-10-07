@@ -157,7 +157,7 @@ RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指�
 | 工具 | 层次 | 用途 / 何时用 |
 |------|------|----------------|
 | `ORBMDK_RDDI_FullTest.exe` | 走 DLL | 全面功能测试 40 项 + 完整导出扫描；**改完 DLL 先跑它** |
-| `ORBMDK_BlockTransferTest.exe <ramAddr>` | 走 DLL | 块传输提速与哨兵越界验证（flash 下载热路径，§13.7） |
+| `ORBMDK_BlockTransferTest.exe <ramAddr>` | 走 DLL | 块传输正确性与哨兵越界验证（flash 下载热路径，§13.7） |
 | `swdprobe.exe [dll] [v1]` | 走 DLL | SWD 通路回归：导出自检 / 适配器字段 / 版本串闸门 / 假冒指针回归 / AP 寄存器解码 / halt-PC-RAM / 日志回调，末尾给出 PASS-FAIL 统计。默认 V2，加 `v1` 走 HID |
 | `hidprobe.exe` | 走 DLL | HID(V1) 极小回归（比 `swdprobe ... v1` 更快更薄） |
 | `jtagprobe.exe` | 走 DLL | JTAG 端到端：`Port=JTAG` → 扫链 → IR 长度 → DP 上电（验证**本层** JTAG 建链） |
@@ -282,15 +282,64 @@ DAP_SWJ_Sequence(56, {0xFF×7}) → (16, {0x9E,0xE7}) → (56, {0xFF×7}) → (8
 | 默认级别 | **ERROR** |
 | 行格式 | `[ORBMDK][HH:MM:SS.mmm][级别][模块][PID:TID] 消息` |
 | 过滤时机 | 在构造日志字符串**之前**判断级别，被过滤时零开销 |
-| 临时恢复（推荐） | 文件 **`%TEMP%\ORBMDK_LOG_LEVEL`**，内容 `0=DEBUG 1=INFO 2=WARN 3=ERROR`；µVision 运行中改**最多 1 秒生效**，删掉文件即恢复默认，**不用重启 IDE** |
-| 环境变量 | `ORBMDK_LOG_LEVEL`（0–3）、`ORBMDK_LOG_FILE`（日志路径，默认 `%TEMP%\ORBMDK_RDDI.log`）；只在进程启动读一次 |
-| 命令级日志 | V1/V2 每条 DAP 命令往返**不受级别控制**、始终落盘（排障线索不允许依赖阈值），并带时间戳 |
+| 临时恢复（推荐） | 文件 **`%TEMP%\ORBMDK_LOG_LEVEL`**，内容 `0=DEBUG 1=INFO 2=TESTSPEED 3=VERBOSE 4=REV1 5=REV2 6=REV3 7=WARN 8=ERROR`；µVision 运行中改**最多 1 秒生效**，删掉文件即恢复默认，**不用重启 IDE** |
+| 环境变量 | `ORBMDK_LOG_LEVEL`（0–8）、`ORBMDK_LOG_FILE`（日志路径，默认 `%TEMP%\ORBMDK_RDDI.log`）；只在进程启动读一次 |
+| 命令级日志 | V1/V2 每条 DAP 命令往返按 **INFO** 级参与级别过滤、只落盘并带时间戳；阈值设为 INFO/DEBUG 时才输出，默认 ERROR 下不落盘 |
 | 宿主通道 | `RDDI_SetLogCallback` 已接通：日志会转发给 AGDI/Keil 的日志窗口（级别自动映射） |
 | 禁止 | 逐寄存器 / 逐次传输的 INFO 日志、响应十六进制转储 |
 
 ```bat
 echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 ```
+
+> PowerShell 下写级别文件请用 `[IO.File]::WriteAllText("$env:TEMP\ORBMDK_LOG_LEVEL","2")`，
+> 不要用 `Set-Content`（PS 5.1 默认 UTF-16，驱动按 ASCII 解析会读不出数字）。
+
+### 烧录速率统计（TESTSPEED）
+
+把级别设为 **2**（TESTSPEED），`DAP_RegWriteRepeat` / `DAP_RegReadRepeat`
+（即 AGDI 的 `SWD_WriteBlock` / `SWD_VerifyBlock` / `SWD_ReadBlock`，flash 下载与校验的真实数据通道）
+会按方向统计字节数与耗时，限流输出到 `%TEMP%\ORBMDK_RDDI.log`：
+
+```
+[ORBMDK][00:12:34.101][TESTSPEED][RDDI][8112:9012] meter config: transport=V2/Bulk speed=Full(12Mbps) cmdPkt=508 B -> 125 words/round trip, blockTransfer=on | bus ceiling ~1465 kB/s
+[ORBMDK][00:12:34.567][TESTSPEED][RDDI][8112:9012] WRITE speed: 4096 B in 7.1 ms -> 563.4 kB/s | 9 round trips, 788.9 us/trip | window wall 47.3 ms, dap 15.0% | total 65536 B in 115.0 ms (avg 556.5 kB/s, 147 trips)
+[ORBMDK][00:12:34.589][TESTSPEED][RDDI][8112:9012] READ  speed: 388 B in 0.9 ms -> 405.2 kB/s | 1 round trips, 900.0 us/trip | window wall 2.1 ms, dap 42.9% | total 1128 B in 3.9 ms (avg 279.4 kB/s, 3 trips)
+[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter segment: wall 1218.4 ms | dap 118.9 ms (9.8%) | other 1099.5 ms (90.2%) | write 65536 B (538.0 kB/s) + read 1128 B | 150 round trips
+[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter usb: 150 cmds, out 96.2 ms (641.3 us/cmd), in 22.7 ms (151.3 us/cmd), round trip 792.6 us/cmd
+```
+
+| 项 | 约定 |
+|----|------|
+| 统计口径 | `WRITE` = 下载写入，`READ` = 回读校验；每行给出**窗口速率**与**累计平均速率**（kB/s） |
+| 往返次数 | `round trips` = 窗口内实际发生的 USB 往返数（块传输 1 次/块，逐字回退 N 次），`us/trip` 由此得出 |
+| 计时范围 | 只含 DAP 传输段（`DAP_TransferBlock` / `DAP_Transfer` 往返），日志格式化不计入 |
+| 输出频率 | 累计 `≥ 1024 字` 或 `≥ 200 ms` 才落一行；两次调用空闲 `> 500 ms` 视为上一段烧录结束，立即结算余量 |
+| 关闭开销 | 阈值高于 TESTSPEED 时连计时都不做（`ORBMDK_LogGetLevel()` 前置判断） |
+| 失败不计 | 中途返回 `RDDI_DAP_ERROR` 的那次不统计（避免把失败路径算进速率） |
+| 配置行 | 首次计量（传输层变化会重打）输出一条 `meter config:`，给出传输层 / **端口速度** / 出包字节数 / 每次往返字数 / 块传输是否生效，以及该速度的总线理论上限 |
+| 窗口墙钟 | 速率行里的 `window wall …, dap …%`：本窗口的**真实墙钟**，以及驱动（DAP 传输）在其中的占比 |
+| 段总结 | 一段连续传输结束（空闲 > 500 ms）后补打 `meter segment:`：整段的 wall / dap / other + 双向字节与往返数。**判断瓶颈在哪一层的唯一依据**。注意它是等**下一笔传输**到来时才补打的，所以日志末尾可能少最后一段 |
+| USB 拆分 | 再补一条 `meter usb:`：累计命令数，以及 OUT（发命令）与 IN（收响应）各自的耗时与每命令均值 |
+
+> **怎么读这几行**（实测样本，见 COMPAT_ANALYSIS）：
+> - **先看 `meter segment` 的 dap%**：实测一次下载里驱动只占 **~10–15%**，其余（other）在 AGDI 与
+>   目标端 flash 算法。把传输优化到 0，整体也只能快这么多 —— 所以"加速"的第一问是
+>   **瓶颈到底在不在这一层**，而不是埋头抠 USB。
+> - **再看 `meter usb` 的 out/in**：`out ↑` = 时间花在把命令包搬上线；`in ↑` = 设备应答慢
+>   （SWD 时钟 / flash 算法），驱动层改什么都没用。
+> - `us/trip` 必须与 `words/round trip` 一起看。两组实测摆在一起：`出包 64 B / 14 字 → ~95 µs/往返`、
+>   `出包 508 B / 125 字 → ~789 µs/往返`。往返耗时几乎正比于**出包字节数**（≈1.55 µs/字节），
+>   即**每个 64 字节包固定约 95 µs**，其中只有 ~43 µs 是 Full Speed 的真实线时间，
+>   剩下 **~52 µs 是每包的固定开销**。
+>   ⇒ 再靠"每次往返多带几个字"已经榨不出东西（总字节数没变），只能**让每个字节更便宜**：
+>   把链路从 Full Speed 换成 High Speed（512 B 包，同样 508 字节只需 1 个包）。
+> - `bus ceiling` 是给对照用的：实测已贴着它 = 被物理层卡死；实测只有它的 ~40%
+>   （FS 下 5 字/µs 量级）时，才值得回头查驱动与端点调度。
+> - **日志时间戳的间隔 ≠ 计量时间**：窗口计量 7.1 ms，两行时间戳却相差 ~47 ms —— 差值就是
+>   AGDI / 目标侧的时间。`window wall` 与 `meter segment` 现在直接把它打出来了。
+> - 需要传输层的详细枚举/标定过程（`[BULK]` 行）时，阈值要放到 **1(INFO) 或 0(DEBUG)** ——
+>   `ORBMDK_LogTrace` 按 INFO 级过滤，阈值 2 会把 `[BULK]` 全部丢掉。
 
 ---
 

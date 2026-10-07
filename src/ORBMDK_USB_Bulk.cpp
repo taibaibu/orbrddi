@@ -877,9 +877,9 @@ static int _bulkWrite(const uint8_t* data, size_t len, int timeoutMs)
         timeoutMs = DEFAULT_BULK_TIMEOUT;
     }
 
-    const ULONGLONG t0 = GetTickCount64();
-
-    // 创建覆盖结构用于超时
+    // 事件对象必须**每次传输独立创建**：_cancelOverlapped 在成功取消时会
+    // CloseHandle 它，句柄生命周期与本次 OVERLAPPED 绑定死了 —— 跨传输复用
+    // 会在一次超时之后留下悬垂句柄，之后所有传输全部失败（已实测）。
     OVERLAPPED overlapped = {0};
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!overlapped.hEvent) {
@@ -900,6 +900,8 @@ static int _bulkWrite(const uint8_t* data, size_t len, int timeoutMs)
         // 等待操作完成
         DWORD waitResult = WaitForSingleObject(overlapped.hEvent, timeoutMs);
         if (waitResult == WAIT_TIMEOUT) {
+            // 取消并等 IRP 真正结束；事件对象的收尾（CloseHandle 或有意泄漏）
+            // 由 _cancelOverlapped 内部统一处理，这里不能再碰它。
             _cancelOverlapped(g_winusb.deviceHandle, g_winusb.winusbHandle,
                               g_winusb.bulkOutPipe, &overlapped, 3000);
 
@@ -937,10 +939,6 @@ static int _bulkWrite(const uint8_t* data, size_t len, int timeoutMs)
     }
 
     CloseHandle(overlapped.hEvent);
-    BulkTrace("  bulkWrite OUT ep=0x%02X len=%u -> %lu bytes, %llu ms",
-              (unsigned)g_winusb.bulkOutPipe, (unsigned)len,
-              (unsigned long)bytesWritten,
-              (unsigned long long)(GetTickCount64() - t0));
     return (int)bytesWritten;
 }
 
@@ -960,9 +958,9 @@ static int _bulkRead(uint8_t* data, size_t maxLen, int timeoutMs)
         timeoutMs = DEFAULT_BULK_TIMEOUT;
     }
 
-    const ULONGLONG t0 = GetTickCount64();
-
-    // 创建覆盖结构用于超时
+    // 事件对象必须**每次传输独立创建**：_cancelOverlapped 在成功取消时会
+    // CloseHandle 它，句柄生命周期与本次 OVERLAPPED 绑定死了 —— 跨传输复用
+    // 会在一次超时之后留下悬垂句柄，之后所有传输全部失败（已实测）。
     OVERLAPPED overlapped = {0};
     overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
     if (!overlapped.hEvent) {
@@ -984,7 +982,7 @@ static int _bulkRead(uint8_t* data, size_t maxLen, int timeoutMs)
         DWORD waitResult = WaitForSingleObject(overlapped.hEvent, timeoutMs);
         if (waitResult == WAIT_TIMEOUT) {
             // 必须先等 IRP 真正结束再释放，否则设备接口会被永久占用
-            // （详见 _cancelOverlapped 的说明）
+            // （详见 _cancelOverlapped 的说明）；事件由它内部收尾。
             _cancelOverlapped(g_winusb.deviceHandle, g_winusb.winusbHandle,
                               g_winusb.bulkInPipe, &overlapped, 3000);
             BulkTrace("  bulkRead IN ep=0x%02X maxLen=%u TIMEOUT after %d ms",
@@ -1006,10 +1004,6 @@ static int _bulkRead(uint8_t* data, size_t maxLen, int timeoutMs)
     }
 
     CloseHandle(overlapped.hEvent);
-    BulkTrace("  bulkRead IN ep=0x%02X maxLen=%u -> %lu bytes, %llu ms",
-              (unsigned)g_winusb.bulkInPipe, (unsigned)maxLen,
-              (unsigned long)bytesRead,
-              (unsigned long long)(GetTickCount64() - t0));
     return (int)bytesRead;
 }
 
@@ -1239,6 +1233,21 @@ static size_t _bulkPacketSize(size_t cmdLen)
 }
 
 /**
+ * @brief 当前传输模式下"一条命令能占用的最大字节数"（见头文件说明）
+ *
+ * 用 cmdLen=0 取"有效出包长度"本身：标定值优先，未标定则描述符 wMaxPacketSize-1。
+ * 上层只要保证 5 + count*4 <= 该值，_bulkPacketSize 就会把出包长度取成这个
+ * **已验证过的值**，不会因为命令变长而变成未验证的长度。
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetMaxCommandBytes(void)
+{
+    if (!g_ctx.initialized || g_ctx.mode != USB_BULK_BULK_MODE) {
+        return 0;                       // V1 HID / 未连接：调用方走 64 字节规则
+    }
+    return (int)_bulkPacketSize(0);
+}
+
+/**
  * @brief 清空端点并排空设备 IN FIFO 里的历史响应
  *
  * 为什么必须做：设备的响应是**流式**的，超时/中断后没被取走的响应会留在
@@ -1382,6 +1391,14 @@ static void _calibrateOutPacket(void)
     BulkTrace("calibrate: no packet size verified, falling back to 64");
 }
 
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetDeviceSpeed(void)
+{
+    if (!g_ctx.initialized || g_ctx.mode != USB_BULK_BULK_MODE) {
+        return 0;                       // 未连接 / V1 HID：速度由 HID 路径自己决定
+    }
+    return (int)g_winusb.deviceSpeed;   // 1=Low 2=Full 3=High（WinUsb DEVICE_SPEED）
+}
+
 /**
  * @brief 一次 V2 命令往返（写一条命令、读一条响应）
  *
@@ -1423,10 +1440,6 @@ static int _bulkTransferCommand(const uint8_t* cmd, size_t cmdLen,
     memcpy(resp, rbuf, copy);
     *respLen = copy;
 
-    BulkTrace("DAPCommand: cmd=0x%02X outLen=%u -> resp %d bytes [%02X %02X %02X %02X]",
-              cmd[0], (unsigned)outLen, n,
-              (n > 0) ? rbuf[0] : 0, (n > 1) ? rbuf[1] : 0,
-              (n > 2) ? rbuf[2] : 0, (n > 3) ? rbuf[3] : 0);
     return 0;
 }
 

@@ -139,6 +139,28 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_DAPCommand(const uint8_t* cmd, size_t cmdLen
                                 uint8_t* resp, size_t* respLen, int timeoutMs);
 
 /**
+ * @brief 当前传输模式下"一条命令能占用的最大字节数"
+ *
+ *   - V2 Bulk：返回自标定得到的有效出包长度（见 _bulkPacketSize）。命令长度
+ *     **不能超过它**，否则发出去的就不是"已验证过的那个长度"，可能踩中
+ *     "恰为整包 → 固件等下一包 → 命令永不派发"的坑。
+ *   - 非 Bulk（V1 HID / 未初始化）：返回 0，调用方据此走 HID 的 64 字节规则。
+ *
+ * 供 RDDI 层决定单次块传输（ID_DAP_TRANSFER_BLOCK）能带多少字：V2 下把每次
+ * USB 往返的载荷从 14 字提升到 (出包-5)/4 字，这是烧录吞吐的主杠杆。
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetMaxCommandBytes(void);
+
+/**
+ * @brief 当前 V2 链路的端口速度（WinUsb DEVICE_SPEED 原值）
+ * @return 1=Low 2=Full 3=High；0 = 未连接 / V1 HID
+ *
+ * 用于把实测速率与总线理论上限对比 —— 若已接近上限，说明瓶颈在物理层，
+ * 驱动侧再怎么改也没用（只能改高速硬件）；若远低于上限，才值得查驱动。
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetDeviceSpeed(void);
+
+/**
  * @brief 发送原始数据 (V2 Bulk 模式)
  * @param data 数据
  * @param len 数据长度

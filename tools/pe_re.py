@@ -12,12 +12,27 @@ pe_re.py — Keil AGDI / RDDI DLL 逆向分析小工具
     python -m pip install capstone
 
 子命令：
-    exports <dll>                    列出导出表（名称 / RVA / VA）
-    imports <dll>                    列出导入的 DLL 名
-    names   <dll> [regex]            扫描文件内符号名（ASCII + UTF-16LE）
-    dis     <dll> <VA|导出名> [len]  按 VA 或导出名线性反汇编（注释字符串立即数）
-    xref    <dll> <子串>             找字符串及其代码引用点
-    slots   <dll> <起VA> <止VA>      AGDI 的 GetProcAddress 指针槽映射 + 调用点统计
+    exports <dll>                        列出导出表（名称 / RVA / VA）
+    imports <dll>                        列出导入的 DLL 名
+    names   <dll> [regex]                扫描文件内符号名（ASCII + UTF-16LE）
+    dis     <dll> <VA|导出名> [len]      按 VA 或导出名线性反汇编（注释字符串立即数）
+    hex     <dll> <VA> [len]            按 VA 十六进制转储（含 ASCII 列）
+    xref    <dll> <子串>                 找字符串及其代码引用点
+    refs    <dll> <VA> [--all]           找「绝对引用某 VA」的位置（默认只扫 .text）
+    slots   <dll> <起VA> <止VA> [段2...]  GetProcAddress 指针槽映射 + 调用点统计
+    scan    <dll>                        全 .text 自动扫描所有 GetProcAddress 加载块
+
+关于 slots / scan 的落表识别（x86 32 位，__cdecl）：
+        push <字符串VA>            ; 函数名
+        push dword ptr [hModule]
+        mov  dword ptr [slot], eax ; 保存「上一条」GetProcAddress 的结果
+        call esi                   ; GetProcAddress
+    编译器也可能把结果先搬进寄存器再落表，两种写法都要认：
+        mov  ecx, eax              ; 中间寄存器
+        mov  dword ptr [slot], ecx
+    因此对应关系是「call 时记下名字，随后的 mov [slot],<eax|中间reg> 落表」，
+    中间夹着的 cmp/test 等不打断 pending。只认 `mov [slot],eax` 会漏掉
+    `mov reg,eax` + `mov [slot],reg` 的写法（曾据此漏判 CMSIS_DAP_SWO_Data 的槽位）。
 
 示例：
     python pe_re.py exports "D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll.bak"
@@ -25,9 +40,13 @@ pe_re.py — Keil AGDI / RDDI DLL 逆向分析小工具
     python pe_re.py dis     "D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll" CMSIS_DAP_GetDeviceIDList 400
     python pe_re.py dis     "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x10022A60 0xD0
     python pe_re.py xref    "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" CMSIS_DAP_Disconnect
+    python pe_re.py refs    "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x102F8B90
     python pe_re.py slots   "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1002C000 0x1002CA00
+    python pe_re.py slots   "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1003CC80 0x1003CF00
+    python pe_re.py scan    "D:\\Keil_v5\\ARM\\BIN\\CMSIS_AGDI.dll"
 """
 
+import bisect
 import re
 import struct
 import sys
@@ -256,78 +275,211 @@ def cmd_xref(path, needle):
         print('未找到字符串：%s' % needle)
 
 
-def cmd_slots(path, start_va, end_va):
-    """还原 AGDI 的 GetProcAddress 槽位表并统计每个槽的调用点。
+# ---------------------------------------------------------------------------
+# GetProcAddress 槽位识别（slots / scan 共用）
+# ---------------------------------------------------------------------------
+def _collect_slots(pe, md, start_va, end_va):
+    """在 [start_va, end_va) 内识别 `GetProcAddress -> 指针槽` 落表。
 
-    识别模式（x86 32 位，__cdecl）：
-        push <字符串VA>            ; 函数名
-        push dword ptr [hModule]
-        mov  dword ptr [slot], eax ; 保存「上一次」GetProcAddress 的结果
-        call esi                   ; GetProcAddress
-    因此 slot 与 name 的对应关系要靠「先记下 call 时的名字，再在下一条
-    mov [slot],eax 时落表」，不能直接看相邻的 push。
+    返回 [(func_name, slot_va, store_va), ...]。识别规则见模块 docstring：
+    call 时记下压栈的函数名字符串，随后 `mov [slot], <eax|中间reg>` 落表，
+    中间夹的 cmp/test 等不打断 pending。
     """
-    pe = PE(path)
-    md = Cs(*X86)
-    md.detail = True
     o = pe.va2o(start_va)
+    if o is None:
+        return []
     code = pe.d[o:o + (end_va - start_va)]
-
     last_str = None
     pending = None
+    carry = None            # 承接 GetProcAddress 结果、再落表的中间寄存器
     order = []
     for ins in md.disasm(code, start_va):
         m = ins.mnemonic
+        ops = ins.operands
         if m == 'push':
-            for op in ins.operands:
+            for op in ops:
                 if op.type == CS_OP_IMM:
                     s = pe.cstr(op.imm & 0xFFFFFFFF)
                     if s:
                         last_str = s
                         break
         elif m == 'call':
-            if last_str:
-                pending = last_str
+            # 只认间接调用（call reg）——即调用 GetProcAddress 指针
+            if len(ops) == 1 and ops[0].type == CS_OP_REG:
+                if last_str:
+                    pending = last_str
+                    carry = None
             last_str = None
-        elif m == 'mov' and len(ins.operands) == 2:
-            dst, src = ins.operands
-            if dst.type == CS_OP_MEM and src.type == CS_OP_REG and ins.reg_name(src.reg) == 'eax':
-                if pending and pending.startswith(('RDDI_', 'DAP_', 'CMSIS_DAP_', 'ULINKPLUS_')):
-                    order.append((pending, dst.mem.disp & 0xFFFFFFFF, ins.address))
-                pending = None
+        elif m == 'mov' and len(ops) == 2:
+            dst, src = ops
+            if dst.type == CS_OP_MEM and src.type == CS_OP_REG:
+                sn = ins.reg_name(src.reg)
+                if sn == 'eax' or (carry is not None and sn == carry):
+                    if pending:
+                        order.append((pending, dst.mem.disp & 0xFFFFFFFF, ins.address))
+                        pending = None
+                        carry = None
+            elif dst.type == CS_OP_REG and src.type == CS_OP_REG \
+                    and ins.reg_name(src.reg) == 'eax':
+                carry = ins.reg_name(dst.reg)   # mov reg, eax → 记住中间寄存器
+    return order
 
-    print('=== name -> pointer slot (%d) ===' % len(order))
-    for nm, slot, at in order:
-        print('  %-38s slot 0x%08X  (stored @0x%08X)' % (nm, slot, at))
 
+def _slot_refs(pe, slot):
+    """.text 中所有绝对引用 slot 的位置；区分出 call/jmp [slot]。"""
     text = [s for s in pe.secs if s[0] == '.text']
     if not text:
-        return
+        return [], []
     tstart, tsize, traw = text[0][1], text[0][4], text[0][3]
     tbytes = pe.d[traw:traw + tsize]
+    pat = struct.pack('<I', slot)
+    hits, calls = [], []
+    j = 0
+    while True:
+        k = tbytes.find(pat, j)
+        if k < 0:
+            break
+        j = k + 1
+        va = pe.imagebase + tstart + k
+        hits.append(va)
+        fo = pe.va2o(va) - 2
+        if fo >= 0 and pe.d[fo] == 0xFF:
+            calls.append(va)
+    return hits, calls
 
+
+def _print_slots(pe, order):
+    print('=== name -> pointer slot (%d) ===' % len(order))
+    for nm, slot, at in order:
+        print('  %-40s slot 0x%08X  (stored @0x%08X)' % (nm, slot, at))
     print()
     print('=== 每个槽在 .text 中的引用统计 ===')
     for nm, slot, at in order:
-        pat = struct.pack('<I', slot)
-        hits = []
-        j = 0
-        while True:
-            k = tbytes.find(pat, j)
-            if k < 0:
-                break
-            j = k + 1
-            hits.append(pe.imagebase + tstart + k)
-        calls = []
-        for h in hits:
-            fo = pe.va2o(h) - 2
-            if fo >= 0 and pe.d[fo] == 0xFF:
-                calls.append(h)
+        hits, calls = _slot_refs(pe, slot)
         flag = '   <== 会被间接调用' if calls else ''
-        print('  %-38s slot 0x%08X refs=%2d call/jmp=%2d%s'
+        print('  %-40s slot 0x%08X refs=%2d call/jmp=%2d%s'
               % (nm, slot, len(hits), len(calls), flag))
         for h in calls[:4]:
             print('        call/jmp @0x%08X' % h)
+
+
+def cmd_slots(path, ranges):
+    pe = PE(path)
+    md = Cs(*X86)
+    md.detail = True
+    order = []
+    for start_va, end_va in ranges:
+        order += _collect_slots(pe, md, start_va, end_va)
+    _print_slots(pe, order)
+
+
+def _find_str_pushes(pe, tbytes, base):
+    """`push imm32` 且 imm 指向合法字符串 → [(va, imm, s), ...]（升序）。"""
+    out = []
+    for m in re.finditer(rb'\x68(....)', tbytes, re.S):
+        imm = struct.unpack_from('<I', m.group(1))[0]
+        s = pe.cstr(imm)
+        if s:
+            out.append((base + m.start(), imm, s))
+    return out
+
+
+# mov dword ptr [imm32], eax → A3 imm32
+# mov dword ptr [imm32], <ecx|edx|ebx|esp|ebp|esi|edi> → 89 <modrm=05/0D/15/1D/25/35/3D> imm32
+def _find_slot_stores(tbytes, base):
+    out = []
+    for m in re.finditer(rb'\xa3(....)', tbytes, re.S):
+        out.append((base + m.start(), struct.unpack_from('<I', m.group(1))[0]))
+    for m in re.finditer(rb'\x89[\x05\x0d\x15\x1d\x25\x35\x3d](....)', tbytes, re.S):
+        out.append((base + m.start(), struct.unpack_from('<I', m.group(1))[0]))
+    return sorted(out)
+
+
+def _find_reg_calls(tbytes, base):
+    """`call r32`（FF D0..D7）——即调用寄存器里的 GetProcAddress 指针。"""
+    return [base + m.start() for m in re.finditer(rb'\xff[\xd0-\xd7]', tbytes)]
+
+
+def cmd_scan(path, back=0x40, fwd=0x30):
+    """通扫整个 .text，自动发现所有 `GetProcAddress -> 槽` 加载块。
+
+    不依赖手工给出的地址区间，用来兜住「分散在多处」的加载（例如 AGDI 对
+    StreamingTrace_* 的第二次 GetProcAddress）。
+
+    实现刻意**不用线性反汇编**：.text 里嵌着跳转表/对齐填充，一次脱同步后面
+    全部解错（实测 scan 会返回空）。这里改用字节模式：
+        push imm32(str)        68 <imm32>            ← call 之前最近的字符串
+        call reg               FF D0..D7             ← GetProcAddress 指针
+        mov [slot], <reg>      A3/89 <modrm> <imm32> ← call 之后第一个落表
+    三者按地址配对，完全绕开解码同步问题。
+    """
+    pe = PE(path)
+    text = [s for s in pe.secs if s[0] == '.text']
+    if not text:
+        print('无 .text 节')
+        return
+    tstart, tsize, traw = text[0][1], text[0][4], text[0][3]
+    tbytes = pe.d[traw:traw + tsize]
+    base = pe.imagebase + tstart
+
+    pushes = _find_str_pushes(pe, tbytes, base)
+    stores = _find_slot_stores(tbytes, base)
+    calls = _find_reg_calls(tbytes, base)
+    pvas = [p[0] for p in pushes]
+    svas = [s[0] for s in stores]
+
+    order = []
+    for c in calls:
+        i = bisect.bisect_left(pvas, c) - 1          # call 之前最近的字符串 push
+        if i < 0 or c - pvas[i] > back:
+            continue
+        j = bisect.bisect_left(svas, c)              # call 之后第一个落表
+        if j >= len(svas) or svas[j] - c > fwd:
+            continue
+        order.append((pushes[i][2], stores[j][1], svas[j]))
+    _print_slots(pe, order)
+
+
+def cmd_refs(path, va, only_text=True):
+    """找所有「绝对引用某 VA」的位置（默认只扫 .text）。"""
+    pe = PE(path)
+    pat = struct.pack('<I', va)
+    out = []
+    j = 0
+    while True:
+        k = pe.d.find(pat, j)
+        if k < 0:
+            break
+        j = k + 1
+        r = pe.o2r(k)
+        if r is None:
+            continue
+        sname = next((s[0] for s in pe.secs if s[3] <= k < s[3] + s[4]), '?')
+        if only_text and sname != '.text':
+            continue
+        out.append((pe.imagebase + r, sname))
+    print('引用 0x%08X 的位置（%d 处%s）'
+          % (va, len(out), '，仅 .text' if only_text else ''))
+    for ref_va, sname in out:
+        note = ''
+        fo = pe.va2o(ref_va)
+        if fo is not None and fo >= 2 and pe.d[fo - 2] == 0xFF:
+            note = '   ; call/jmp [0x%08X]' % va
+        print('  0x%08X  [%s]%s' % (ref_va, sname, note))
+
+
+def cmd_hex(path, va, length=256):
+    pe = PE(path)
+    o = pe.va2o(va)
+    if o is None:
+        print('VA 0x%08X 不在任何节内' % va)
+        return
+    data = pe.d[o:o + length]
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hx = ' '.join('%02X' % b for b in chunk)
+        asc = ''.join(chr(b) if 0x20 <= b <= 0x7E else '.' for b in chunk)
+        print('0x%08X  %-47s  %s' % (va + i, hx, asc))
 
 
 # ---------------------------------------------------------------------------
@@ -357,10 +509,25 @@ def main(argv):
             return 1
         cmd_xref(path, rest[0])
     elif cmd == 'slots':
-        if len(rest) < 2:
-            print('需要 <起VA> <止VA>')
+        if len(rest) < 2 or len(rest) % 2:
+            print('需要 <起VA> <止VA> [<起VA> <止VA> ...]')
             return 1
-        cmd_slots(path, int(rest[0], 16), int(rest[1], 16))
+        ranges = [(int(rest[i], 16), int(rest[i + 1], 16))
+                  for i in range(0, len(rest), 2)]
+        cmd_slots(path, ranges)
+    elif cmd == 'scan':
+        cmd_scan(path)
+    elif cmd == 'refs':
+        if not rest:
+            print('需要 <VA>')
+            return 1
+        cmd_refs(path, int(rest[0], 16), '--all' not in rest)
+    elif cmd == 'hex':
+        if not rest:
+            print('需要 <VA>')
+            return 1
+        cmd_hex(path, int(rest[0], 16),
+                int(rest[1], 0) if len(rest) > 1 else 256)
     else:
         print(USAGE)
         return 1
