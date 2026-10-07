@@ -139,14 +139,8 @@ static const GUID& USB_GUID_DEVINTERFACE = GUID_DEVINTERFACE_USB_DEVICE;
 
 // ---------------------------------------------------------------------------
 // 诊断日志（统一实现见 src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）
-//
-// 本文件此前完全没有日志（见 §8.1），V2 打不开时无从排查；后来补了 BulkTrace，
-// 但它绕过级别、绕过 ORBMDK_LOG_FILE、且手写前缀（§8.2(2)(3)）。
-// 现在走统一入口：遵循 ORBMDK_LOG_FILE 并带时间戳/进程线程号。
-//
 // ⚠ 2026-10-03：按"**最底层日志统一 INFO**"的口径改为 ORBMDK_LOG_INFO ——
 // 传输级日志是排障必备，阈值设为 INFO(1) 时即可见，并会送宿主（Keil）日志窗口。
-// 只记关键路径（枚举到的接口、被拒绝的原因、最终选中的端点），不记逐次传输。
 // ---------------------------------------------------------------------------
 #define ORBMDK_LOG_MODULE "BULK"
 #define BulkTrace(...) ORBMDK_LOG_INFO(__VA_ARGS__)
@@ -242,11 +236,6 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
     }
 
     if (pref != USB_BULK_TRANSPORT_HID) {
-        // 与 V1 分支对称："接口能打开" ≠ "接口在讲 CMSIS-DAP"。
-        // 放开 VID/PID 之后，枚举可能选中别的厂商的 0xFF 接口（也绑了 WinUSB、
-        // 也有 Bulk 对）。不在这里问一句，错误会一路拖到第一条命令读超时才爆，
-        // 现场表现就成了"探针不响应"，而不是"这台设备不是 DAP"。
-        //
         // ⚠ 这里只校验"有没有有效应答"，**不校验版本号内容**：0x04 是 CMSIS-DAP
         //    **协议版本**（不是产品固件版本，那是 0x09）。
         char v2ver[64] = {};
@@ -1028,6 +1017,8 @@ static int _bulkWrite(const uint8_t* data, size_t len, int timeoutMs)
         return -1;
     }
 
+    orbmdk::MeterUsbTimer usbTimer(0);      // meter usb：OUT（发命令）耗时
+
     ULONG bytesWritten = 0;
     BOOL result;
 
@@ -1108,6 +1099,8 @@ static int _bulkRead(uint8_t* data, size_t maxLen, int timeoutMs)
     if (!g_winusb.winusbHandle || !data || maxLen == 0) {
         return -1;
     }
+
+    orbmdk::MeterUsbTimer usbTimer(1);      // meter usb：IN（等应答）耗时
 
     ULONG bytesRead = 0;
     BOOL result;
@@ -1278,10 +1271,6 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
     }
 
     // 选了 "CMSIS-DAP v2"（ifNo=0）却打不开：**如实失败，绝不静默降级到 V1**。
-    //
-    // 静默降级是最坏的处理方式：它把"V2 坏了"伪装成"一切正常"，于是整场会话
-    // 都跑在 V1 上、用户看不出任何异常，真正的缺陷（句柄泄漏导致的 err=5）
-    // 被永久掩盖 —— 历史上正是这样拖了很久。选谁就必须是谁，打不开就报错。
     if (pref == USB_BULK_TRANSPORT_BULK) {
         BulkTrace("Init: CMSIS-DAP v2 selected but V2 unavailable -> FAIL "
                   "(no silent fallback; see the err=5 notes in _closeWinUSB)");

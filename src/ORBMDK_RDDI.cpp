@@ -27,13 +27,9 @@ using namespace ORBMDK;
 // 日志
 //
 // ★ 2026-09-30：改为统一实现（src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）。
-//   本文件只定义模块名和一组薄宏，**全部既有调用点保持不变**；
-//   原来的 ORBMDK_LogLevel / ORBMDK_LogWriteFile / ORBMDK_Log 已删除
 //   —— 它们与 ORBMDK_HID.cpp 的 HID_Log 是两套逻辑重复的实现（§8.2）。
 //
 // 排障开关（对所有模块一致，免重启、免命令行）：
-//   %TEMP%\ORBMDK_LOG_LEVEL   0=DEBUG 1=INFO 2=TESTSPEED 3=VERBOSE 4=REV1
-//                             5=REV2 6=REV3 7=WARN 8=ERROR（最多 1 秒生效）
 //   环境变量 ORBMDK_LOG_LEVEL / ORBMDK_LOG_FILE（进程启动读一次，文件优先）
 // ============================================================================
 #define ORBMDK_LOG_MODULE "RDDI"
@@ -80,9 +76,6 @@ static constexpr int kJtagRecoverMaxFails = 3;
 // 由 ORBMDK::DAP_GetInfo 内部按当前模式分发到 HID 或 Bulk），在 RDDI_Open 里
 // 问一次并缓存进 ctx（见那里的说明）。
 //
-// **不要**改用 USB 设备描述符的 bcdDevice：那是 USB 栈/引导程序写的字段，
-// 与版本无关 —— 这就是它"不准"的原因，已弃用。
-//
 // 机理（§17.6 反汇编；§17.5 单变量对照实验）：
 // AGDI 把该串按 "%lu.%lu.%lu" 解析并取**主版本号**，`cmp eax, 2` 决定是否切到它
 // 自己的"多 DAP 设备"分支；那次观测里该分支走不通 —— **跳过全部设备枚举**
@@ -93,11 +86,11 @@ static constexpr int kJtagRecoverMaxFails = 3;
 // **注意**：那次观测发生在流式 sink 那 13 个接口实现之前，失败可能正源于接口缺失
 // （AGDI 来注册 sink 时无接口可调），不能直接推广到当前代码。
 //
-// 当前口径（2026-10-01 放开，见 Todo.md §18.10-C）：**设备的真实版本照问、照写日志**
+// 当前口径（2026-10-01 放开，见 Todo.md.bak §18.10-C）：**设备的真实版本照问、照写日志**
 // （RDDI_Open 里的 LOG_INFO 原样打印设备回串），但上报给主机的串经
 // ORBMDK_NormalizeProtocolVersion 把主版本提升到 >= 2，用于打开 AGDI 的流式分支。
 // 若实机回归出现上面那种"连上即断 / RDDI-DAP Error"，即为回退判据，
-// 回退步骤见 include/ORBMDK.h 里那段 ⚠️ 说明。
+// 回退步骤见 Todo.md.bak §18.10-C「判死条件与回退」（口径说明在 include/ORBMDK.h）。
 //
 // 下面这个常量只在**问不到设备**时使用（兜底）。⚠️ 它取 "1.0.0"（主版本 1），与上面
 // "归一化把主版本抬到 >= 2"**故意不一致**：兜底意味着设备状态未知（Identify case 4 的
@@ -131,6 +124,11 @@ static constexpr int kSingleDapId    = 0;
 //     (64 - 5) / 4 = 14
 // 上限同时受 ORBMDK_HID_DAPCommand 的长度校验约束（见 ORBMDK_HID.cpp）。
 static constexpr int kMaxBlockWords = 14;
+
+// 多笔传输（D2）一个批量最多几笔的**栈缓冲硬上限**。实际值取
+// min(kMaxMultiBatch, ORBMDK::DAP_TransferMultiMax()) —— 后者按当前出包长度算
+// （V1/HID 12 笔，V2/511 B 101 笔）。
+static constexpr int kMaxMultiBatch = 100;
 
 // V2 Bulk 下单次块传输的字数**硬上限**（防呆天花板，不随标定值/描述符放大）。
 // 126 来自**固件**（orbtrace/debug/cmsis_dap.py）：响应 RAM 深度 127 字（地址 0..126）、
@@ -223,6 +221,20 @@ struct RDDIContext {
     bool blockTransferSupported = true;
     bool blockTransferProbed    = false;
 
+    // 多笔传输（D2，**仅 SWD**）：把连续的多笔 DAP_Transfer 合成一条命令。
+    // 默认乐观开启，首次用到 DAP_RegAccessBlock 时探测一次；探测或后续失败即置 false，
+    // 本会话永久回退到逐笔（与块传输同一套"先探测、失败即回退"的做法）。
+    bool transferMultiSupported = true;
+    bool transferMultiProbed    = false;
+
+    // 等待值匹配的加速开关（D1）：
+    //   true  = 主机侧先读一次；若已满足就走（1 往返，与历史一致）；**未满足时**改让
+    //           固件用 MATCH_VALUE 在其内部按 match_retry 等（1 往返）+ 补一次普通读取值，
+    //           把最坏 100 次往返压到 3 次；
+    //   false = 回到纯主机侧轮询（固件忽略 match 位 / 失配时自动置 false）。
+    // ⚠ 不能把匹配读放进合并批量：该固件的匹配读**不回数据**（见 ProbeTransferMulti 说明）。
+    bool waitMatchSupported = true;
+
     // Debug configuration
     bool isSWD = true;
     // JTAG（§18.9 落地）：链上器件的 IR 长度与个数。
@@ -241,6 +253,38 @@ struct RDDIContext {
     int     jtagDpIndex     = 0;                        // JTAG-DP 在链上的位置
     int     jtagChainIrBits = 0;                        // 全链 IR 总位数
     uint8_t jtagCurIr       = 0;                        // DP 当前 IR；0 = 未知（需重选）
+    // 链上每个 TAP 的 IDCODE（jtagIds[0] = 离 TDO 最近），由 JtagInitSequence 扫链填充。
+    // ⚠ 必须留档：AGDI 的器件列表就是按本层给出的这张表画的（行数取
+    //   CMSIS_DAP_JTAG_GetIDCODEs 的 *count、每行 IDCODE 取 GetDeviceIDList，
+    //   两者都读 ctx->dapIdList，见 DetectTargetDapIdList 结尾）。
+    //   只留 DP 一个 IDCODE 会让 Keil 的 JTAG 列表少一行（Todo.md §7，2026-10-03 实测）。
+    uint32_t jtagIds[8]     = { 0 };
+    // ⛔ JTAG **位流批量写**（原 JtagApWriteBurst）已作废，代码与开关一并删除。
+    //    **不要再按"修采样点"这条路复活它** —— 它不是采样错位，是语义不成立。
+    //
+    // 依据（参考实现只有 orbtrace-1.4.3，其门级 DAP 用 Amaranth 写的）：
+    //   `orbtrace/debug/cmsis_dap.py:712-716`
+    //       with m.If(self.dbgif.ack==ACK_WAIT):
+    //           self.retries.eq(self.retries-1),
+    //           self.tfr_txb.eq(Mux(self.retries!=0, 6, 10))
+    //     ⇒ ACK_WAIT（=2）时**回到状态 6 = 把同一笔 TRANSACT 原样重发**，
+    //       `waitRetry` 默认 4096（同文件 :219）。即 WAIT 的含义是
+    //       "这一笔**没完成**，必须重发同一笔"，而不是"上位机把 ACK 采错了位"。
+    //
+    //   实测数据也指向真 WAIT，而不是错位：
+    //     `段ACK(段i=第i-1笔)=[2,1,2,1,2,1]`（严格交替）
+    //     `RegAccessBlock: numRegs=29 -> [batch=0 single=20 wait=9]`
+    //     —— 逐笔路径同样有 31% 的 WAIT（重试后才成功），说明该 AP 本来就常回 WAIT。
+    //
+    //   把 N 笔塞进**一条** ID_DAP_JTAG_SEQUENCE 连发，等于：返回 WAIT 的那半**被丢掉**
+    //   （写没生效），而调用方又从上一次未确认处**整体重写**（写两遍 + AP TAR 多自增）
+    //   ⇒ 丢字 + 错址叠加，正是 Keil 读/写内存出错、下载失败的成因。
+    //   **结论：位流拼接式批量写在语义上不可能正确，没有"采样点"可修。**
+    //
+    // 合法提速方向（尚未打通）：让**能重发的层**去做批量 —— 固件门级的
+    //   ID_DAP_TRANSFER（DAP_TransferMulti，内部按 WAIT 重发）。当前 JTAG 侧被
+    //   `batchLimit = ctx->isSWD ? … : 0` 关掉，见 RegAccessBlock；要动须连
+    //   JTAG "任何读都是延迟读"的规则一起处理（cmsis_dap.py:626-637、:778-786）。
     bool    jtagWritePending = false;                   // 有一次写已进 DP 流水线、待后续访问提交
     int     jtagRecoverFails = 0;                       // 链路自愈的连续失败次数（超过阈值停止重试，防风暴）
     uint32_t debugClock = kDefaultClock;
@@ -301,7 +345,7 @@ struct RDDIContext {
     // 故只在头几次失败时留痕（见该函数的实现）。
     int swoBaudFailCount = 0;
 
-    // ---- SWO 流式 trace 会话（Todo.md §18.10-C 阶段 2）----
+    // ---- SWO 流式 trace 会话（Todo.md.bak §18.10-C 阶段 2）----
     // AGDI 的注册与取数协议（反汇编 CMSIS_AGDI.dll 逐调用点取证）：
     //   Connect(handle)                                  → GetSinkCount(handle,&n)
     //   → GetSinkDetails(handle,i,Rec) 循环 i=0..n-1     → Attach(handle,idx)
@@ -494,21 +538,51 @@ static inline RDDIContext* GetContext(RDDIHandle handle)
 //   - 固件不支持：该命令被当作未知命令处理，响应长度 / 命令 ID / 计数对不上，
 //     DAP_TransferBlock 会返回错误（含新增的 Transfer Count 校验）→ 判定不可用。
 //
+// ★ 两段式：先单字，再**按实际工作深度**多字读一遍并逐字校验。
+//   只测单字太浅 —— 固件只要"能回一个字"就会通过，而块传输真正被用到的深度是
+//   BlockWordsLimit()（V2 下 125/126 字/往返，见 DAP_RegWriteRepeat）。固件若把 count
+//   解释错、只回部分数据或响应被截断，会**静默**给出错误数据（命令全报 OK、值却是错的）。
+//   故这里把深度测满：n 个字都应等于同一个 IDCODE。
+//   读 DP IDCODE 是理想的压力载荷 —— DP 读不自增、无副作用，n 次读恒回同一值。
+//
 // 探测失败只影响性能，不影响功能 —— 之后永久走逐字 DAP_Transfer。
 // ---------------------------------------------------------------------------
 static bool ProbeBlockTransfer(int dapId)
 {
+    // ① 单字基线。
     uint32_t idcode = 0;
     const int status = ORBMDK::DAP_TransferBlock(dapId, 1, 0x02 /* read IDCODE */,
                                                  nullptr, &idcode);
-    if (status == ORBMDK::DAP_RES_OK) {
-        LOG_INFO("Block transfer probe OK (ID_DAP_TRANSFER_BLOCK supported, idcode=0x%08X)",
-                 idcode);
-        return true;
+    if (status != ORBMDK::DAP_RES_OK) {
+        LOG_WARN("Block transfer probe failed (status=%d) -> firmware does not support "
+                 "ID_DAP_TRANSFER_BLOCK, falling back to single transfers", status);
+        return false;
     }
-    LOG_WARN("Block transfer probe failed (status=%d) -> firmware does not support "
-             "ID_DAP_TRANSFER_BLOCK, falling back to single transfers", status);
-    return false;
+
+    // ② 按实际工作深度多字读，逐字校验。
+    const int n = BlockWordsLimit();
+    if (n > 1) {
+        std::vector<uint32_t> buf(static_cast<size_t>(n), 0);
+        const int deep = ORBMDK::DAP_TransferBlock(dapId, static_cast<uint16_t>(n),
+                                                   0x02, nullptr, buf.data());
+        if (deep != ORBMDK::DAP_RES_OK) {
+            LOG_WARN("Block transfer probe: %d-word block read failed (status=%d) -> "
+                     "固件在真实工作深度下不可用，回退逐字传输", n, deep);
+            return false;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (buf[i] != idcode) {
+                LOG_WARN("Block transfer probe: %d-word block read 第 %d 字不符 "
+                         "(0x%08X != IDCODE 0x%08X) -> 固件深层块读静默不可信，"
+                         "回退逐字传输", n, i, buf[i], idcode);
+                return false;
+            }
+        }
+    }
+
+    LOG_INFO("Block transfer probe OK (ID_DAP_TRANSFER_BLOCK supported, idcode=0x%08X, "
+             "deep %d-word read verified)", idcode, n);
+    return true;
 }
 
 // 首次用到块传输时调用；之后再调用无开销。
@@ -522,6 +596,32 @@ static bool ProbeBlockTransfer(int dapId)
 // SWD 走"先探测、失败即永久回退"：探测失败只影响性能，功能不受影响，之后
 // 永久走逐字 DAP_Transfer。
 //
+// ---------------------------------------------------------------------------
+// 速率计量：把"当前传输层快照"报给日志模块（TESTSPEED 级）
+//
+// 只在计量开启时做事 —— 阈值高于 TESTSPEED 时**第一行就返回**（零开销，不取时钟）。
+// 传输层 / 速度 / 出包字节 / 每次往返字数 / 块传输是否生效，任一变化都会重打配置行。
+// ---------------------------------------------------------------------------
+static void PublishMeterConfig(const RDDIContext* ctx)
+{
+    if (!ORBMDK_LogMeterEnabled()) {
+        return;
+    }
+
+    const int pkt   = ORBMDK_USB_Bulk_GetMaxCommandBytes();  // 0 = HID / 未连接
+    const int speed = ORBMDK_USB_Bulk_GetDeviceSpeed();      // 0 = HID；1=Low 2=Full 3=High
+    const bool bulk = (pkt > 0);
+
+    int linkMbps = 12;                     // V1 HID：Full Speed 中断端点（负载固定 64 字节）
+    if (bulk) {
+        linkMbps = (speed == 3) ? 480 : (speed == 2 ? 12 : (speed == 1 ? 2 : 0));
+    }
+
+    ORBMDK_LogMeterSetTransport(bulk ? "V2/Bulk" : "V1/HID", linkMbps,
+                                bulk ? pkt : 64, BlockWordsLimit(),
+                                ctx->blockTransferSupported ? 1 : 0);
+}
+
 // 传输层是 HID 还是 Bulk 与本函数无关：两者都经 ORBMDK_HID_DAPCommand 派发，
 // 字数上限由 BlockWordsLimit() 按当前出包长度给出。
 static void EnsureBlockTransferProbed(RDDIContext* ctx, int dapId)
@@ -610,7 +710,7 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
                 // 带上系统错误码：否则现场只能看到"失败了"，无从判断是
                 // 设备未插、被独占、还是驱动问题。
                 const DWORD sysErr = GetLastError();
-                LOG_ERROR("RDDI_Open: open failed (V2 Bulk and V1 HID both failed), "
+                LOG_WARN("RDDI_Open: open failed (V2 Bulk and V1 HID both failed), "
                           "GetLastError()=%lu", (unsigned long)sysErr);
                 // 失败时必须把句柄置 0（本层句柄从 1 开始，0 恒为无效值）：
                 // AGDI 的 `rddi_Open(&handle, NULL)` 之后直接用该变量当句柄，
@@ -1215,6 +1315,197 @@ static bool JtagDrScan(RDDIContext* ctx, uint8_t request, uint32_t wdata,
     return true;
 }
 
+// ===========================================================================
+// ⛔ 以下整段是**已作废**的「JTAG 位流批量 DR 写」实现，用 #if 0 保留供考古。
+//
+// 作废结论（2026-10-03，参考 orbtrace-1.4.3 门级 DAP 唯一权威源）：
+//   WAIT 的语义是「这一笔**没完成**，必须原样重发同一笔」——见
+//   `orbtrace/debug/cmsis_dap.py:712-716`（ACK_WAIT ⇒ 退回状态 6 重发同一笔
+//   TRANSACT，waitRetry 默认 4096，:219）。`段ACK=[2,1,2,1,2,1]` 是**真 WAIT**，
+//   不是 ACK 采样错位；逐笔路径同样 31% WAIT（`[single=20 wait=9]`）可证。
+//   ⇒ 位流把 N 笔一次连发：返回 WAIT 的那半**被丢掉**，调用方又整体重写
+//     ⇒ 丢字 + 写两遍 + AP TAR 多自增，三者叠加。
+//   ⇒ **位流拼接式批量写在语义上不可能正确，没有"采样点"可修。**
+//   合法批量只能交给「能重发的那一层」：固件门级 ID_DAP_TRANSFER（DAP_TransferMulti）。
+//
+// ⚠ 任何人想把它 #if 1 复活：先读完上面结论 —— 它解决不了 WAIT，只会再次静默错址。
+// ===========================================================================
+#if 0
+// ---------------------------------------------------------------------------
+// JTAG 批量 DR 写：把 N 笔「同一 AP 寄存器」的写合并进**一条** ID_DAP_JTAG_SEQUENCE(0x14)。
+//
+// 背景（2026-10-03 实测）：JTAG 会话下固件块传输被禁用（§18.9 第十步），
+// `DAP_RegWriteRepeat` 逐笔往返 —— 实测 4.0 B/往返、170.7 us/往返、22.9 kB/s，
+// 而 SWD 块传输是 455 B/往返、563 kB/s。往返数是唯一瓶颈，故把 N 笔塞进一条命令。
+//
+// ⚠ 关键教训（首版即错，自检 read[0]==pattern[N-1] 暴露）：DAP 的 DR 只有 35(+旁路)
+//   位，**一段连续 Shift-DR 移 N×36 位 ≠ N 次访问** —— DAP 只在 Update-DR 处理 DR
+//   内容，只有末尾那笔真正生效。每笔必须完整走
+//   Select-DR → Capture-DR → Shift-DR → Exit1-DR → Update-DR 循环。
+//   相邻循环可拼段（导航拍可共用），但**每笔仍须回到 Run-Test/Idle** —— 见下一段。
+//
+// ⚠ 隔字丢失的根因（2026-10-03 实测 mem[i]==pattern[2i] 的复盘）：最初的拼段是
+//   Update-DR --TMS=1--> Select-DR 直达下一笔，**全程不进 Run-Test/Idle**。
+//   而参考固件 JTAG_DP.c:JTAG_Transfer() 每次访问都以 Update-DR → TMS=0 → **Idle**
+//   收尾（idle_cycles 也加在这里），本层的 JtagDrScan 同样以 {1,0,0} 落回 Idle。
+//   JTAG-DP 的 AP 访问是 posted 的：上一笔尚未提交时发来的那一笔会被**静默丢掉**，
+//   且应答仍是上一笔的 OK —— 所以既没有 WAIT 也没有 FAULT 可查，隔一笔丢一笔，
+//   TAR 只随真正生效的那笔自增，表现为 mem[i]==pattern[2i]。故每笔之间必须补 Idle。
+//
+// 每笔的段（**与 JtagDrScan 逐段等价**，导航拍单独成段且不捕获）：
+//   {2,  TMS=0, 不捕获}     Select-DR→Capture-DR→Shift-DR（导航 2 拍，不移位、不捕获）
+//   {total-1, TMS=0, 捕获}  首 total-1 个移位拍（捕获）
+//   {2,  TMS=1, 不捕获}     末位移位拍（Shift-DR→Exit1-DR）+ Exit1-DR→Update-DR，共 2 拍
+//   {1,  TMS=0, 不捕获}     Update-DR → Run-Test/Idle（提交本笔的 posted AP 访问）
+//   {1,  TMS=1, 不捕获}     Run-Test/Idle → Select-DR 接下一笔（末笔不补，直接以 Idle 收尾）
+// 移位拍合计 = (total-1) + 1 = total，恰好填满 total 位 DR。
+// ⚠ 2026-10-03 修正（首版把导航 2 拍并入捕获段、采样按 2+before 跳过 → 段ACK 恒 2,1 交替）：
+//   固件对捕获段是「按段字节对齐」返回，但**导航拍并进捕获段**后采样点与 posted 应答错位，
+//   首笔即误判 WAIT。改为与 JtagDrScan 完全一致的分段（导航拍不捕获），采样点回到 before。
+// 包长：请求 12K+3 B（2 头 + 每笔 nav2/cap6/last2/update1/link1 + 首个 Idle→Select 1）、
+//       响应 3+5K B ⇒ V2/Bulk(508B) K≤42（保守取 41）；V1/HID(64B) K≤4。
+//
+// ACK：JTAG-DP 是 posted 语义 —— 第 k 笔扫描的捕获是**第 k-1 笔**访问的应答
+// （JtagDapTransfer 的 RDBUFF 取数同理）。故此处校验写 0..K-2（捕获 1..K-1），
+// 末笔的 ACK 由随后的 JtagDapFlush（RDBUFF 读）兜底。任何一笔非 OK 即返回，
+// 调用方回退逐笔 —— 批量只影响速度，不改变正确性判定。
+// ---------------------------------------------------------------------------
+static constexpr int kJtagBurstMaxBulk = 41;   // V2/Bulk：请求 12*41+3=495 B / 响应 3+5*41=208 B
+static constexpr int kJtagBurstMaxHid  = 4;    // V1/HID ：请求 12*4+3=51 B / 响应 3+5*4=23 B（+报告ID 1 B ≤ 64）
+
+static int JtagBurstWordsLimit()
+{
+    return (ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE) ? kJtagBurstMaxBulk
+                                                            : kJtagBurstMaxHid;
+}
+
+// 一条命令写入 count 笔（count >= 2）。返回 ORBMDK::DAP_RES_*
+//
+// ⛔ **已停用（2026-10-03）**：默认不调用 —— 见 RDDIContext::jtagApBurstEnabled 的完整说明。
+//    核心缺陷：本函数把 count 笔位流**一次发完**（写已提交）之后才事后校验 ACK，而调用方
+//    把"返回失败"理解为"一笔都没写"⇒ 整体重写 ⇒ 数据被写两遍、AP TAR 多自增一段 ⇒ 静默错址。
+//    实证：`第 0/7 笔 ack=2（WAIT）-> 回退逐笔` + `段ACK=[2,1,2,1,2,1]`（错位误判，非真 WAIT）。
+static int JtagApWriteBurst(RDDIContext* ctx, uint8_t request, int count, const int* data)
+{
+    if (count < 2) return ORBMDK::DAP_RES_NO_ACK;
+    if (count > kJtagBurstMaxBulk) count = kJtagBurstMaxBulk;
+
+    const int idx    = ctx->jtagDpIndex;
+    const int before = idx;                                   // TDO 侧器件数（各 1 位旁路）
+    const int after  = ctx->jtagChainCount - idx - 1;          // TDI 侧器件数
+    const int total  = 35 + before + after;                    // 本链 = 36
+    const int capBits = total - 1;                             // 捕获段的移位拍数（末位交给 {2,1,0} 段）
+    if (capBits > 63) {                                        // info 只有 6 位（0 表 64）
+        LOG_WARN("JtagApWriteBurst: DR 单段 %d 位超出 63，放弃批量", capBits);
+        return ORBMDK::DAP_RES_NO_ACK;
+    }
+
+    const uint8_t ir = (request & 0x01) ? kJtagIrApacc : kJtagIrDpacc;
+    if (!JtagSetIr(ctx, ir)) return ORBMDK::DAP_RES_NO_ACK;
+
+    const int headBytes = (capBits + 7) / 8;                   // 5
+    ORBMDK::JtagSeg segs[5 * kJtagBurstMaxBulk + 2];           // 每笔 5 段（导航/捕获/末2拍/提交/链接）
+    // 按 headBytes 上限（8 = 63 位）开，链长时 headBytes>5 也不会越界
+    uint8_t tdiStore[kJtagBurstMaxBulk * 8] = {0};
+    uint8_t lastBits[kJtagBurstMaxBulk]     = {0};
+    uint8_t tdoStore[kJtagBurstMaxBulk * 8] = {0};
+
+    int n = 0;
+    segs[n++] = { 1, 1, 0, nullptr };                          // Idle -> Select-DR
+    for (int i = 0; i < count; ++i) {
+        // 本笔 total 位请求流（位序与 JtagDrScan 完全一致）
+        uint8_t s[8] = {0};
+        int pos = 0;
+        pos += before;                                         // TDO 侧旁路位
+        JtagPackBits(s, &pos, (request >> 1) & 1u, 1);         // RnW = 0（写）
+        JtagPackBits(s, &pos, (request >> 2) & 1u, 1);         // A2
+        JtagPackBits(s, &pos, (request >> 3) & 1u, 1);         // A3
+        JtagPackBits(s, &pos, static_cast<uint32_t>(data[i]), 32);
+        pos += after;                                          // TDI 侧旁路位
+
+        // 捕获段从第一个移位拍开始（导航 2 拍独立成段、不捕获），故请求位从位 0 起放；
+        // 最后一个移位拍交给 {2,TMS=1} 段。
+        uint8_t* t = &tdiStore[i * headBytes];
+        for (int b = 0; b < total - 1; ++b) {
+            if ((s[b >> 3] >> (b & 7)) & 1u) {
+                t[b >> 3] |= static_cast<uint8_t>(1u << (b & 7));
+            }
+        }
+        lastBits[i] = static_cast<uint8_t>((s[(total - 1) >> 3] >> ((total - 1) & 7)) & 1u);
+
+        segs[n++] = { 2, 0, 0, nullptr };                          // 导航：Select-DR→Capture-DR→Shift-DR（不捕获）
+        segs[n++] = { static_cast<uint8_t>(capBits), 0, 1, t };    // 前 total-1 个移位拍（捕获）
+        segs[n++] = { 2, 1, 0, &lastBits[i] };                     // 末位移位 + Exit1-DR + Update-DR（同拍）
+        segs[n++] = { 1, 0, 0, nullptr };                          // Update-DR -> Run-Test/Idle（提交本笔）
+        if (i != count - 1) {
+            segs[n++] = { 1, 1, 0, nullptr };                      // Idle -> Select-DR 接下一笔
+        }
+    }
+
+    size_t tdoLen = 0;
+    if (ORBMDK::DAP_JTAG_Sequence(segs, n, tdoStore, sizeof(tdoStore), &tdoLen) != 0) {
+        return ORBMDK::DAP_RES_NO_ACK;
+    }
+    if (tdoLen < static_cast<size_t>(count * headBytes)) {
+        LOG_WARN("JtagApWriteBurst: TDO 只回 %llu 字节（需要 %d）",
+                 (unsigned long long)tdoLen, count * headBytes);
+        return ORBMDK::DAP_RES_NO_ACK;
+    }
+
+    // posted ACK：第 i 段捕获（跳过 before 个旁路位后 3 位）= 第 i-1 笔写的应答
+    LOG_DEBUG("JtagApWriteBurst: tdoLen=%llu cap[0]=%s cap[1]=%s cap[2]=%s (headBytes=%d)",
+              (unsigned long long)tdoLen,
+              JtagHex(tdoStore, headBytes).c_str(),
+              JtagHex(tdoStore + headBytes, headBytes).c_str(),
+              JtagHex(tdoStore + 2 * headBytes, headBytes).c_str(), headBytes);
+    for (int i = 1; i < count; ++i) {
+        const uint8_t* cap = &tdoStore[i * headBytes];
+        const int p0 = before;                                     // 捕获段从首个移位拍起（无导航偏移）
+        const uint32_t c0 = (cap[p0 >> 3] >> (p0 & 7)) & 1u;
+        const uint32_t c1 = (cap[(p0 + 1) >> 3] >> ((p0 + 1) & 7)) & 1u;
+        const uint32_t c2 = (cap[(p0 + 2) >> 3] >> ((p0 + 2) & 7)) & 1u;
+        const uint8_t  ack = static_cast<uint8_t>((c0 << 1) | (c1 << 0) | (c2 << 2));
+        if (ack != 1) {
+            // 把整条 burst 每段的 ACK 都解析出来（段 i 的捕获 = 第 i-1 笔的应答，见上），
+            // 便于判断"从第几笔开始异常 / 是否整体移位错位 / 是否只末笔缺应答"。
+            char acksSeq[4 * kJtagBurstMaxBulk + 4];
+            int  ap = 0;
+            acksSeq[ap++] = '[';
+            for (int k = 1; k < count && ap < static_cast<int>(sizeof(acksSeq)) - 3; ++k) {
+                const uint8_t* c = &tdoStore[k * headBytes];
+                const uint32_t b0 = (c[p0 >> 3] >> (p0 & 7)) & 1u;
+                const uint32_t b1 = (c[(p0 + 1) >> 3] >> ((p0 + 1) & 7)) & 1u;
+                const uint32_t b2 = (c[(p0 + 2) >> 3] >> ((p0 + 2) & 7)) & 1u;
+                const uint8_t  a  = static_cast<uint8_t>((b0 << 1) | (b1 << 0) | (b2 << 2));
+                acksSeq[ap++] = static_cast<char>('0' + ((a <= 7) ? a : 7));
+                if (k != count - 1) acksSeq[ap++] = ',';
+            }
+            acksSeq[ap]     = ']';
+            acksSeq[ap + 1] = '\0';
+            LOG_WARN("JtagApWriteBurst: 第 %d/%d 笔 ack=%u（%s）-> 回退逐笔"
+                     " | req=0x%02X ir=%u(%s) RnW=%u A2=%u A3=%u data=0x%08X"
+                     " | cap[段%d]=%s c=%u%u%u"
+                     " | chain=%d before=%d after=%d total=%d capBits=%d headBytes=%d tdoLen=%llu"
+                     " | 已通过=%d 段ACK(段i=第i-1笔)=%s",
+                     i - 1, count, ack, (ack == 2) ? "WAIT" : "FAULT/NO_ACK",
+                     request, ir, (ir == kJtagIrApacc) ? "APACC" : "DPACC",
+                     (request >> 1) & 1u, (request >> 2) & 1u, (request >> 3) & 1u,
+                     static_cast<uint32_t>(data[i - 1]),
+                     i, JtagHex(cap, headBytes).c_str(), c0, c1, c2,
+                     ctx->jtagChainCount, before, after, total, capBits, headBytes,
+                     (unsigned long long)tdoLen,
+                     i - 1, acksSeq);
+            return JtagAckToRes(ack);
+        }
+    }
+
+    ctx->jtagWritePending = true;      // 末笔的提交交给下一次访问 / JtagDapFlush（兜底其 ACK）
+    LOG_DEBUG("JtagApWriteBurst: 一条命令写入 %d 字（request=0x%02X, %d 段, %d 位/笔）",
+              count, request, n, total);
+    return ORBMDK::DAP_RES_OK;
+}
+#endif   // ⛔ 已作废的位流批量写 —— 勿 #if 1，见上方结论（WAIT 必须重发同一笔）
+
 // 单次 DAP 传输（JTAG）。request 位定义与 SWD 一致：
 //   bit0 = APnDP, bit1 = RnW, bit2 = A2, bit3 = A3（bit4.. 的 MATCH/TIMESTAMP 未实现）
 // 返回值语义与 ORBMDK::DAP_Transfer 对齐（ORBMDK::DAP_RES_*）。
@@ -1365,6 +1656,10 @@ static bool JtagInitSequence(RDDIContext* ctx, int* outMode, uint32_t* outIdcode
     ctx->jtagIrLength     = ctx->jtagIrLens[dpIndex];
     ctx->jtagChainIrBits  = 0;
     for (int i = 0; i < devCount; ++i) ctx->jtagChainIrBits += ctx->jtagIrLens[i];
+    // 链上每个 TAP 的 IDCODE 留档（AGDI 的器件列表按它画，见 ctx->jtagIds 的说明）
+    for (int i = 0; i < 8; ++i) {
+        ctx->jtagIds[i] = (i < devCount) ? ids[i] : 0;
+    }
     ctx->jtagCurIr        = 0;       // 未知：让首次访问自己选 IR
     ctx->jtagWritePending = false;
 
@@ -1645,6 +1940,89 @@ RDDI_FUNC int DAP_WriteReg(const RDDIHandle handle, const int dapId, const int r
     return RDDI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// 多笔传输（D2）辅助
+// ---------------------------------------------------------------------------
+
+/// DAP_RES_* → RDDI 错误码（逐笔与批量处理共用，保证两条路径的返回码一致）
+static int MapDapStatusToRddi(int status)
+{
+    if (status == ORBMDK::DAP_RES_FAULT) {
+        return RDDI_DAP_DP_STICKY_ERR;
+    }
+    if (status == ORBMDK::DAP_RES_WAIT || status == ORBMDK::DAP_RES_NO_ACK) {
+        return RDDI_DAP_OPERATION_TIMEOUT;
+    }
+    return RDDI_INTERNAL_ERROR;
+}
+
+/// 一次成功写之后的副作用：状态 LED 跟踪 AP TAR(5) / DRW(7)。
+/// AGDI 通过 SWD_WriteData（TAR + DRW）写 DHCSR，即走这条路径。
+static void TrackLedForWrite(RDDIContext* ctx, int id, uint32_t data)
+{
+    if (id == 5) {          // TAR
+        TrackApTarWrite(ctx, data);
+    } else if (id == 7) {   // DRW
+        TrackApDataWrite(ctx, data);
+    }
+}
+
+// 多笔传输能力探测：**连读两次 DP IDCODE**（同一地址、同一值）并与单笔结果交叉比对
+// —— 三者一致才认为固件正确实现了 count>1。
+//
+// 为什么不直接信"规范要求支持"：这条命令在 AGDI 的内存/寄存器热路径上，一旦固件
+// 把 count 解释成别的意思（或只执行第一笔就返回），读回的数据会**静默错**（命令全报
+// OK、值却是错的）。探测成本：2 次往返，每会话一次。
+//
+// ⚠ 这里**只**验证读语义。曾经试过再加一段"批量内写"校验 —— 结论是**不能加在这个位置**，
+//   原因见函数体内的说明。要补写语义，必须另找载体与时机并在实机上回归。
+static bool ProbeTransferMulti(int dapId)
+{
+    // 只验证 count>1 的基本语义（读笔数据按序返回）：
+    //   连读两次 DP IDCODE，并与单笔结果三方交叉比对。
+    //
+    // ⚠ 这里**刻意不验证 match 语义**：实测 HSLinkPro/CherryDAP 固件的匹配读
+    //   **不往响应里写数据**（`DAP/Source/DAP.c` 的 "Store data" 只在普通读的
+    //   else 分支里，:832-836；匹配读分支 :755-788 之后直接出循环），所以
+    //   "匹配读 + 取值" 这种用法在该固件上不成立。match 只被用于"等待条件成立"
+    //   这一个用途（见 processOneLegacy 的等待值分支），且不依赖它回数据。
+    ORBMDK::DAP_XferItem items[2] = { { 0x02, 0 }, { 0x02, 0 } };   // 0x02 = DPACC 读 IDCODE
+    uint32_t rd[2] = { 0, 0 };
+    int      done  = 0;
+
+    const int st = ORBMDK::DAP_TransferMulti(dapId, items, 2, rd, &done);
+    if (st != ORBMDK::DAP_RES_OK || done != 2) {
+        LOG_WARN("TransferMulti probe failed (batch of 2 reads: status=%d, done=%d) "
+                 "-> 本会话回退逐笔传输", st, done);
+        return false;
+    }
+
+    uint32_t one = 0;
+    if (ORBMDK::DAP_Transfer(dapId, 0x02, &one) != ORBMDK::DAP_RES_OK) {
+        LOG_WARN("TransferMulti probe: 单笔交叉比对失败 -> 本会话回退逐笔传输");
+        return false;
+    }
+    if (!((rd[0] == rd[1]) && (rd[0] == one) && one != 0u && one != 0xFFFFFFFFu)) {
+        LOG_WARN("TransferMulti probe MISMATCH (batch=0x%08X/0x%08X single=0x%08X) "
+                 "-> 本会话回退逐笔传输", rd[0], rd[1], one);
+        return false;
+    }
+
+    // ⚠ 这里曾加过一段"批量内写"校验（读 DP SELECT -> 同值写回 -> 读回自比）。**已撤回**：
+    //   实测在 orbtrace 上，它会让本会话**后续的 AP 存储器访问全部读回 0**
+    //   （CPUID / DHCSR / RAM 皆 0；而 AP 寄存器如 CSW 仍正常）。同一固件上：
+    //     · 用加固前的 DLL 跑同一 swdprobe = 19/0；
+    //     · 用"只加块传输深读、不加本校验"的 DLL = 正常；
+    //     · 用加了本校验的 DLL = 14/5。
+    //   ⇒ 破坏就出在这一句上（机理未查清）。**不要**再往这里塞写笔：探测发生在
+    //     DAP_RegAccessBlock 的 flushBatch 中途，此时 DP/AP 的选择与 posted-read
+    //     流水线正处于"半途"状态，额外插写笔容易把它带乱。要补写语义，须换载体
+    //     （不要碰 DP SELECT）与时机，并先在 orbtrace 上做同样的实机回归。
+
+    LOG_INFO("TransferMulti probe OK (idcode=0x%08X, count>1 读语义已交叉验证)", one);
+    return true;
+}
+
 RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const int numRegs,
                                  const int *regIdArray, int *dataArray)
 {
@@ -1673,23 +2051,269 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
     int  matchMask    = 0;
     int  matchRetry   = 100;
 
-    // Build transfer request sequence
+    // ---------------------------------------------------------------------
+    // 多笔传输（D2）：把**连续的非等待**寄存器合并进一条 DAP_Transfer 命令。
+    //
+    // 依据：AGDI 的 SWD_GetARMRegs / SWD_SetARMRegs（单步、运行、命中断点时的
+    // 上下文保存/恢复）一次就是十几笔，逐笔发等于十几次 USB 往返；实测每次往返
+    // 固定 ≈150 µs（COMPAT_ANALYSIS §9.4 / Todo.md §4 阶段 5）。
+    //
+    // 语义等价性：DAP_Transfer 按**顺序**执行，同一批量里的 DP_SELECT 之类顺带写也保序
+    // （AP posted read 由固件处理），所以与逐笔逐字等价。
+    //
+    // ⚠ 只用于 SWD：JTAG 下固件的 DAP_Transfer(0x05) 不响应（§18.9），那里
+    //    DapTransferFor 走的是本层自己的 JTAG 引擎，无法"合并批量"。
+    // ⚠ 能力先探测（ProbeTransferMulti）；失败/中途异常即本会话永久回退逐笔。
+    // ---------------------------------------------------------------------
+    // 攒批量上限只由**出包长度**决定（乐观估计）。真正的能力判定放在"首次合并批量"时做 ——
+    // 否则本次若压根没有可合的笔（例如只来一笔读），也要白付一次探测成本。
+    const int multiMax   = ORBMDK::DAP_TransferMultiMax();
+    const int batchLimit = ctx->isSWD
+                               ? ((multiMax < kMaxMultiBatch) ? multiMax : kMaxMultiBatch)
+                               : 0;
+
+    // 批量缓冲按**槽位（slot）**粒度。一个 WaitForValue 读会占两个槽：
+    //   [掩码伪写笔(bit5)] + [带 bit4 的匹配读] —— 依据见 ORBMDK_HID.h 的说明。
+    std::array<ORBMDK::DAP_XferItem, kMaxMultiBatch> bItem {};
+    std::array<uint32_t, kMaxMultiBatch> bR    {};
+    std::array<int,      kMaxMultiBatch> bIdx  {};   // 槽 -> 输入下标（-1 = 掩码伪笔）
+    std::array<int,      kMaxMultiBatch> bId   {};   // 槽 -> 寄存器 id（LED 跟踪用）
+    std::array<int,      kMaxMultiBatch> bRead {};   // 槽是否返回数据
+    int nb     = 0;
+    int iFirst = -1;    // 本批量覆盖的输入下标区间（中途失配时按区间重做）
+    int iLast  = -1;
+    // 诊断计数（TESTSPEED 级才落盘）
+    int trips   = 0;    // 本次调用实际发生的 USB 往返数
+    int nBatch  = 0;    // 其中由"多笔传输"发出的批量数
+    int nSingle = 0;    // 逐笔发出的笔数
+    int nWait   = 0;    // WaitForValue 笔数
+
+    // 槽位结果落地：读回填、写做 LED 跟踪、掩码伪笔跳过
+    auto applySlot = [&](int k) {
+        if (bIdx[k] < 0) {
+            return;
+        }
+        if (bRead[k]) {
+            dataArray[bIdx[k]] = static_cast<int>(bR[k]);
+        } else {
+            TrackLedForWrite(ctx, bId[k], bItem[k].data);
+        }
+    };
+
+    // 单笔老路（含 WaitForValue 的**主机侧轮询**）：单槽批量 / JTAG / 探测失败回退 /
+    // 以及"批量中途失配后重做剩余项"都用它 —— 与历史逐笔行为逐字一致。
+    auto processOneLegacy = [&](int i) -> int {
+        const int regId  = regIdArray[i];
+        const int id     = GetRegId(regId);
+        const int offset = GetRegOffset(regId);
+        if (offset < 0) {
+            return RDDI_DAP_BAD_REGISTER_ID;
+        }
+        const bool isRead = (regId & DAP_REG_RnW) != 0;
+        const bool isWait = (regId & DAP_REG_WaitForValue) != 0;
+
+        if (isRead && isWait) {
+            // dataArray[i] 是期望值，掩码取自 MATCH_MASK；未给 MATCH_MASK 时
+            // 按期望值中为 1 的位匹配（"等这些位置起来"），而不是全等比较。
+            const uint8_t request   = static_cast<uint8_t>(offset) | 0x02;
+            const int expected      = dataArray[i];
+            const int effectiveMask = matchMaskSet ? matchMask : expected;
+            const int retries       = (matchRetry > 0) ? matchRetry : 1;
+            uint32_t data = 0;
+            int status = ORBMDK::DAP_RES_ERROR;
+            ++nWait;
+            for (int r = 0; r < retries; r++) {
+                data = 0;
+                ++trips;
+                status = DapTransferFor(ctx, dapId, request, &data);
+                if (status != ORBMDK::DAP_RES_OK) {
+                    break;
+                }
+                if ((static_cast<int>(data) & effectiveMask) == (expected & effectiveMask)) {
+                    break;                          // 条件已满足（快路径：1 次往返）
+                }
+
+                // 还没满足。若固件支持 MATCH_VALUE，就让**它**按 match_retry 在内部等，
+                // 而不是主机再轮询最多 99 次（每次 1 往返）。
+                //   ① 一条命令带 2 槽 = 1 次往返：[掩码伪写笔] + [匹配读]
+                //      （匹配读**不回数据**，所以 ② 必须补一次普通读来取值）
+                //   ② 普通读 1 次往返 → 拿到"等到之后"的真实值
+                // 合计最坏 3 次往返（对比主机轮询最坏 100 次）。
+                if (ctx->waitMatchSupported) {
+                    ORBMDK::DAP_XferItem mi[2] = {
+                        { 0x20u, static_cast<uint32_t>(effectiveMask) },        // 掩码伪写笔
+                        { static_cast<uint8_t>(request | 0x10),
+                          static_cast<uint32_t>(expected & effectiveMask) }     // 匹配读
+                    };
+                    ++trips;
+                    const int mst = ORBMDK::DAP_TransferMulti(dapId, mi, 2, nullptr, nullptr);
+                    if (mst == ORBMDK::DAP_RES_OK) {
+                        ++trips;
+                        data = 0;
+                        status = DapTransferFor(ctx, dapId, request, &data);
+                        if (status != ORBMDK::DAP_RES_OK) {
+                            break;
+                        }
+                        if ((static_cast<int>(data) & effectiveMask) ==
+                            (expected & effectiveMask)) {
+                            break;
+                        }
+                        // 固件说匹配成功、普通读却仍不匹配 ⇒ 该固件忽略 match 位，别再依赖
+                        LOG_WARN("DAP_RegAccessBlock[%d]: 固件 match 结果与读值不一致 -> "
+                                 "本会话改用主机侧轮询", i);
+                    }
+                    ctx->waitMatchSupported = false;
+                }
+            }
+            if (status == ORBMDK::DAP_RES_OK &&
+                (static_cast<int>(data) & effectiveMask) != (expected & effectiveMask)) {
+                LOG_ERROR("DAP_RegAccessBlock[%d]: no match after %d retries "
+                          "(expected 0x%08X, mask 0x%08X%s, got 0x%08X)",
+                          i, retries, expected, effectiveMask,
+                          matchMaskSet ? "" : " (derived from expected)", data);
+                return RDDI_DAP_NO_MATCH;
+            }
+            if (status != ORBMDK::DAP_RES_OK) {
+                return MapDapStatusToRddi(status);
+            }
+            dataArray[i] = static_cast<int>(data);
+            return RDDI_SUCCESS;
+        }
+
+        uint32_t data = isRead ? 0u : static_cast<uint32_t>(dataArray[i]);
+        const uint8_t request = static_cast<uint8_t>(offset | (isRead ? 0x02 : 0x00));
+        ++trips;
+        ++nSingle;
+        const int status = DapTransferFor(ctx, dapId, request, &data);
+        if (status != ORBMDK::DAP_RES_OK) {
+            return MapDapStatusToRddi(status);
+        }
+        if (isRead) {
+            dataArray[i] = static_cast<int>(data);
+        } else {
+            TrackLedForWrite(ctx, id, data);
+        }
+        return RDDI_SUCCESS;
+    };
+
+    // 把已攒的批量发出去；返回 RDDI 码（RDDI_SUCCESS = 全部成功）
+    auto flushBatch = [&]() -> int {
+        if (nb == 0) {
+            return RDDI_SUCCESS;
+        }
+        const int n = nb;
+        const int f = iFirst;
+        const int l = iLast;
+        nb     = 0;
+        iFirst = -1;
+        iLast  = -1;
+
+        // ≥2 槽才值得合并批量。首次合并批量前先探测能力（含 match/掩码语义）；
+        // 探测失败 → 本批量按逐笔老路重做（顺序与语义完全不变，只是慢）。
+        const bool wantMulti = (n >= 2);
+        if (wantMulti && !ctx->transferMultiProbed) {
+            ctx->transferMultiProbed    = true;
+            ctx->transferMultiSupported = ProbeTransferMulti(dapId);
+        }
+
+        if (wantMulti && ctx->transferMultiSupported) {
+            int done = 0;
+            ++trips;                                   // 合并批量：n 槽 = 1 次往返
+            ++nBatch;
+            const int status = ORBMDK::DAP_TransferMulti(dapId, bItem.data(), n, bR.data(), &done);
+
+            if (status == ORBMDK::DAP_RES_OK && done == n) {
+                for (int k = 0; k < n; ++k) {
+                    applySlot(k);
+                }
+                return RDDI_SUCCESS;
+            }
+
+            if (status == ORBMDK::DAP_RES_VALUE_MISMATCH) {
+                // ★ 等值没等到 —— 这是 match 的**正常语义**，不是故障：
+                //   已完成的槽照收，剩余项按逐笔老路重做（老路自己做主机侧轮询）。
+                //
+                // 但"首槽就没执行"要区分两种情况：首槽若是**普通笔**却没执行，说明固件
+                // 根本没按 count>1 处理（不可信，永久回退）；首槽若本身就是匹配读，
+                // 首槽失配是正常现象，不当作故障。
+                if (done == 0 && n >= 2 && (bItem[0].request & 0x10) == 0) {
+                    ctx->transferMultiSupported = false;
+                    LOG_WARN("DAP_RegAccessBlock: 多笔传输首槽即未执行 (n=%d) "
+                             "-> 本会话回退逐笔传输", n);
+                }
+                for (int k = 0; k < done; ++k) {
+                    applySlot(k);
+                }
+                int regStart = -1;
+                for (int k = done; k < n; ++k) {
+                    if (bIdx[k] >= 0) {
+                        regStart = bIdx[k];
+                        break;
+                    }
+                }
+                if (regStart < 0) {
+                    return RDDI_SUCCESS;               // 没有待做的寄存器项
+                }
+                LOG_DEBUG("DAP_RegAccessBlock: 匹配失配于槽 %d/%d -> 下标 %d..%d 按逐笔重做",
+                          done, n, regStart, l);
+                for (int i = regStart; i <= l; ++i) {
+                    const int rc = processOneLegacy(i);
+                    if (rc != RDDI_SUCCESS) {
+                        return rc;
+                    }
+                }
+                return RDDI_SUCCESS;
+            }
+
+            // 其它提前中断（FAULT/WAIT/NO_ACK/莫名停下）：按失败上抛，与逐笔路径在
+            // 首个失败处返回一致；只在"完全没有进展"时才判定固件有问题并永久回退。
+            if (done == 0) {
+                ctx->transferMultiSupported = false;
+            }
+            LOG_WARN("DAP_RegAccessBlock: 多笔传输异常 (status=%d, done=%d/%d)",
+                     status, done, n);
+            return MapDapStatusToRddi(status != ORBMDK::DAP_RES_OK ? status
+                                                                  : ORBMDK::DAP_RES_ERROR);
+        }
+
+        // 逐笔：单槽批量 / JTAG 会话 / 探测失败 / 已回退 —— 与历史行为完全一致
+        if (f >= 0 && l >= f) {
+            for (int i = f; i <= l; ++i) {
+                const int rc = processOneLegacy(i);
+                if (rc != RDDI_SUCCESS) {
+                    return rc;
+                }
+            }
+        }
+        return RDDI_SUCCESS;
+    };
+
     for (int i = 0; i < numRegs; i++) {
         const int regId = regIdArray[i];
         const int id    = GetRegId(regId);
 
-        if (id == 16) {              // MATCH_MASK
+        if (id == 16) {              // MATCH_MASK：虚拟寄存器，先落地已攒的批量
+            const int rc = flushBatch();
+            if (rc != RDDI_SUCCESS) {
+                return rc;
+            }
             matchMask    = dataArray[i];
             matchMaskSet = true;
             continue;
         }
         if (id == 17) {              // MATCH_RETRY
+            const int rc = flushBatch();
+            if (rc != RDDI_SUCCESS) {
+                return rc;
+            }
             matchRetry = dataArray[i];
             continue;
         }
 
         const int offset = GetRegOffset(regId);
         if (offset < 0) {
+            // 先把前面已攒的发掉，保持"顺序执行、在坏项处停下"的历史行为
+            (void)flushBatch();
             LOG_ERROR("DAP_RegAccessBlock[%d]: unsupported regID=0x%08X", i, regId);
             return RDDI_DAP_BAD_REGISTER_ID;
         }
@@ -1697,67 +2321,68 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
         const bool isRead = (regId & DAP_REG_RnW) != 0;
         const bool isWait = (regId & DAP_REG_WaitForValue) != 0;
 
-        uint32_t data = 0;
-        int status = 0;
-
-        if (isRead) {
-            const uint8_t request = static_cast<uint8_t>(offset) | 0x02;
-            if (isWait) {
-                // 读并等待值匹配：dataArray[i] 是期望值，掩码取自 MATCH_MASK。
-                // 本次调用未给出 MATCH_MASK 时按期望值中为 1 的位匹配
-                // （"等这些位置起来"），而不是全等比较 —— 见 matchMaskSet 的说明。
-                const int expected      = dataArray[i];
-                const int effectiveMask = matchMaskSet ? matchMask : expected;
-                const int retries       = (matchRetry > 0) ? matchRetry : 1;
-                status = ORBMDK::DAP_RES_ERROR;
-                for (int r = 0; r < retries; r++) {
-                    data = 0;
-                    status = DapTransferFor(ctx, dapId, request, &data);
-                    if (status != ORBMDK::DAP_RES_OK) {
-                        break;
-                    }
-                    if ((static_cast<int>(data) & effectiveMask) == (expected & effectiveMask)) {
-                        break;
-                    }
-                }
-                if (status == ORBMDK::DAP_RES_OK &&
-                    (static_cast<int>(data) & effectiveMask) != (expected & effectiveMask)) {
-                    LOG_ERROR("DAP_RegAccessBlock[%d]: no match after %d retries "
-                              "(expected 0x%08X, mask 0x%08X%s, got 0x%08X)",
-                              i, retries, expected, effectiveMask,
-                              matchMaskSet ? "" : " (derived from expected)", data);
-                    return RDDI_DAP_NO_MATCH;
-                }
-            } else {
-                status = DapTransferFor(ctx, dapId, request, &data);
+        if (batchLimit <= 0) {
+            // 未启用批量处理（JTAG / 已回退）：逐笔，与历史行为一致
+            const int rc = processOneLegacy(i);
+            if (rc != RDDI_SUCCESS) {
+                return rc;
             }
-            if (status == ORBMDK::DAP_RES_OK) {
-                dataArray[i] = static_cast<int>(data);
-            }
-        } else {
-            const uint8_t request = static_cast<uint8_t>(offset);
-            data = static_cast<uint32_t>(dataArray[i]);
-            status = DapTransferFor(ctx, dapId, request, &data);
-            if (status == ORBMDK::DAP_RES_OK) {
-                // 状态 LED：跟踪 AP TAR(5) / DRW(7) 写入。
-                // AGDI 通过 SWD_WriteData（TAR + DRW）写 DHCSR，即走本分支。
-                if (id == 5) {          // TAR
-                    TrackApTarWrite(ctx, data);
-                } else if (id == 7) {   // DRW
-                    TrackApDataWrite(ctx, data);
-                }
-            }
+            continue;
         }
 
-        if (status != ORBMDK::DAP_RES_OK) {
-            if (status == ORBMDK::DAP_RES_FAULT) {
-                return RDDI_DAP_DP_STICKY_ERR;
+        if (isRead && isWait) {
+            // 等待值匹配**不编进批量**：实测 HSLinkPro/CherryDAP 固件的匹配读
+            // **不往响应里写数据**（`DAP/Source/DAP.c:755-788` 之后直接出循环，
+            // 而 "Store data" 只在普通读分支 :832-836），所以"匹配读 + 取值"不成立。
+            // 处理：先把已攒的发掉，再走单笔老路 —— 老路内部有"固件 match 加速"
+            // （未满足时让固件等 1 往返 + 补一次普通读，把最坏 100 次压到 3 次）。
+            const int rc0 = flushBatch();
+            if (rc0 != RDDI_SUCCESS) {
+                return rc0;
             }
-            if (status == ORBMDK::DAP_RES_WAIT || status == ORBMDK::DAP_RES_NO_ACK) {
-                return RDDI_DAP_OPERATION_TIMEOUT;
+            const int rc1 = processOneLegacy(i);
+            if (rc1 != RDDI_SUCCESS) {
+                return rc1;
             }
-            return RDDI_INTERNAL_ERROR;
+            continue;
         }
+
+        if (nb >= batchLimit) {
+            const int rc = flushBatch();
+            if (rc != RDDI_SUCCESS) {
+                return rc;
+            }
+        }
+        if (iFirst < 0) {
+            iFirst = i;
+        }
+        iLast = i;
+        bItem[nb].request = static_cast<uint8_t>(offset | (isRead ? 0x02 : 0x00));
+        bItem[nb].data    = isRead ? 0u : static_cast<uint32_t>(dataArray[i]);
+        bR[nb]    = 0;
+        bIdx[nb]  = i;
+        bId[nb]   = id;
+        bRead[nb] = isRead ? 1 : 0;
+        ++nb;
+    }
+
+    {
+        const int rc = flushBatch();
+        if (rc != RDDI_SUCCESS) {
+            return rc;
+        }
+    }
+
+    // 诊断（TESTSPEED 级，只落日志文件）：一次 RegAccessBlock 到底发了几个往返，以及
+    // **被谁切碎**（batch = 合并批量发出的批量数 / single = 逐笔 / wait = 等值匹配笔）。
+    // ⚠ 只在 numRegs ≥ 4 时打：2~3 笔的调用是热路径（实测一次会话上万次），逐笔打会把
+    //   日志冲垮（首次实测 12k 行里 11944 行都是 `numRegs=2 -> 1`）。
+    if (numRegs >= 4 && ORBMDK_LogMeterEnabled()) {
+        ORBMDK_LOG_AT_TESTSPEED("RDDI",
+                                "RegAccessBlock: numRegs=%d -> %d round trip(s) "
+                                "[batch=%d single=%d wait=%d]%s",
+                                numRegs, trips, nBatch, nSingle, nWait,
+                                ctx->transferMultiSupported ? " (multi-transfer on)" : "");
     }
 
     return RDDI_SUCCESS;
@@ -1805,7 +2430,9 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
 
     // 首次使用时探测固件是否支持 ID_DAP_TRANSFER_BLOCK；不支持则自动回退
     EnsureBlockTransferProbed(ctx, dapId);
+    PublishMeterConfig(ctx);          // 能力落定后（或传输层变化时）补一条 meter config
 
+    const int meterOn = ORBMDK_LogMeterEnabled();
     const int wordsLimit = BlockWordsLimit();
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
@@ -1814,10 +2441,18 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
         }
 
         if (ctx->blockTransferSupported) {
+            if (meterOn) {
+                ORBMDK_LogMeterTripBegin();   // 墙钟从这一笔开始（见 ORBMDK_Log.h）
+            }
+            const unsigned long long t0 = meterOn ? ORBMDK_LogMeterNowUs() : 0ull;
             const int status = ORBMDK::DAP_TransferBlock(
                 dapId, static_cast<uint16_t>(chunk), request,
                 reinterpret_cast<const uint32_t*>(dataArray + done), nullptr);
             if (status == ORBMDK::DAP_RES_OK) {
+                if (meterOn) {
+                    ORBMDK_LogMeterAccount(1, (unsigned)(chunk * 4), 1u,
+                                           ORBMDK_LogMeterNowUs() - t0);
+                }
                 done += chunk;
                 continue;
             }
@@ -1826,13 +2461,28 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
                      "falling back to single transfers", status);
         }
 
-        for (int i = 0; i < chunk; i++) {
-            uint32_t data = static_cast<uint32_t>(dataArray[done + i]);
-            const int status = DapTransferFor(ctx, dapId, request, &data);
-            if (status != ORBMDK::DAP_RES_OK) {
-                LOG_ERROR("DAP_RegWriteRepeat: single write failed at %d/%d, status=%d",
-                          done + i, numRepeats, status);
-                return RDDI_DAP_ERROR;
+        // ⛔ 此处原有「JTAG 位流批量写」（JtagApWriteBurst）分支，已**整体删除**。
+        //    原因见 RDDIContext 顶部注释：WAIT 必须原样重发同一笔（orbtrace 门级
+        //    cmsis_dap.py:712-716），位流一次连发 N 笔在语义上不可能正确。
+        //    JTAG 的合法批量只能走固件门级的 ID_DAP_TRANSFER（DAP_TransferMulti），
+        //    其 `batchLimit` 对 JTAG 目前被关掉（见下方 RegAccessBlock 的 `: 0`）。
+        {
+            if (meterOn) {
+                ORBMDK_LogMeterTripBegin();
+            }
+            const unsigned long long t0 = meterOn ? ORBMDK_LogMeterNowUs() : 0ull;
+            for (int i = 0; i < chunk; i++) {
+                uint32_t data = static_cast<uint32_t>(dataArray[done + i]);
+                const int status = DapTransferFor(ctx, dapId, request, &data);
+                if (status != ORBMDK::DAP_RES_OK) {
+                    LOG_ERROR("DAP_RegWriteRepeat: single write failed at %d/%d, status=%d",
+                              done + i, numRepeats, status);
+                    return RDDI_DAP_ERROR;      // 失败的那一次不记账
+                }
+            }
+            if (meterOn) {
+                ORBMDK_LogMeterAccount(1, (unsigned)(chunk * 4), (unsigned)chunk,
+                                       ORBMDK_LogMeterNowUs() - t0);
             }
         }
         done += chunk;
@@ -1867,7 +2517,9 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
 
     // 首次使用时探测固件是否支持 ID_DAP_TRANSFER_BLOCK；不支持则自动回退
     EnsureBlockTransferProbed(ctx, dapId);
+    PublishMeterConfig(ctx);          // 能力落定后（或传输层变化时）补一条 meter config
 
+    const int meterOn = ORBMDK_LogMeterEnabled();
     const int wordsLimit = BlockWordsLimit();
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
@@ -1880,10 +2532,19 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
             for (int i = 0; i < chunk; i++) {
                 dataArray[done + i] = 0;
             }
+            // 计时从清零之后开始：只算 DAP 传输段，主机侧清理不计入
+            if (meterOn) {
+                ORBMDK_LogMeterTripBegin();
+            }
+            const unsigned long long t0 = meterOn ? ORBMDK_LogMeterNowUs() : 0ull;
             const int status = ORBMDK::DAP_TransferBlock(
                 dapId, static_cast<uint16_t>(chunk), request,
                 nullptr, reinterpret_cast<uint32_t*>(dataArray + done));
             if (status == ORBMDK::DAP_RES_OK) {
+                if (meterOn) {
+                    ORBMDK_LogMeterAccount(0, (unsigned)(chunk * 4), 1u,
+                                           ORBMDK_LogMeterNowUs() - t0);
+                }
                 done += chunk;
                 continue;
             }
@@ -1892,15 +2553,25 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
                      "falling back to single transfers", status);
         }
 
-        for (int i = 0; i < chunk; i++) {
-            uint32_t data = 0;
-            const int status = DapTransferFor(ctx, dapId, request, &data);
-            if (status != ORBMDK::DAP_RES_OK) {
-                LOG_ERROR("DAP_RegReadRepeat: single read failed at %d/%d, status=%d",
-                          done + i, numRepeats, status);
-                return RDDI_DAP_ERROR;
+        {
+            if (meterOn) {
+                ORBMDK_LogMeterTripBegin();
             }
-            dataArray[done + i] = static_cast<int>(data);
+            const unsigned long long t0 = meterOn ? ORBMDK_LogMeterNowUs() : 0ull;
+            for (int i = 0; i < chunk; i++) {
+                uint32_t data = 0;
+                const int status = DapTransferFor(ctx, dapId, request, &data);
+                if (status != ORBMDK::DAP_RES_OK) {
+                    LOG_WARN("DAP_RegReadRepeat: single read failed at %d/%d, status=%d",
+                              done + i, numRepeats, status);
+                    return RDDI_DAP_ERROR;      // 失败的那一次不记账
+                }
+                dataArray[done + i] = static_cast<int>(data);
+            }
+            if (meterOn) {
+                ORBMDK_LogMeterAccount(0, (unsigned)(chunk * 4), (unsigned)chunk,
+                                       ORBMDK_LogMeterNowUs() - t0);
+            }
         }
         done += chunk;
     }
@@ -2176,9 +2847,13 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
             if (newIsSwd != ctx->isSWD) {
                 ctx->blockTransferProbed    = false;
                 ctx->blockTransferSupported = true;   // 乐观开启，按新模式重新落定
+                // 多笔传输同样只在 SWD 下可用：换模式后探测结论与等待加速一并重新判定
+                ctx->transferMultiProbed    = false;
+                ctx->transferMultiSupported = true;
+                ctx->waitMatchSupported     = true;
                 ctx->jtagCurIr        = 0;
                 ctx->jtagWritePending = false;
-                LOG_INFO("CMSIS_DAP_ConfigureInterface: 调试模式切换 -> 块传输能力将重新判定");
+                LOG_INFO("CMSIS_DAP_ConfigureInterface: 调试模式切换 -> 块传输/多笔传输能力将重新判定");
             }
 
             ctx->isSWD = newIsSwd;
@@ -2255,7 +2930,7 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
     // 因此需要试 JTAG 时照样可选：本层会按 ConfigureInterface 的 Port= 走 JTAG 路径。）
     // JTAG 在真机上验证通过后，把 `| INFO_CAPS_JTAG` 加回来。
     //
-    // SWO 位（Bit2/Bit3）是 AGDI trace 配置块的**门控位**（反汇编见 Todo.md §18.8）：
+    // SWO 位（Bit2/Bit3）是 AGDI trace 配置块的**门控位**（反汇编见 COMPAT_ANALYSIS.md §17.9(8)）：
     //   0x10022A2F  test caps, 0x04   ; INFO_CAPS_SWO_UART
     //   0x10022A53  test caps, 0x08   ; INFO_CAPS_SWO_MANCHESTER
     // 两位都置 0 时，AGDI 找不到可用的 Trace Port，会把传输兜底写成 None
@@ -2265,7 +2940,7 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
     // Read 传输只需上面两位之一，**不**要求 Identify(idNo=4) 主版本 >= 2，
     // 也**不**要求 INFO_CAPS_SWO_STREAMING_TRACE(0x40)。
     //
-    // Streaming 位（Bit6 = 0x40）**已置**（2026-10-01 放开，见 Todo.md §18.10-C）。
+    // Streaming 位（Bit6 = 0x40）**已置**（2026-10-01 放开，见 Todo.md.bak §18.10-C）。
     // 它与 Identify(idNo=4) 的主版本号是同一道门控的两半，两道必须同侧：
     //   0x1003CB97  cmp eax, 2 / jb   —— 主版本 >= 2 才走 streaming sink 注册
     //   0x10022A6B  test caps, 0x40   —— caps 无 0x40 时 Trace 传输退回 Read
@@ -2296,6 +2971,7 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
         LOG_INFO("CMSIS_DAP_Capabilities: 无探针能力位（probeCaps<0）-> 乐观口径 0x%04X",
                  static_cast<unsigned>(caps));
     }
+
     *cap_info = caps;
 
     return RDDI_SUCCESS;
@@ -2384,14 +3060,41 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
         status = DapTransferFor(ctx, 0, 0x02, &idcode);
     }
 
+    // ------------------------------------------------------------------
+    // 填"器件表" —— AGDI 的 JTAG_devs 就是按这张表画的（行数取
+    // CMSIS_DAP_JTAG_GetIDCODEs 的 *count，每行 IDCODE 取 GetDeviceIDList /
+    // DetectDAPIDList，两者都读 ctx->dapIdList；见本函数上方说明）：
+    //   * JTAG 会话：链上**每个 TAP** 都是一行（本链 = cpu IR=4 + bs IR=5），顺序与
+    //     jtagIrLens[] 对齐（[0] = 离 TDO 最近的器件）。只回 DP 一个会让 Keil 的
+    //     JTAG 列表少一行（2026-10-03 实测 GetIDCODEs=1 / GetIRLengths=2 的旧缺陷，已修，
+    //     修后 jtagprobe 实测两者一致：count=2，id 含 0x4BA00477 + 0x06413041）。
+    //   * SWD 会话：**保持原样** —— 单 DP 目标就是 1 项，这段行为不要动。
+    // ------------------------------------------------------------------
     ctx->dapIdList.clear();
-    if (status == ORBMDK::DAP_RES_OK && idcode != 0 && idcode != 0xFFFFFFFFu) {
+    if (!ctx->isSWD && ctx->jtagChainCount > 0) {
+        for (int i = 0; i < ctx->jtagChainCount && i < 8; ++i) {
+            if (ctx->jtagIds[i] != 0) {
+                ctx->dapIdList.push_back(ctx->jtagIds[i]);
+            }
+        }
+        // 扫链 IDCODE 缺席（例如本次会话还没扫过链）时退回 DP 那一个，别把表清空
+        if (ctx->dapIdList.empty() && jtagIdcode != 0) {
+            ctx->dapIdList.push_back(jtagIdcode);
+        }
+        if (outIdcode && !ctx->dapIdList.empty()) {
+            *outIdcode = ctx->dapIdList[0];
+        }
+        LOG_INFO("DetectTargetDapIdList: JTAG 链上 %d 个 TAP -> 器件表 %llu 项"
+                 " (id[0]=0x%08X id[1]=0x%08X)",
+                 ctx->jtagChainCount, (unsigned long long)ctx->dapIdList.size(),
+                 ctx->jtagIds[0], ctx->jtagIds[1]);
+    } else if (status == ORBMDK::DAP_RES_OK && idcode != 0 && idcode != 0xFFFFFFFFu) {
         ctx->dapIdList.push_back(idcode);
         if (outIdcode) {
             *outIdcode = idcode;
         }
     } else if (!ctx->isSWD && jtagIdcode != 0) {
-        // JTAG：DP IDCODE 偶发读失败时，用上面扫链的结果兜底
+        // JTAG：链上 ID 不可用时，用扫链拿到的 DP IDCODE 兜底
         ctx->dapIdList.push_back(jtagIdcode);
         if (outIdcode) {
             *outIdcode = jtagIdcode;
@@ -2412,6 +3115,10 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
     // ------------------------------------------------------------------
     if (status == ORBMDK::DAP_RES_OK) {
         EnsureBlockTransferProbed(ctx, 0);
+        // 目标刚连上：多笔传输能力一并重新判定 —— 上次可能因"目标还没上电"而探测失败，
+        // 一旦失败就会在本会话内永久回退逐笔，这里给它一次重新来过的机会（与块传输同法）。
+        ctx->transferMultiProbed = false;
+        ctx->waitMatchSupported  = true;    // 目标重连后重新判定等待加速
     }
     return static_cast<int>(ctx->dapIdList.size());
 }

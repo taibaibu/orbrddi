@@ -3,7 +3,7 @@
 > 分析日期：2026-09-29
 > 实机联调：2026-09-30（ORBTrace 调试器 + STM32F4 目标）
 >
-> 本文档只保留**当前仍然有效**的结论。已过时或被后续实测推翻的内容（导出符号数量快照、"已实现/缺失函数"
+> 本文档只保留**当前可能有效**的结论。已过时或被后续实测推翻的内容（导出符号数量快照、"已实现/缺失函数"
 > 逐条清单、编译阻塞排查过程、逐项代码对比、各轮修改文件清单、未落地的方案设计稿，以及已被更正的错误结论
 > 与死路排查记录）均已删除或合并，避免与源码现状矛盾。
 
@@ -13,6 +13,7 @@
 
 | 项 | 状态 |
 |----|------|
+| 版本 | **`0.5.0`** —— 驱动自身发版号（`include/ORBMDK.h` 的 `ORBMDK_VERSION_STRING`）。⚠️ 与下表"固件版本门"里**上报给宿主的协议版本串**（设备 `DAP_Info(0x04)`，主版本归一化抬到 ≥ 2）不是一回事，**勿联动** |
 | 编译 | ✅ `build.ps1` 全量编译通过，**无 error、无 warning** |
 | 运行库 | ✅ **静态 CRT（`/MT`）**，产物不依赖 `MSVCP140`/`VCRUNTIME140`/UCRT（原因见第十二节） |
 | 编译器依赖 | ⚠️ **与 MSVC / UCRT 强绑定**（Annex K 安全 CRT、`#pragma comment(lib)`）：`clang-cl` 理论可行，MinGW-w64 GCC 与 VS2013 及更早不支持 —— 静态审查见 **§19** |
@@ -24,11 +25,30 @@
 | Keil 联调 | ✅ 官方 AGDI v1.33.24 下对话框正确显示 `IDCODE 0x2BA01477` / `ARM CoreSight SW-DP`（见 4.7） |
 | Flash 下载 | ✅ 烧录与调试均验证通过（擦除失败根因见 4.8） |
 | 烧录速率 | ✅ 块传输已接入且**能力探测通过**（日志 `Block transfer probe OK`，§13.7 更正）；越界/正确性验证已通过（§9.2：12/12、哨兵零损坏）。适用范围 = **仅 SWD**（V1(HID) / V2(Bulk) 两条传输层都生效）；**JTAG 侧禁用** —— 实测会挂死探针（§18.9 第十步） |
+| 能力探测深度 | ✅ 块传输探测已按**真实工作深度**深读（`BlockWordsLimit()`，orbtrace = 125 字）并逐字校验（**§20.1**）；多笔探测**只验读** —— 其"批量内写校验"实测会破坏本会话后续 AP 存储器访问，**已撤回**（**§20.2**） |
 | 传输模式 | ✅ V1(HID) / V2(Bulk) 两条在 Keil 适配器列表里都可选可切换（§14），**V2 已实机可用**：完整调试 + 下载（§17.3 / §17.5 B 臂） |
 | V2 通道真因 | ✅ 句柄泄漏导致 WinUSB 接口被**永久**独占（§17.1）+ 出包长度必须用设备自报的 508、**绝不发整包**（§17.2） |
 | 传输层选择 | ✅ 只认对话框里选中的那条接口；**已删除全部隐藏开关**（`ORBMDK_TRANSPORT` / `ORBMDK_FWVER` / `ORBMDK_BULK_PAD` / `ORBMDK_SERIAL`），选中通道打不开就如实报错（§17.4） |
-| 固件版本门 | ✅ AGDI 用 `"%lu.%lu.%lu"` 解析 `Identify(idNo=4)` 并 `cmp eax,2`，主版本 ≥ 2 **只多走两步**：SWO 传输置 Stream（还需 caps `0x40`）+ 注册 streaming sink —— **函数指针表是无条件安装的**（§17.6 反汇编，§17.7 末更正块）；本层钉 `1.0.0`（§17.5 单变量 A/B） |
+| 固件版本门 | ✅ AGDI 用 `"%lu.%lu.%lu"` 解析 `Identify(idNo=4)` 并 `cmp eax,2`，主版本 ≥ 2 **只多走两步**：SWO 传输置 Stream（还需 caps `0x40`）+ 注册 streaming sink —— **函数指针表是无条件安装的**（§17.6 反汇编，§17.7 末更正块）；本层 2026-10-01 起**放开到 ≥ 2**（早年"钉 `1.0.0`"见 §17.5 A/B；放开的实机回归判据见 `Todo.md.bak` §18.10-C 阶段 5） |
 | 日志 | ✅ 单一实现 `src/ORBMDK_Log.cpp`（§8.1）：多 Sink（文件 / stdout / DebugView / 宿主回调）、`%TEMP%\ORBMDK_LOG_LEVEL` 热更新、线程安全；`RDDI_SetLogCallback` 已接通 Keil 日志窗口 |
+
+### 文档引用约定（0.5.0 整理时补）
+
+本文中出现的 **`Todo.md §18.x` 属历史编号**。`Todo.md` 于 2026-10-03 精简为"只列未完成项"，
+原 §18 体系已整卷移入 **`Todo.md.bak`**（历史快照；**其中 `18.10-C` 等方案的结论已被后续实验推翻，勿直接采信**）。
+当前活跃待办只落在 **`Todo.md`**，对应关系如下：
+
+| 本文常引 | 现行落点 |
+|---|---|
+| §18.8（界面为何开不了 Trace） | `Todo.md` **§5 T1-b**（路线 (b) 已实测否决 → `bug.md` **B12**） |
+| §18.10 / §18.10-B / §18.10-C（ETM、SWO 流式） | `Todo.md` **§5 T2**（ETM 建议结案）；流式方案 2026-10-01 **已放开**（版本门 ≥ 2 + caps `0x40`），Keil 侧实机回归（阶段 5）待做，细案在 `Todo.md.bak` |
+| §18.5 / §18.11 / §18.12 / §18.13 / §18.14 | `Todo.md` **同号**（现行有效） |
+| §18.1 / §18.2-遗留 | `Todo.md` **§3**（保留同号标签） |
+| §18.2 / §18.6 / §18.9 / §18.15 | **已完成**，留档在 `Todo.md.bak` |
+| §18.7a / §18.7b | 已决"**不做**"，留档在 `Todo.md.bak` |
+| §4 阶段 N（性能） | 数据与结论已迁 `bug.md` **附录 B**（B-1=阶段1、B-2=阶段2、B-3=阶段4、B-4=阶段5、B-6=实测口径） |
+
+> 实现细节与排查记录一律在 **`bug.md`**（B 系列）；本文只放**逆向结论与 ABI / 行为判定**。
 
 **导出符号分类（78 个）**
 
@@ -109,7 +129,8 @@ rddi::rddi_Close = (decltype(rddi::rddi_Close))GetProcAddress(handle, "RDDI_Clos
 - `CMSIS_DAP_Capabilities`（槽 `0x10362F70`，`stored @0x1002C443`）—— 静态 `call [slot]` 计数为 0，
   因为它走的是 `mov ecx,[slot]` + `call ecx` 的间接形式；**实际有 1 个调用点 `0x10022858`**
   （配置串构建函数：`Capabilities(handle, ifNo, &caps@0x102F8B90)`）。该 caps 是 trace 门控的
-  输入（逐条门控 asm、"界面为什么开不了 trace"的结论见 **Todo.md §18.8**；ETM 见 **Todo.md §18.10 / §18.10-B**）。
+  输入（逐条门控 asm、"界面为什么开不了 trace"的结论见 **Todo.md §5 T1-b**；ETM 见 **Todo.md §5 T2**，
+  SWO 流式细案见 **`Todo.md.bak` §18.10-B**）。
 - `CMSIS_DAP_ConfigureDAP`（槽 `0x10362F80`，`stored @0x1002C48B`）—— 有 **1 个 `call [slot]` 调用点**
   （`refs=5`）。早期"全工程无调用点"的结论**有误，此处修正**。
 
@@ -134,7 +155,7 @@ AGDI 在**常规调试链路**里只依赖 **15 个** RDDI 函数。但"trace �
 - **AGDI 自己实现了 trace**：它在 `0x1003CC80`–`0x1003CEF1` 对 RDDI 模块句柄 `[0x102FA6C0]`
   做**第二轮 `GetProcAddress`**，把 `StreamingTrace_*` 13 个函数全部绑到槽
   `0x10362FDC`–`0x1036300C`；`CMSIS_DAP_SWO_*` 4 个绑在 `0x10362FBC`–`0x10362FC8`。
-  两组都有真实 `call [slot]` 调用点（明细见 §10.4；门控结论见 **Todo.md §18.8**）。
+  两组都有真实 `call [slot]` 调用点（明细见 §10.4；门控结论见 **Todo.md §5 T1-b**）。
 - 但这套 trace 通路**在运行时被门控关闭**（`Identify(idNo=4)` 主版本 + caps 位），当前环境不会触发。
   所以"不影响 Keil 调试链路"这句**在行为层面仍然成立**，只是原因不是"不涉及"，而是"没开闸"。
 
@@ -725,7 +746,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 >
 > 一句话结论：以下均**不影响 Keil 调试链路**（AGDI 常规链路实际只调用第二节列出的
 > 15 个函数）；三种"补齐后才会用到"的场景分别对应 —— trace / sequencer → `Todo.md`
-> §18.5、ULINK+（不实现）→ §18.7a、ETM v4 深度 → §18.10。
+> §18.5、ULINK+（不实现）→ §18.7a（已决"不做"，见 `Todo.md.bak`）、ETM v4 深度 → `Todo.md` §5 T2。
 
 ---
 
@@ -787,7 +808,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 
 ### 7.3 🟡 低：符号解析的候选搜索路径（设计内 fallback）
 
-硬编码候选清单（3 处）与处置结论**已迁至 `Todo.md` §18.7b**（状态 `[-]`，保持现状）。
+硬编码候选清单（3 处）与处置结论**已迁至 `Todo.md.bak` §18.7b**（状态 `[-]`，保持现状）。
 要点：`ORBMDK_FindObjdumpPath` 已按「环境变量 → Keil `TOOLS.INI` → 常见安装目录 → `PATH`」
 顺序探测，前序步骤（`OBJDUMP` / `ARM_TOOLCHAIN_PATH` / `ARMGCC_DIR`）与 `PATH` 兜底可覆盖
 多数场景；残留硬编码均在"候选路径 fallback"语义内，不影响构建与实机调试链路。
@@ -806,7 +827,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 
 - ✅ **必改 1 类（已改）**：测试程序的 DLL 绝对路径（7.1，5 个文件），改为裸文件名 + `argv[1]` 覆盖。
 - ✅ **建议改 1 类（已改）**：构建脚本的工具链路径（7.2，2 个脚本），改为 vswhere + 注册表自动探测。
-- 🟡 **可选优化（部分已改）**：符号解析候选路径（7.3），已补 `D:\Keil_v5\` —— 明细与处置（`[-]` 保持现状）见 **`Todo.md` §18.7b**。
+- 🟡 **可选优化（部分已改）**：符号解析候选路径（7.3），已补 `D:\Keil_v5\` —— 明细与处置（`[-]` 保持现状）见 **`Todo.md.bak` §18.7b**。
 - 残留硬编码均在"候选路径 fallback"语义内，不影响构建与实机调试链路。
 
 ### 7.6 环境变更记录（2026-09-30）
@@ -999,6 +1020,127 @@ bin\ORBMDK_BlockTransferTest.exe 0x20000000
 在仓库里存在已久却零调用点，因此其越界拷贝一直未被发现 —— 把这类函数接入
 新路径前，应先给它补最小验证。
 
+### 9.4 速率计量（TESTSPEED）重建 —— 2026-10-03
+
+**背景**：`ORBMDK_LOG_TESTSPEED` / `LOG_AT_TESTSPEED` 宏一直存在，但**全工程零调用点**
+（`meter config` / `meter segment` 等字样在 `src/` 搜不到）—— README「烧录速率统计」那节
+记录的输出在代码里已经不存在，等于**没有基线**，任何"加速"都无法验收。
+
+**本次只恢复计量，不做任何加速**：
+
+| 位置 | 内容 |
+|------|------|
+| `src/ORBMDK_Log.cpp` | `MeterState` + `_meterFlushWindow` / `_meterSettleSegment` / `_meterEmit`；公开入口 `ORBMDK_LogMeterEnabled / NowUs / TripBegin / SetTransport / Account / Usb` |
+| `include/ORBMDK_Log.h` | 计量 API + `orbmdk::MeterUsbTimer`（RAII，放在 `extern "C"` 之外） |
+| `src/ORBMDK_RDDI.cpp` | `PublishMeterConfig()`（传输层 / 端口速度 / 出包字节 / 每次往返字数 / 块传输是否生效，变化时重打）+ `DAP_RegWriteRepeat` / `DAP_RegReadRepeat` 记账（**块 = 1 往返，逐字回退 = chunk 往返**） |
+| `src/ORBMDK_HID.cpp` / `ORBMDK_USB_Bulk.cpp` | 每次 OUT / IN 上报耗时（`meter usb` 的 out/in 拆分） |
+
+**口径**（与 §9.2 的实测数据保持一致，改了会让历史数据不可比）：
+
+- kB/s 按 **1 kB = 1024 B**（`4096 B / 7.1 ms → 563.4 kB/s` 就是这么算的）；
+- `us/trip` = 窗口 DAP 耗时 ÷ 窗口往返数；`window wall` = 窗口**首笔到末笔**的墙钟，
+  它减去 DAP 段即 AGDI / 目标侧的时间（判断"瓶颈在不在这一层"的唯一依据）；
+- 落行时机：窗口累计 ≥1024 B 或 ≥200 ms；空闲 >500 ms 视为上一段结束，
+  在**下一笔传输到来时**补打 `meter segment` / `meter usb`（故日志末尾可能少最后一段）；
+- **失败的那一次不记账**（只在成功路径上 Account）。
+
+**实机首轮暴露并修掉的 4 个计量缺陷**（2026-10-03，HSLinkPro 实测）：
+
+| 现象 | 根因 | 修法 |
+|------|------|------|
+| 段内 19 次 DAP 往返却报 **7107 cmds** | `meter usb` 只要"窗口 active"就采样，而窗口跨越多笔**不受计量**的 DAP 命令（它们同样走 `_bulkWrite/_bulkRead`） | 新增 `ORBMDK_LogMeterTripBegin()`；USB 采样只认 `TripBegin..Account` 之间 |
+| `dap 1.8 ms (137.5%) \| other 0.0 ms (-37.5%)` | 墙钟从"记账时刻"起算，而 DAP 耗时是在记账**之前**测的 ⇒ DAP 段落在窗口之外 | 墙钟改从 `TripBegin` 起算，`dap ≤ wall` 恒成立 |
+| `total` 越滚越大、此后再不打 `meter segment` | `_meterSettleSegment()` 在 `wallUs == 0` 时提前 `return`，**没清零段计数** | 抽出 `resetSegment()` 无条件清零；且不再用"上一段末笔"当新段起点 |
+| `window wall 0.0 ms, dap 0.0%` | 窗口墙钟用 1 ms 分辨率的 `GetTickCount64` | 全部时间戳改用 µs 单调时钟（`ORBMDK_LogMeterNowUs`） |
+
+**零开销保证**：阈值 > TESTSPEED 时 `ORBMDK_LogMeterEnabled()` 返回 0，调用方既不取时钟也不记账；
+传输层的 `MeterUsbTimer` 在关闭时构造/析构都是空操作。
+
+**待实机验收**（见 `Todo.md` §4 阶段 1）：设 `%TEMP%\ORBMDK_LOG_LEVEL = 2` 跑一次下载，
+确认四类行出现，且 `us/trip` 与 `words/round trip` 自洽
+（V1/HID 14 字 ≈95 µs/trip；V2/508 B 包 125 字 ≈789 µs/trip）。
+
+**本轮明确排除**：JTAG 侧的 IR+DR 合并、响应缓冲放大等加速项 —— 另行再议。
+
+### 9.5 多笔传输（D2，`DAP_Transfer` count>1）—— 2026-10-03
+
+**目的**：`DAP_RegAccessBlock` 过去**逐寄存器一笔 USB 往返**。AGDI 的 `SWD_GetARMRegs` /
+`SWD_SetARMRegs`（单步、运行、命中断点时的上下文保存/恢复）一次就是十几笔 ⇒ 十几次往返，
+而每次往返固定 ≈150 µs（§9.4 实测）。改为把**连续的非等待**寄存器合进一条 `DAP_Transfer`。
+
+| 位置 | 内容 |
+|------|------|
+| `src/ORBMDK_HID.cpp` | 新增 `DAP_TransferMulti()` / `DAP_TransferMultiMax()`：请求 `[0x05][dapId][count][req…]`；响应按**读笔顺序**取数；`done != count` 视为失败 |
+| `src/ORBMDK_RDDI.cpp` | `DAP_RegAccessBlock` 攒批量 + `flushBatch()`；`kMaxMultiBatch = 100`，实际上限取 `min(它, DAP_TransferMultiMax())`（V1/HID 12 笔、V2/511 B 101 笔） |
+
+**安全设计**（与块传输 §13.7 同一套："先探测、失败即回退"）：
+
+- **只用于 SWD**：JTAG 下固件的 `DAP_Transfer(0x05)` 不响应（§18.9），那里 `DapTransferFor`
+  走本层 JTAG 引擎，无法合并批量；
+- **能力先探测**：首次真正合并批量前先发一个批量（"连读两次 DP IDCODE"），并与**单笔**结果交叉比对，
+  三者一致才算通过（`ProbeTransferMulti`）。理由：这条命令在内存/寄存器热路径上，
+  固件若把 `count` 理解错会**静默读错**，不能只信"规范要求支持"；
+- **失败即永久回退**：探测失败或中途 `done != count` ⇒ 本会话 `transferMultiSupported=false`，
+  之后全部走逐笔（与历史行为逐字一致）；
+- **顺序语义不变**：`DAP_Transfer` 按序执行，同一批量里的 DP_SELECT 之类顺带写保序；
+  `MATCH_MASK(16)` / `MATCH_RETRY(17)` 虚拟寄存器与 `WaitForValue` 项都会**先 flush 再单独处理**；
+- **失败不使用部分结果**（与逐笔路径"在首个失败处返回"一致）。
+
+**诊断**：TESTSPEED 级每次调用落一行
+`RegAccessBlock: numRegs=N -> T round trip(s) (multi-transfer on)` —— 合并批量生效时 `T << N`。
+
+**待实机验证**（见 `Todo.md` §4 阶段 5）：Keil 里单步/运行几次，确认 ① 出现 `TransferMulti probe OK`；
+② 不出现 `多笔传输失败 … 回退逐笔`；③ 寄存器/内存窗口数值正确；④ `numRegs=16 -> 1 round trip(s)`。
+
+### 9.6 D1：`WaitForValue` 的处理（一次失败的尝试 + 最终方案）—— 2026-10-03
+
+**问题（D2 落地后实测暴露）**：D2 只把"连续的非等待寄存器"合并批量，而 AGDI 会在普通寄存器之间
+**插入 `DAP_REG_WaitForValue` 读**。实测形态（HSLinkPro）：
+
+| `numRegs → trips` | `[batch, single, wait]` | 说明 |
+|---|---|---|
+| `5 → 1` | `[1, 0, 0]` | 完美合并批量 |
+| `6 → 5` | `[1, 2, 2]` | 2 个 wait 把 6 笔切成 3 段 |
+| `60 → 41` | `[19, 2, 20]` | **20 个 wait 把 40 个普通项切成 19 段** |
+
+即：瓶颈不是"轮询太多次"（这些 wait 第一次读就匹配上、各只花 1 往返），而是**它们把批量切碎了**。
+
+#### 尝试：把 wait 也编进批量（❌ 实测失败，已撤销）
+
+思路是让固件用 `MATCH_VALUE` 在内部等，并把匹配读与普通项放进同一条 `DAP_Transfer`。
+固件语义确实支持其中大部分（`DAP/Source/DAP.c`）：
+
+| 事实 | 出处 |
+|------|------|
+| 比较式 `(data & match_mask) != match_value` —— **匹配值不参与掩码**，主机需预先相与 | `:782` |
+| `MATCH_MASK(0x20)` 是**写笔伪操作**（只设固件状态、不产生总线访问），且**持久有效** | `:864-867` |
+| 失配 `→ MISMATCH; break;`：**中断后续笔**，失配项不计入 `response_count` | `:783-788, 890` |
+| ★ **匹配读不回数据**：`MATCH_VALUE` 分支结束后直接出循环，而 "Store data" 只在**普通读**分支里 | `:832-836` vs `:755-788` |
+
+**决定性的一条是第 4 条**：匹配读**不往响应里写数据**。实测吻合 —— 探测发
+`[掩码伪写笔][匹配读 IDCODE]` 得到 `done=2` 且无失配位，但读回**全 0**
+（`TransferMulti probe: 匹配值路径未按预期成功 (done=2, rd=0x00000000)`）。
+⇒ 匹配读**只能用于"等待条件成立"**，不能用来取值，因此"把 wait 编进批量"在该固件上不成立。
+撤销后探测自身失败还会把 `transferMultiSupported` 置 false，连带 D2 全部退回逐笔
+（实测 `29 -> 29`、`5 -> 3`、`batch=0`）—— 这也是"探测失败要能干净回退"的一次验证。
+
+#### 最终方案：**有界等待**（`processOneLegacy` 的等待值分支）
+
+保持 wait 走单笔、不编进批量（顺序语义不变），但把"最坏 100 次往返"压成 3 次：
+
+1. 先按老路读一次 —— 条件已满足时**就是 1 次往返**（与历史完全一致，热路径无变化）；
+2. 未满足且 `ctx->waitMatchSupported` 时：发一条 `[掩码伪写笔]+[匹配读]`（**1 次往返**）让固件
+   在其内部按 `match_retry` 等；成功后**再补一次普通读**（1 次往返）取真实值；
+3. 若固件说成功、普通读却仍不匹配 ⇒ 该固件忽略 match 位 ⇒ 本会话把 `waitMatchSupported`
+   置 false，回到纯主机轮询。目标重连 / 切 SWD-JTAG 模式时重新置 true。
+
+**收益**：条件迟迟不满足时（擦除/写 flash 的等待、§4.8 那类场景）从"最多 100 次往返"变成
+**最多 3 次**；条件已满足时与历史逐字相同。
+
+**诊断**：TESTSPEED 级 `numRegs ≥ 4` 时落一行
+`RegAccessBlock: numRegs=N -> T round trip(s) [batch=… single=… wait=…]`。
+D2 生效的形态应回到 `5 -> 1`、`6 -> 3`、`60 -> 21` 量级（wait 各占 1 往返 + 普通项合并批量）。
+
 ---
 
 ## 十、逆向分析工具链与已得结论
@@ -1075,7 +1217,7 @@ mov  dword ptr [slot], ecx      ; 再落表
 
 `.text` 里嵌着跳转表（如 `0x10011ED8` 的 `DllUv3Cap` 分派表 —— 该函数按 `cmp eax,0x6d` +
 字节表 `0x10011EF0` 分派，仅 `n=1/2/100/110` 四个真实分支且返回值全为常量，是 µVision 判定
-"驱动类别"的来源，见 `Todo.md` §18.10 证据 1）和对齐填充，线性反汇编一旦
+"驱动类别"的来源，见 `Todo.md` §5 T2 证据 1）和对齐填充，线性反汇编一旦
 在某处脱同步，**后面全部解错**（实测按线性扫描实现的 `scan` 直接返回空）。现版本改用字节模式：
 `push imm32(str)`（`68 xx`）+ `call reg`（`FF D0..D7`）+ `mov [slot],<reg>`（`A3` 或
 `89 05/0D/15/1D/25/35/3D`），按地址配对，完全绕开解码同步问题；因此能自动兜出分散在多处的
@@ -1197,13 +1339,13 @@ push "CMSIS_DAP_DetectDAPIDList" ; 回退名，覆盖同一个槽
 
 SWO 四槽的真实调用点：`Baudrate` @`0x1003D094`（共 2 处）、`Control` @`0x1003D27D`、
 `Status` @`0x100344E4`、`Data` @`0x1003D35A`（**4 参**）。
-门控条件、sink 名、配置串构建与"界面上为什么开不了 trace"见 **Todo.md §18.8**；
+门控条件、sink 名、配置串构建与"界面上为什么开不了 trace"见 **Todo.md §5 T1-b**；
 ETM 指令跟踪为什么开不了（**UI 层不可选** —— µVision 按驱动类别限定；AGDI 协议层无并行 / ETB 编码；
-另需目标硬件前提）见 **Todo.md §18.10**（结论 5 为 2026-10-01 二次复核新增）。
+另需目标硬件前提）见 **Todo.md §5 T2**（结论 5 为 2026-10-01 二次复核新增）。
 
 > **sink 注册链路的逐参取证与记录布局**（逐调用点入参表、sink 描述记录 `0x20` 布局、
-> 事件条目 16 字节布局、`WaitForEvent` token 协议）已迁至 **`Todo.md` §18.10-C 执行记录**；
-> 本节只保留 trace 函数指针槽与槽位落表点。参数语义结论见 `Todo.md` §18.10-C 的 P4 表。
+> 事件条目 16 字节布局、`WaitForEvent` token 协议）已迁至 **`Todo.md.bak` §18.10-C 执行记录**；
+> 本节只保留 trace 函数指针槽与槽位落表点。参数语义结论见 `Todo.md.bak` §18.10-C 的 P4 表。
 
 ### 10.5 已得结论 B：AGDI 关键调用序列
 
@@ -1973,7 +2115,7 @@ AGDI 有两条与"设备数量"有关的判断，触发条件都不在我们手�
 只有 HID 通道才给 `ctx->firmwareVersion` 赋值，且是主版本 1；而 auto 现在默认优先 V2
 （§13.3），V2 下这段被跳过 → 字段为空 → `CMSIS_DAP_Identify(idNo=4)` 落到回退分支
 现问设备，把**设备自己的** DAP_Info 固件串 `2.1.0` 透给 AGDI（主版本 2）。
-这解释了"**之前 V1 一直是好的**"：V1 路径恰好把版本钉在 `1.0.0`，从来不会进那条分支。
+这解释了"**之前 V1 一直是好的**"：V1 路径恰好把版本钉在 `1.0.0`（**早年口径**），从来不会进那条分支。
 
 叠加 `CMSIS_DAP_Detect` 恒为 2（§14），AGDI 眼里"两台设备 + 驱动自报支持多 DAP"，
 但本层的设备表/DAP 表始终只有 1 项 —— 三条口径互不自洽。
@@ -2072,21 +2214,22 @@ transport = CMSIS-DAP v2 (USB Bulk)   idcode=0x2BA01477
 1. A 臂里 **RDDI 层完全正常**（V2 通、IDCODE 正确、Connect 成功），错只出在 AGDI
    那条分支上 —— 它连"设备列表枚举"都不做，连上就放弃。
 2. 与传输层无关：A 在 V2 与 HID 上都失败，B 在 V2 上成功 → 唯一变量就是这个版本串。
-3. 因此**上报串必须落在 1.x**（这一半仍然是"钉住"的），设备自报串照问、照记日志。
-   当前实现（2026-10-01，细节见 `Todo.md` §18.6）：来源 = 设备 `DAP_Info(0x04)`，
-   上报前只把**主版本**归一化为 1（设备自报 `2.1.0` → 上报 `1.1.0`；自报 1.x 则原样上报）；
-   问不到设备时兜底 `1.0.0`。**不再读 USB 描述符的 bcdDevice** —— 那是 USB 栈 / 引导
-   写的字段，与固件版本无关（已从三个源文件中删除）。
+3. 因此**在本环境下**上报串要落在 1.x 才走得通（这一半曾长期"钉住"）；设备自报串照问、照记日志。
+   来源 = 设备 `DAP_Info(0x04)`。**不再读 USB 描述符的 bcdDevice** —— 那是 USB 栈 / 引导写的
+   字段，与固件版本无关（已从三个源文件中删除）。
+   ⚠️ **主版本的归一化方向已于 2026-10-01 反转**：旧实现把主版本**压到 1**（`2.1.0` → `1.1.0`，
+   自报 1.x 原样）；自 `Todo.md.bak` §18.10-C 第三轮起改为**抬到 ≥ 2**（`1.x` → `2.x`，`2.x` 原样），
+   以放行 AGDI 的 SWO 流式分支。问不到设备时仍兜底 `1.0.0`。放开的**回归判据与回退条件**见
+   `Todo.md.bak` §18.10-C —— **阶段 5 实机回归尚未完成**（本表 A 臂即放开后必须整体回归的清单）。
    本节结论**推翻了早期"不改版本串的取值"那一条**（当时的推断被本次实验推翻：
    那条分支在本环境下靠"逐项对齐接口"过不去，AGDI 根本不会走到那些接口）。
 4. 临时诊断入口 `ORBMDK_FWVER` 已按约定删除，正式代码里不留开关。
 
-> 附注：这里设想的做法（"只把主版本归一化为 1"，即 `2.1.0` 上报成 `1.1.0`）
-> **已成为当前实现**，故对话框里显示的是设备真实版本（仅主版本 ≥ 2 时被改写为 1）。
->
-> 反过来，若将来要**主动放开**到 `≥ 2`（**只为 SWO 流式传输，与 ETM 无关** —— 见 `Todo.md`
-> §18.10-B 与 §18.10 结论 2；旧记述"ETM 的唯一前置"已作废），
-> 本节这张表就是需要整体回归的清单（A 臂的失败必须先在 §18.10-B 的 P1/P3 阶段定性）。
+> 附注（**2026-10-01 后已过时，仅存史**）：这里设想的"只把主版本归一化为 1"曾是实现口径；
+> 自 `Todo.md.bak` §18.10-C 第三轮（2026-10-01）起改为**主动放开到 ≥ 2**
+> （**只为 SWO 流式传输，与 ETM 无关** —— 旧记述"ETM 的唯一前置"已作废），并配套补齐了
+> `StreamingTrace_*` 流式语义。上表 A 臂的失败即放开后**必须整体回归**的清单
+> —— 判据 / 回退见 `Todo.md.bak` §18.10-C，**阶段 5 实机回归尚待完成**。
 
 ### 17.6 AGDI 侧"版本号判断"的反汇编证据（CMSIS_AGDI.dll v1.33.24.0）
 
@@ -2148,27 +2291,26 @@ transport = CMSIS-DAP v2 (USB Bulk)   idcode=0x2BA01477
 **结论**：AGDI 把 `Identify(idNo=4)` 的返回值当版本号 `sscanf`，用 **`cmp eax,2`** 做门槛；
 主版本 ≥ 2 时**只多走两步** —— 把 SWO 传输方式置为 Stream（还需 caps `0x40`）并注册
 streaming sink。**两张"函数指针表"（`0x1003D030`/`0x1003D0F0`）是无条件安装的，与本门槛
-无关**（订正见 §17.7 末的更正块）。本环境下那套逻辑走不通（A 臂：跳过全部设备枚举、
-`Connect` 后立刻 Close），所以这一栏必须钉在 `1.0.0`。这也正是 §17.5"只改这一个字符串、
-行为就翻转"的代码级解释。
+无关**（订正见 §17.7 末的更正块）。早年（§17.5 A 臂）这条路径在本环境下走不通（跳过全部设备枚举、
+`Connect` 后立刻 Close），故一度把这一栏**钉在 `1.0.0`**；**2026-10-01 起改为放开到 ≥ 2**
+（见 §17.5 要点 3 与 `Todo.md.bak` §18.10-C）。这也正是 §17.5"只改这一个字符串、行为就翻转"的代码级解释。
 
-> **要解开这个钉子需要什么 —— 见 `Todo.md` §18.10-B（原 §17「多 DAP 分支」专章，已整体迁出）。**
+> **这个"钉子"已于 2026-10-01 解开（放开到 ≥ 2）**；完整方案 / 回退判据见 `Todo.md.bak` §18.10-C
+> （原 §17「多 DAP 分支」专章已整体迁出至 §18.10-B）。
 
-### 17.7 ⭐ 「多 DAP 分支」专章 —— 已整体迁出至 `Todo.md` §18.10-B
+### 17.7 ⭐ 「多 DAP 分支」专章 —— 已整体迁出至 `Todo.md.bak` §18.10-B
 
 > 本节（原含 17.7.1 触发条件 / 17.7.2 两个候选解释 H1·H2 / 17.7.3 已就绪接口账 /
-> 17.7.4 P0~P3 探测立项 / 17.7.5 三条解法路线）**已全文并入 `Todo.md` §18.10-B**，
-> 此处只留索引。§17.5/§17.6 回答"**为什么现在必须钉 1.0.0**"；"**要解开这个钉子需要
-> 什么**"见 `Todo.md` §18.10-B。
->
-> ~~一句话：ETM 走 `StreamingTrace_*` 表，而换表由两条 `cmp eax,2 / jb` 把守~~
-> **订正**：ETM **不**走 `StreamingTrace_*` 表（那套是 SWO 流式传输，见下方 ②）；两条
+> 17.7.4 P0~P3 探测立项 / 17.7.5 三条解法路线）**已全文并入 `Todo.md.bak` §18.10-B**，
+> 此处只留索引。§17.5/§17.6 回答"**版本门是怎么被 AGDI 用起来的**"（早年据此钉 `1.0.0`，
+> 2026-10-01 已改为放开到 ≥ 2）；"**放开 / 回退的条件与步骤**"见 `Todo.md.bak` §18.10-C。
+> ETM **不**走 `StreamingTrace_*` 表（那套是 SWO 流式传输，见下方 ②）；两条
 > `cmp eax,2 / jb`（`0x10022870`、`0x1003CB92`，`major` 由 `0x10021FB0` 对
 > `Identify(idNo=4)` 串做 `sscanf("%lu.%lu.%lu")` 得来）**只管**"SWO 的 Read / Stream 选择"
 > 与"streaming sink 注册"，与"能不能开 ETM"**无关**。决定 B 能否成立的仍是
 > "`LoadLibraryA("CMSIS_DAP.dll")` 失败"（H1）是否属实，须先做 P1/P3 探测定论。
 >
-> ⚠️ **2026-10-01 更正（见 `Todo.md` §18.10 结论 1~5）**：上面这句已被实测推翻 ——
+> ⚠️ **2026-10-01 更正（见 `Todo.md` §5 T2 结论 1~5）**：上面这句已被实测推翻 ——
 > ① 表 1/表 2（`0x1003D030`/`0x1003D0F0`）**无条件安装**，`jb` 只跳过"caps→Read/Stream"判定；
 > ② `StreamingTrace_*` 是 **SWO 流式传输**（sink 名 `cmsis_dap_swo_trace`），**不是 ETM 通路**；
 > ③ 并行 / ETB 项在 Trace 页 **UI 层即不可选**（**非**"可见但选后被拒"）—— 可用项由 UV4 按
@@ -2201,23 +2343,311 @@ streaming sink。**两张"函数指针表"（`0x1003D030`/`0x1003D0F0`）是无�
   `0x13927` / `0x1f73` / `0x2073` / `0x2173` / `0x1397b` / **`7`**；命中 `7`（AGDI /
   CMSIS-DAP 类）后 `0x5F3ED2` 调 `DllUv3Cap(100,&buf)`，并把其返回值原样返回。
 - 由此：**AGDI / CMSIS-DAP 类驱动的「并行 Trace 端口」/「ETB」项在 UI 层即不可选**
-  （详见 `Todo.md` §18.10 结论 5）。本层哪怕改 `CMSIS_DAP_Capabilities` 的任何位，也
+  （详见 `Todo.md` §5 T2 结论 5）。本层哪怕改 `CMSIS_DAP_Capabilities` 的任何位，也
   **不可能**让这些项变为可选；caps 只影响 SWO 的 `Read`/`Stream`（`0x40`）与
   `UART`/`Manchester`（`0x04`/`0x08`）之选择。
 - 复核命令：`tools/pe_re.py xref "D:\Keil_v5\UV4\UV4.exe" "DllUv3Cap"`（4 处 `GetProcAddress`）、
   `tools/pe_re.py dis "$AGDI" 0x10011D70 0x220`、`tools/pe_re.py dis "…\UV4.exe" 0x5F3E40 0x140`。
 - 附注：`n=100` 分支**不写**第二参数，而 UV4 传入的是未初始化的栈缓冲（`[ebp-0x10524]`）；
   该路径 UV4 只取返回值、不读该缓冲（`0x5F3ED2`–`0x5F3EFE` 全程无读），故无副作用。
+- ⚠️ **2026-10-03 精确化**：上面"类别取自 `DllUv3Cap(2)` 的常量 `7`"应读作 ——
+  **UV4 记录的「驱动条目」所期待的自报值就是 `7`**。UV4 的**类别索引**来自它自己的驱动条目
+  （`0x7189D0`，不读 magic），`DllUv3Cap(2)` 只做"条目类别 ↔ DLL 自报值"的**交叉校验**，
+  **不带任何能力语义**；且 Trace 页（含 `Trace Port` 下拉）的**资源由 AGDI 提供**，UV4 里没有这些串。
+  ⇒ 完整证据、三个边界与**三路线解法**见下节 **§17.9**。
+
+### 17.9 ⭐ `DllUv3Cap` 的第二层真相：magic ≠ 类别；Trace 页的提供方是 AGDI（2026-10-03 新增）
+
+**问**："既然 §17.8 说 Trace 页的可用项由 `DllUv3Cap(2)` 的常量 `7` 决定，那把它改成别的值、
+或者 hook 掉，是不是就能放开「并行 Trace 端口」/「ETB」？" —— **不能**；§17.8 的表述也需按本节精确化。
+
+#### (1) 硬证据 A：UV4 对 `DllUv3Cap(2)` 只有**一个**使用点，且它是"身份白名单"，不携带能力
+
+`pe_re.py xref UV4.exe DllUv3Cap` 共 4 处字符串引用，其中 `0x5F3E73` 是唯一取 `n=2` 的地方
+（另三处 `0x5264B2` / `0x526C17` / `0x52764A` / `0x5B6433` 走别路径）：
+
+```asm
+0x5F3E72  push 0xbd10c8            ; "DllUv3Cap"
+0x5F3E77  push eax                 ; hMod
+0x5F3E78  call [0xb29588]          ; GetProcAddress
+0x5F3E84  push 0                   ; 参数 2（未初始化栈缓冲）
+0x5F3E86  push 2                   ; n = 2
+0x5F3E88  call esi                 ; ★ DllUv3Cap(2, 0)：全镜像唯一 n=2 调用点
+0x5F3E8D  mov ecx, 0x2d46c40       ; UV4 全局配置对象
+0x5F3E92  mov edx, eax             ; edx = AGDI 自报 magic
+0x5F3E94  call 0x7189D0            ; eax = 「当前驱动类别索引」0..5（**该函数不读 edx**）
+0x5F3E99  cmp eax, 5 / ja 0x5F3EFF ; 类别未知 → 放弃
+0x5F3E9E  jmp [eax*4 + 0x5F3F1C]   ; 6 路跳表
+```
+
+跳表（`0x5F3F1C`，实测 6 项）与各分支白名单：
+
+| 类别索引 | 分支 | 接受的自报 magic |
+|---|---|---|
+| 0 | `0x5F3EAD` | `0x1f73` / `0x2073` / `0x2173` |
+| 1 | `0x5F3EC5` | `0x1397b` |
+| 2 | `0x5F3EA5` | `0x13927` |
+| 3 / 4 | `0x5F3ECD` | `7`（`cmp edx,7` / `jne 0x5F3EFF`） |
+| 5 | `0x5F3ECC` | 跳表项落在指令中间 ⇒ 不可达/未定义 |
+
+**所有命中分支都汇聚到 `0x5F3ED0 → 0x5F3ED2`**（再调 `DllUv3Cap(100,&buf)` 并原样返回）。
+⇒ 这一段是"**UV4 记录的类别** ↔ **DLL 自报 magic**"的**交叉校验**（防换错 DLL），
+返回什么 magic **不带能力语义**。
+
+#### (2) 硬证据 B：「驱动类别索引」来自 UV4 自己的驱动条目，**不来自** `DllUv3Cap`
+
+`0x7189D0`（全镜像 34 个调用点，通用）反汇编：
+
+```asm
+0x7189D0  mov eax,[ecx+0x9ab8]        ; 当前选中的「调试器驱动条目」
+0x7189DA  mov eax,[eax+0x1e]          ; 其子记录
+0x7189E1  movzx eax, word [eax+0x12]  ; ★ 类别编号（word）
+0x7189E5  cmp eax,5 / ja → return 0x64 ; 未知类别
+0x7189EA  movzx ecx, byte [eax+0x718a04] / jmp [ecx*4+0x718a00]  ; 二级映射
+```
+
+入参只有 `ecx`（`0x2d46c40`），**完全不读 edx（magic）**；另一处调用 `0x5F3D85` 拿它去
+`[eax*4+0x2d4bb4c]` 取类别记录、再按 `word[+0x18]` 拼 `"%s%s\Debug\%s.dll"` / `Release`
+—— 即**驱动 DLL 的目录/路径解析**。
+
+⇒ 决定"这个驱动属于哪一类"的是 **UV4 的驱动条目数据**（内建表 / `TOOLS.INI` 侧）；
+`DllUv3Cap(2)=7` 只证明"DLL 自称与条目类别配套"。
+
+#### (3) 硬证据 C：Trace 页的**内容提供方是 AGDI**（UV4 里没有这些字符串）
+
+AGDI `.rsrc` 里整套 Trace 页控件文本（宽串，实测区 `0x10366790`–`0x103669B4`）：
+
+| 文本 | VA | 文本 | VA |
+|---|---|---|---|
+| `Trace Enable` | `0x10366790` | `Trace Port` | `0x103668C4` |
+| `ETM Trace Enable` | `0x103667C0` | `SWO Clock Prescaler:` | `0x10366918` |
+| `Trace Clock:` | `0x10366808` | `Autodetect` | `0x10366980` |
+| `Use Core Clock` | `0x10366880` | `SWO Clock:` | `0x103669B4` |
+
+同一批串在 **UV4.exe 中一处都没有**（`xref "Trace Port"` 未命中；UV4 的 `Parallel` 只在
+"Parallel Build Configuration"，属编译页）⇒ µVision 的 Trace 页（含 `Trace Port` 下拉）
+**由 AGDI 提供资源/页**，"哪些项可选"的最终决定权在 **AGDI + UV4 的类别限定**，两边都不过本层。
+
+#### (4) 硬证据 D：本层（RDDI 层）**没有** ETM / 并行 Trace 接口
+
+`include/ORBMDK_RDDI.h` 的 Trace 相关导出只有 `StreamingTrace_*`（8 个，SWO 流式，
+sink 名 `cmsis_dap_swo_trace`）。**没有** ETM/ETB/并口采集 API
+⇒ 即便 UI 放开，配置与数据也**没有既有通道**可走。
+
+#### (5) 三个边界（定论，勿重复踩）
+
+1. **只改 magic（含 hook `DllUv3Cap`）= 破坏交叉校验** ⇒ 驱动被 `0x5F3EFF` 拒；
+   不是放开 UI 的抓手。
+2. **只改 caps（本层 `CMSIS_DAP_Capabilities`）永远无效** —— 判定在 UV4/AGDI 内（§17.8）。
+3. **放开 UI 而不建数据通路 = 看不到数据**（ETM 取数在 RDDI 层无接口，见 (4)）。
+
+#### (6) 解决方法（三路线，按"代价 / 确定性"排序）
+
+**路线 1（成本最低，先做）—— 进程内自改：本层 DLL 就是"注入器"**
+
+- 前提事实：本层 `CMSIS_DAP.dll` 由 AGDI 在 **UV4 进程内** `LoadLibrary`（见 `src/ORBMDK_DLL.cpp`
+  顶注"AGDI 在两次 rddi_Open 之间会卸载并重新加载本 DLL"）⇒ **无需外部注入器**：
+  在本层 `DllMain`（ATTACH 后）用 `GetModuleHandle(NULL)` 拿基址，对 UV4 代码
+  `VirtualProtect(PAGE_EXECUTE_READWRITE)` → 字节改写 / inline hook。
+- 候选落点：
+
+  | 目标 | 地址（本机 UV4） | 改法 | 效果 / 风险 |
+  |---|---|---|---|
+  | 类别查询（只此一处） | `0x5F3E94` 的 `call 0x7189D0` | 改跳到本层 stub，返回"支持 ETM 的类别"（0/1/2 之一） | 让 UV4 以为"这是 ULINKpro 类"；**风险**：同进程另 33 处 `0x7189D0` 仍返回原类别 ⇒ 不一致，需实测 |
+  | magic 校验段 | `0x5F3EA5`–`0x5F3ED0` | 6 段 `cmp/jne` 全部 nop 成"直落 `0x5F3ED2`" | **只**解除身份校验，不放开 UI（单独做无意义，仅作配合） |
+  | 驱动初始化 / 能力位 | `0x5F3F40`（读 `[esi+0x206]` 位）、`0x5F3F90` | 置 `0x206` 相应位、令 `[esi+0x21e]` 非空 | 这是 UV4 侧"是否存在 Trace 配置"的判定，需实测其与 UI 的耦合 |
+
+- 验证：`pe_re.py dis "<UV4>" 0x5F3E80 0x120` 改前后比对 + 实机看 Trace 页。
+
+**路线 2（路线 1 的决定性前提）—— 逆向 AGDI 的 Trace 页资源 ID 与回调**
+
+- 从 `.rsrc` 中可见的控件 ID 入手（`0x44D`/`0x44E`/`0x451`/`0x456`/`0x457`/`0x458`/`0x459`/`0x578`/`0x579`，
+  位于 `0x10366790` 一带的 DLGINIT 数据内），定位创建该页的 `CreateDialogParam` /
+  属性页注册与 `WM_INITDIALOG` 中填充 `Trace Port` 下拉的代码。
+- 复核：`pe_re.py hex "<AGDI>" 0x10366780 0x280`（控件 ID + 文本）。
+  ⚠️ 资源经 `MAKEINTRESOURCE` 引用，**不会有绝对 VA 引用**（实测 `refs 0x103668C4` = 0 处），
+  须按"立即数 `push imm32 == 控件 ID`"搜。
+
+**路线 3（真正的工程量，仅确定要 ETM 时立项）—— 在本层新增 ETM / 并行 Trace 通路**
+
+- 需在 RDDI 层实现 ETM 数据搬运（探针侧 TPIU/并口采集 + 缓冲 → AGDI 期望的 sink/回调），
+  并把 AGDI Trace 页的配置请求映射过去。CMSIS-DAP 标准不覆盖此路径 ⇒
+  必须先用**路线 2** 弄清 AGDI 期望什么接口/数据结构，否则无从对接。
+- 不做路线 3 时，路线 1/2 的产出只是"**确认 UI 无法放开这一边界**"，不等于"ETM 能跑"。
+
+#### (7) ⭐ 铁证 E：`Trace Port` 下拉（含 `Embedded Trace Buffer`）被 **AGDI 自己硬禁用**（2026-10-03 定论 / T0 关闭）
+
+**T0 结论：UI 收紧发生在 AGDI，不在 UV4。** 依据（本机 `CMSIS_AGDI.dll` 实测）：
+
+- 控件映射（`tools/_rsrc_scan.py` 解析 `DIALOG / DLGINIT 102`）：
+  - `DIALOG 102` = µVision Trace 页（`style=0x80C800C0`，`cdit=93`）；控件 `0x456`（1110）类别
+    序数 `133 = 0x85` ⇒ **COMBOBOX**，紧邻静态框 `Trace Port`（`0x103668C4`）⇒ **`0x456` = Trace Port 下拉**。
+  - `DLGINIT 102`（`0x10367728`）给 `0x456` 填 **6 项**（`msg=0x403`）：
+    `0`=Sync…1-bit / `1`=Sync…2-bit / `2`=Sync…4-bit / `3`=SWO-Manchester /
+    `4`=SWO-UART/NRZ / **`5`=Embedded Trace Buffer**。⇒ **ETB 项静态就在表里**，不是"缺项"，
+    而是"**整条下拉被灰**"。
+
+- 代码侧（IAT 已核实：`0x101B56EC`=`GetDlgItem`、`0x101B57B4`=`EnableWindow`、`0x101B56BC`=`SendMessageA`）：
+
+```asm
+; —— 函数 A：0x1003B2A0（Trace 页可控态刷新；OnInitDialog 包装 0x1003BB00 及所有控件
+;              处理器 0x1003BCA0/0x1003BCD0/0x1003BD60 均 tail-jmp 到此）
+0x1003B39A  6A 00            push 0            ; ★★★ 硬编码；本页其它控件此处用 eax/edi
+0x1003B39C  68 56 04 00 00   push 0x456        ; Trace Port 组合框
+0x1003B3A1  8B CE            mov  ecx, esi
+0x1003B3A3  E8 25 12 01 00   call GetDlgItem   ; (this, 0x456)
+0x1003B3A8  8B C8            mov  ecx, eax
+0x1003B3AA  E8 B0 11 01 00   call EnableWindow ; EnableWindow(combo, FALSE) ⇒ 灰
+
+; —— 函数 B：0x1003B610（把设置灌进对话框；OnInitDialog 尾段调用）
+0x1003BA6D  68 56 04 00 00   push 0x456
+0x1003BA74  E8 54 0B 01 00   call GetDlgItem
+0x1003BA7F  6A 00 6A 04 68 4E 01 00 00 FF 70 20 FF D7
+                            ; SendMessageA(hwnd, CB_SETCURSEL(0x14E), 4, 0) ⇒ 强制选中 index 4
+                            ;   (= “Serial Wire Output - UART/NRZ”)
+0x1003BA8D  6A 00            push 0            ; ★ 再次硬禁用
+0x1003BA8F  68 56 04 00 00   push 0x456
+0x1003BA9D  E8 BD 0A 01 00   call EnableWindow ; EnableWindow(combo, FALSE)
+```
+
+- **穷举**：全镜像只有 4 处 `push 0x456` —— `0x1003B39C` / `0x1003BA8F`（两处 `EnableWindow(…,0)`）、
+  `0x1003BA6D`（`CB_SETCURSEL`）、`0x1003BD61`（选择变更处理器里的 `CB_GETCURSEL`）。
+  **没有**任何一处 `EnableWindow(0x456, TRUE)` ⇒ 该下拉**恒灰**，ETB（index 5）自然不可选。
+- 选择变更处理器 `0x1003BD60`（`CB_GETCURSEL` → `cmp eax,5 / ja` → 跳表 `0x1003BE1C`）把 6 个
+  index 映射到 `[0x102FA6D0]`：`0/1/2 → 0x100/0x200/0x800`（word，低字节仍为 0）、`3 → 1`、`4 → 2`、
+  **`5 → 3`**，再 tail-jmp 函数 A 刷新。⇒ 选 ETB 的"下游"逻辑是完整的，只差"下拉能点开"。
+
+**补丁（T1；两处 `6A 00` → `6A 01`）**：
+
+| VA | 文件偏移 | 节 | 原字节 | 新字节 |
+|---|---|---|---|---|
+| `0x1003B39A` | `0x03A79A` | `.text` | `6A 00 68 56 04 00` | `6A 01 68 56 04 00` |
+| `0x1003BA8D` | `0x03AE8D` | `.text` | `6A 00 68 56 04 00` | `6A 01 68 56 04 00` |
+
+- 必须**两处同时**改：函数 A 与函数 B 在页面初始化 / 每次刷新都会执行（只改一处，下一次刷新会被重新灰掉）。
+- 补丁后：下拉可点开、6 项齐全；选 ETB → `0x1003BD60` 写 `[0x102FA6D0]=3` 并刷新。
+- ⚠️ 仍受 **(4)** 制约：**放开 UI ≠ 有数据通路** —— RDDI 层无 ETM/ETB 采集接口，选中后能否取到数据另说。
+- 落地方式二选一：(a) 直接改盘上 DLL（**先备份** `CMSIS_AGDI.dll.bak`）；(b) 按**路线 1** 的进程内做法，
+  由本层 `DllMain` 对 `GetModuleHandleA("CMSIS_AGDI.dll") + 0x3A79A / + 0x3AE8D` 两字节
+  `VirtualProtect`→写 `01`（Keil 升级不丢失、不动官方文件，推荐作为长期解）。
+- **已落地（2026-10-03，方式 (a)）**：本机 `D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll` 已打补丁，备份为
+  `CMSIS_AGDI.dll.bak`；工具 `tools/patch_agdi_etb.py`（`--check` / `--apply` / `--revert`）。
+  实机 UI 复验与"选 ETB 是否触发未实现调用"仍是 `Todo.md` §5 **T1** 的剩余项。
+
+**对 §17.9(6) 的修正**：路线 1（改 UV4 类别 / 白名单）**单独做不足以**放开 `Trace Port` ——
+即便 UV4 侧类别放行，AGDI 仍会把 `0x456` 灰掉。AGDI 这两行才是 T0 要抓的"UI 收紧点"。
+（§17.8 关于 `DllUv3Cap` 的结论不受影响：那是 UV4 侧的驱动身份/类别校验，是**另一道**门。）
+
+#### (8) ⭐ 实测反馈与定论（2026-10-03）：补丁生效，但 `Trace Enable` 仍灰；**ETB 是死路**
+
+**现象**：打完 §17.9(7) 补丁并重启 µVision 后，Trace 页 `Trace Port` 下拉可点开、
+`Embedded Trace Buffer` 可选；但 `Trace Enable`（控件 `0x44D`）**仍然是灰的**。
+
+**(8.1) `Trace Enable` 为什么灰 —— 它不是硬编码，而是 AGDI 的四条件门控**
+
+函数 A（`0x1003B2A0`）里 `0x44D` 的使能是**动态算出来的**（与 `0x456` 的硬编码 `push 0` 不同）：
+
+```asm
+; @@ 0x1003B2A0  Trace 页可控态刷新
+0x1003B2A6  cmp  byte  ptr [0x1021BDA5], 0    ; 条件①
+0x1003B2B2  je   0x1003B2D6                    ;   └ 不满足 → 禁
+0x1003B2B4  cmp  dword ptr [0x102F8B94], 0    ; 条件②
+0x1003B2BB  jne  0x1003B2D6                    ;   └ ≠0 → 禁
+0x1003B2BD  cmp  dword ptr [0x102FA574], 1    ; 条件③ = SWO 槽（CMSIS_DAP_SWO_*）绑定成功
+0x1003B2C4  jne  0x1003B2D6                    ;   └ 未绑定 → 禁
+0x1003B2C6  test byte  ptr [0x102F8B90], 4    ; 条件④ = caps.BIT2（INFO_CAPS_SWO_UART）
+0x1003B2CD  je   0x1003B2D6                    ;   └ 未置 → 禁
+0x1003B2CF  mov  eax, 1
+0x1003B2D6  xor  eax, eax
+0x1003B2D8  push eax / push 0x44D / mov ecx,esi / call GetDlgItem / call EnableWindow
+```
+
+同页第二处（`0x1003B303`）把 `0x44D` 的**勾选态**按 `[0x102FA6C8]&1 && [0x102FA574]==1 && caps&4`
+同步（`CheckDlgButton`）。
+
+**四条逐一核对**（本层侧已查）：
+
+| 条件 | 全局 | 本层现状 | 结论 |
+|---|---|---|---|
+| ① | `[0x1021BDA5]` | AGDI 内部状态（写入点在 `0x1001103A/0x10011DB6/0x10011DF4/0x10011E3D/0x10011EB8`），非本层可控 | 待运行时确认 |
+| ② | `[0x102F8B94]` | caps 结构第二 dword，`CMSIS_DAP_Capabilities` 只写 4 字节，AGDI 侧清零 | 应为 0（通过） |
+| ③ | `[0x102FA574]` | 本层已导出 `CMSIS_DAP_SWO_Baudrate/Control/Data/Status`（ord 36–39） | 通过 |
+| ④ | `caps & 0x04` | **`CMSIS_DAP_Capabilities` 按 `probeCaps` 收口；探针自报无 0x04/0x08 → 本层不置** | **失败** |
+
+⇒ **灰的直接原因就是条件④**：不是 AGDI 硬禁用，而是**探针自报的 `DAP_Info(0xF0)` 里没有 SWO 位**，
+本层按"只宣称已验证能力"的口径如实转达（`src/ORBMDK_RDDI.cpp:2951-2973`）。
+
+> 注意 `[0x102FA6C8]` bit0 = UI 勾选态；`0x100229FD test byte [0x102FA6C8], 1 / je → Trace=Off…`。
+> 所以即便把 `0x44D` 强行点亮成可勾，**条件④不满足时勾选也不产生任何效果**（写出的仍是 `Trace=Off`）。
+
+**(8.2) ETB 是死路 —— 编码器根本不接受 port=3**
+
+配置串编码块（`0x100229F0` 起）只认 UART(2) / Manchester(1)：
+
+```asm
+0x100229FD  test byte [0x102FA6C8], 1
+0x10022A04  je   0x10022A77                  ; Trace Enable 未勾 → "Trace=Off;TraceBaudrate=0;TraceTransport=None;"
+0x10022A06  movzx eax, byte [0x102FA6D0]     ; Trace Port 取值
+0x10022A0D  sub  eax, 1
+0x10022A10  je   0x10022A53                  ; ==1 Manchester → test caps,0x08
+0x10022A12  sub  eax, 1
+0x10022A15  je   0x10022A2F                  ; ==2 UART       → test caps,0x04
+0x10022A17  mov  eax, 0x2024                 ; ★ 其余一切（含 3=ETB、0x100/0x200/0x800 并口）→ 不支持的配置
+```
+
+而 AGDI 内建的配置串模板**只有 5 个**（`0x101EB3DC / 0x101EB400 / 0x101EB428 / 0x101EB454 / 0x101EB480`）：
+
+```
+Trace=SWO-UART;TraceTransport=Read;         Trace=SWO-UART;TraceTransport=Stream;
+Trace=SWO-Manchester;TraceTransport=Read;   Trace=SWO-Manchester;TraceTransport=Stream;
+Trace=Off;TraceBaudrate=0;TraceTransport=None;
+```
+
+**没有任何 ETB / ETM / 并口 Trace 的表达形式** ⇒ 选中 ETB 后唯一可能的结果就是 `0x2024`（不支持配置）。
+
+⇒ **结论**：`Embedded Trace Buffer` 在 AGDI 这套实现里**不可能真正工作**。
+§17.9(7) 的补丁只让"UI 能选"，功能上零收益（反而容易误判）。
+§17.9(4) 的判断由"看不到数据"升级为"**根本没有通往 ETB 的代码路径**"。
+
+> 附注：`0x1003BD60` 的跳表把 6 个下拉项映到 `[0x102FA6D0]` = `0x100/0x200/0x800/1/2/3`
+> （并口三项 / Manchester / UART / **ETB=3**）；编码器取的是**低字节**，
+> 所以并口三项也一并落到 `0x2024`。
+
+**(8.3) 由此确定的可行动作**
+
+- `Trace Enable`（=SWO）这条路本身是通的，卡点只在**条件④（caps 位）**：
+  要么让探针自报 `0x04/0x08`，要么**本层不再按 `probeCaps` 收口**（= 主动宣称 SWO 能力）。
+  这是一次**口径决策**，不是 bug —— 见 `Todo.md` §5 T1。
+- ETB / ETM 方向建议**结案**：不是 RDDI 层能补的洞，AGDI 侧连配置串模板都不存在。
+
+复核命令：
+`python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x1003B2A0 0x100`（`0x44D` 四条件门控）
+`python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x100229F0 0xB0`（编码器只认 1/2，其余 `0x2024`）
+`python tools/pe_re.py hex "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x101EB3C0 0xE0`（5 个配置串模板）
+
+复核命令：
+`python tools/_rsrc_scan.py "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" --quiet --dialog 102`
+`python tools/pe_re.py off "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x1003B39A 6`（→ `file 0x03A79A`）
+`python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x1003B290 0x160`
+`python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x1003BD60 0x150`
+
+> 复核命令（本节结论全部可复现）：
+> `python tools/pe_re.py xref "<KeilRoot>\UV4\UV4.exe" DllUv3Cap`
+> `python tools/pe_re.py dis "<KeilRoot>\UV4\UV4.exe" 0x5F3E40 0x140` / `0x7189D0 0x60` / `0x5F3F40 0x140`
+> `python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x10011D70 0x220`
+> `python tools/pe_re.py exports "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll"`（15 个导出，`DllUv3Cap` ord=13）
 
 ---
 
 ## 十八、已完成事项清单（2026-09-30 复核）
 
 > 本节只保留**已关闭**的条目（编号沿用原文，故不连续）。
-> 未解决项（原 §18.1 / §18.5 / §18.6 / §18.7 及 §18.2 的遗留观察）已迁出至 `Todo.md`。
+> 未解决项（原 §18.1 / §18.5 / §18.6 / §18.7 及 §18.2 的遗留观察）已迁出至 `Todo.md`
+> （自 2026-10-03 起 `Todo.md` 只列未完成项；原 §18 体系全文留档在 `Todo.md.bak`）。
 > 二轮补充迁出（2026-10-01）：正文中散落的待办 —— §五（stub 清单）、§7.3（符号路径）、
 > §17.7（ETM 立项）、§4.12 两条注、§13.5 的剩余失败、§18.9 第一步 #6 —— 亦已一并迁出，
-> 各处只留指针（对应 `Todo.md` §18.5 / §18.7b / §18.10-B / §18.12 / §18.14 / §18.11 / §18.13）。
+> 各处只留指针（现行落点：`Todo.md` §18.5 / §18.11 / §18.12 / §18.13 / §18.14，
+> 以及 `Todo.md.bak` §18.7b / §18.10-B / §18.10-C）。
 
 ### 18.2 ✅ 块传输提速验证 —— 2026-09-30 完成
 
@@ -2418,6 +2848,20 @@ DP/AP 访问由本层用 `JTAG_Sequence` 自己实现（IR=0xA/0xB + 35 位 DR +
 必须先单独确认固件支持，再放开；尤其要警惕"会挂死设备、需人工插拔"这一类失败模式，
 它的代价是整条调试链路而不是一次操作。
 
+> **⚠️ 2026-10-03 复核更正（定性部分推翻；上面第 2 条表里的现场证据仍然成立）**
+>
+> 上面"当时的判断（错在哪）"把原因写成"固件在 JTAG 下行没有这条实现路径"，**与源码不符**：
+> orbtrace-1.4.3 的门级固件**明确实现**了 JTAG 下的块传输 —— `cmsis_dap.py:766-903`
+> （`RESP_TransferBlock_Setup/Process` 带 `isJTAG` 分支、`readBDelay = isJTAG & rnw`，
+> 实现清单 `# DAP_TransferBlock : Done` 无 SWD-only 限定）、`dbgIF.v:480-502`（`CMD_TRANSACT`
+> 的 `MODE_JTAG` 路径）、`jtagIF.v:142-273`（35 位 DPACC/APACC + 多 TAP bypass）。
+> **真不支持会立刻回 `0xFF`（`RESP_Not_Implemented`）**，而不是"无声 + 停止服务 OUT 端点"。
+>
+> ⇒ 本步**现象**（#84 日志、须插拔）**仍然成立**，但准确定性应为：**本层主动禁用，根因未定性**
+> （代码上可指认的卡死候选：`irlenx` 链信息未下发/不符、JTAG 时钟未跑、JTAG 延迟读计数与本层
+> 严格校验冲突）。**完整证据、候选与判定方法见 `bug.md` B9**；复验工具
+> **`test/jtagblockprobe.cpp`**（每步 0x06 之后 Ping 一次，把结果分成"可用 / 未处理但存活 / 挂死"三类）。
+
 ---
 
 ## 十九、编译器兼容性审查（仅限 Windows，2026-10-03）
@@ -2498,3 +2942,258 @@ DP/AP 访问由本层用 `JTAG_Sequence` 自己实现（IR=0xA/0xB + 35 位 DR +
 | 加 `/permissive-` 试编一遍（只加开关、产物丢临时目录） | 标准符合性（预期零错误，因为无模板） | 一次编译 |
 | 用 `clang-cl` 试编 | MSVC 宽松模式差异 + GNU 语法差异（Windows 下最现实的第二编译器） | 需装 LLVM |
 | 在 MinGW 下试编 | 验证 §19.2 的 C1/C2 判断 | 需装 MinGW-w64 |
+
+---
+
+## 二十、能力探测的"深度"与一处固件副作用（2026-10-03）
+
+> **背景**：`ProbeBlockTransfer` 原来只发 **1 个字**（读一次 DP IDCODE），`ProbeTransferMulti`
+> 只发 **2 笔读**；而这两条路径实际被用到的深度远不止于此 —— 块传输 V2 下是 **125/126 字/往返**
+> （见 `BlockWordsLimit()`），多笔可达上百笔**且含写**。探测太浅的后果是：固件"浅层能过、
+> 深层静默出错"时**无法回退**，只能把错误数据交出去。
+
+### 20.1 已落地：块传输探测改为"按真实工作深度深读"
+
+`src/ORBMDK_RDDI.cpp` 的 `ProbeBlockTransfer` 改成**两段式**：
+
+1. 单字基线（读 DP IDCODE）；
+2. 按 `BlockWordsLimit()`（orbtrace 标定 508 → **125 字**；HSLinkPro 511 → 126 字；V1/HID → 14 字）
+   再做一次多字块读，并**逐字校验** n 个字是否都等于该 IDCODE。
+
+压力载荷选 **DP IDCODE**：DP 读不自增、无副作用，n 次读恒回同一值，所以"逐字相等"是硬判据。
+日志变为 `Block transfer probe OK (… idcode=0x…, deep N-word read verified)`；失败则按既有约定
+**永久回退逐字**（只影响性能，不影响功能）。
+
+### 20.2 ★ 固件副作用：在 `flushBatch` 中途插"写笔"会破坏后续 AP 访存
+
+**现象**：给 `ProbeTransferMulti` 加了一段"批量内写"校验（读 DP SELECT → **同值写回** → 读回自比）后，
+orbtrace 上 `swdprobe` 从 **19/0** 变成 **14/5**，失败形态高度一致：
+
+| 读回项 | 值 | 备注 |
+|--------|----|------|
+| `DP CTRL/STAT` | `0xF0000040` | 正常（调试电源已上） |
+| `AP CSW` 写 → 读回 | 一致 | **AP 寄存器访问正常** |
+| `SCB->CPUID` | **`0x00000000`** | AP **存储器**访问 |
+| `DHCSR` | **`0x00000000`** | |
+| `RAM 0x20000000` 写后读回 | **`0x00000000`** | |
+
+⇒ 形态 = **"AP 寄存器能访问、但 AP 存储器 / 核心寄存器全部读回 0"**。
+
+**定位（A/B 实测，同一 orbtrace、同一目标、同一测试）**：
+
+| 被测 DLL | swdprobe 结果 |
+|-----------|---------------|
+| 加固前（旧的浅探测） | **19/0** |
+| 只加 §20.1 块深读、**不加**批量内写校验 | **19/0** |
+| 加了批量内写校验 | **14/5** |
+
+旁证：`ORBMDK_BlockTransferTest` 的会话**未触发多笔探测**（只触发块深读），其 RAM **逐值**写读 **6/0 全过**。
+
+**结论**：破坏出在"在 `DAP_RegAccessBlock` 的 `flushBatch` **中途**额外插入写笔"这一动作上 ——
+此刻 DP/AP 的选择与 **posted-read 流水线正处于"半途"状态**，插写笔（尤其碰 **DP SELECT**）会把它带乱。
+**机理未查清**（属固件侧，本层只能选择不这么做）。⚠ 本条是 **orbtrace 实测**结论，**HSLinkPro 未验**。
+
+**处置**：该写校验**已撤回**，并在 `ProbeTransferMulti` 处留了警示注释 —— **不要**再往那一处塞写笔；
+要补写语义须换载体（**不要碰 DP SELECT**）与时机，并先在 orbtrace 上做同样的实机回归。
+
+### 20.3 本结论的复现 / 回归手段
+
+- `bin\swdprobe.exe ORBMDK_RDDI.dll` → 期望 **19 通过 / 0 失败**（orbtrace；DPIDR `0x2BA01477`）。
+- `bin\ORBMDK_BlockTransferTest.exe` → 期望 **6 通过 / 0 失败**。
+- `%TEMP%\ORBMDK_RDDI.log`（`ORBMDK_LOG_LEVEL` = `1`）：两条探测行齐全，且 **0 WARN / 0 ERROR**。
+
+---
+
+## 二十一、RAM 读写速率实测（绕开 Keil，2026-10-03）
+
+> **目的**：回答"**设备侧**（探针 + 目标 + 本 DLL）到底能跑多快"。Keil/AGDI 站在用户与本 DLL
+> 之间，还自带每次调用的开销与交错的寄存器访问，所以**任何 Keil 会话的数字都不能代表设备极限**。
+>
+> **工具**：`test\ORBMDK_RAM_SpeedTest.cpp` → `bin\ORBMDK_RAM_SpeedTest.exe`
+> （已挂进 `test\build_test.ps1 -All`；用法
+> `ORBMDK_RAM_SpeedTest.exe [ramAddr] [bytes] [rounds] [clockHz] [dllPath]`）
+>
+> **方法**：直接调 `DAP_RegWriteRepeat` / `DAP_RegReadRepeat`（= 烧录热路径），链路里只有本 DLL；
+> 顺序为 **停核 → 尺寸阶梯 → 稳态 N 轮 → 单笔基线**（单笔 = 1 字/次调用 = 1 次 USB 往返）。
+> 逐值校验 + 首尾哨兵查越界；速率口径 `1 kB = 1024 B`，与 DLL 的 TESTSPEED 一致，可直接对比。
+
+### 21.1 实测（orbtrace / 目标 Cortex-M4（STM32F407RET6）/ 4 KB 缓冲 / 4~8 轮）
+
+> **笔误更正**：本节标题原写“目标 Cortex-M0+”。实测 CPUID `0x410FC241`，PartNo（bit[15:4]）`0xC24`
+> = **Cortex-M4** r0p1，与 **STM32F407RET6**（192 KB SRAM）一致；DP IDCODE `0x2BA01477` 亦相符。
+> 下表数据采自同一块板、同一台探针。
+> **后续**：4 KB 缓冲**正好等于该链的 TAR 自增块**（见 §21.5 与 `bug.md` B7）；改用 **32 KB** 重测的
+> 完整 1→100 MHz 步进曲线见 **§21.5**。
+
+| SWD 时钟 | 写 best | 读 best | 块传输 vs 单笔 |
+|---|---|---|---|
+| 1 MHz | 74.3 kB/s | 78.5 kB/s | 2.6× / 2.9× |
+| **10 MHz** | **582.1 kB/s** | **631.5 kB/s** | **19.5× / 25.0×** |
+
+**尺寸阶梯**（10 MHz，写 kB/s）：16 字（64 B）46.8 → 64 字 475.6 → 256 字 429.6 → **1024 字 595.7**。
+**单笔基线**：**130~155 µs/字**，即一次 USB 往返的延迟 —— 这是"逐命令一问一答"的地板。
+
+### 21.2 结论
+
+1. **瓶颈是 SWD 时钟，不是 USB**：1 → 10 MHz 提速 **7.9×**。
+   500 B 一块在 10 MHz 上"光移位"就要 `4000 bit / 10 MHz = 400 µs`，实测每块 ≈700 µs
+   ⇒ **约一半是 SWD 移位、一半是 USB 往返 + 固定开销** ⇒ **继续提高时钟仍有直接收益**
+   （上限由信号完整性决定；时钟margin不足会**静默**出错，本工具会逐值抓到，Keil 不会）。
+2. **与 Keil 烧录吻合**：10 MHz 下 582/631 kB/s ≈ Keil 烧录实测 565 kB/s
+   ⇒ **AGDI/µVision 自身几乎没有拖累**，"Keil 慢"就是这条路径的真实极限。
+3. **带宽远未成为瓶颈**：631 kB/s ≈ 5 Mbps ≈ **USB 2.0 HS 480 Mbps 的 1%**。
+4. **小缓冲被固定开销吃满**：16 字只有 46.8 kB/s（每次调用的固定开销占绝大部分）。
+
+### 21.3 顺带修掉的两个自测 bug
+
+| # | 文件 | 现象 | 根因 | 修法 |
+|---|------|------|------|------|
+| 1 | `ORBMDK_RAM_SpeedTest.cpp`、`ORBMDK_BlockTransferTest.cpp` | 停核后读回 `DHCSR = 0x00000000`，误报 `[NOT halted]` | 写 DHCSR 后 CSW 的 `AddrInc=single` 已把 TAR 自增到 `DHCSR+4`，直接读 DRW 读到的是 DCRSR | 读之前**重新 arm TAR**，即得 `0x01030003 [halted]` |
+| 2 | `ORBMDK_RAM_SpeedTest.cpp` | 尺寸阶梯假报"哨兵越界" | 把大缓冲"切片"当小缓冲用，尾部哨兵落在真实数据中间 | 每档**独立分配**带哨兵的缓冲 |
+
+### 21.4 复现
+
+```
+bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 4096 4 1000000      # ~74 kB/s（SWD 时钟受限）
+bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 4096 4 10000000     # ~582 / 631 kB/s
+```
+
+> ⚠ 会覆盖 `[ramAddr, ramAddr+bytes)`；且**跑完核处于停机状态**，须复位/上电后再跑真实程序。
+
+### 21.5 32 KB 缓冲 · 1→100 MHz 步进扫描（2026-10-03）
+
+> **为什么重测**：§21.1 用的 **4 KB 正好等于该链的 TAR 自增块**（`bug.md` B7），既覆盖不到块边界，
+> 也无法代表大缓冲。本表用 **32 KB**（跨 8 个 TAR 块）重测。
+>
+> **工具**：`bin\ORBMDK_RAM_SpeedTest.exe`；按 `max_tar_block_size()` 切块、**仅在块边界重写 TAR**
+> （方案 3，`bug.md` B7，落在测试路径；主代码不改）。**不这样做会被静默折返** —— 把第 6 参置 `0` 即可复现。
+> **命令**：`0x20000000 32768 3 <时钟Hz>`，时钟 1→100 MHz **步进 1 MHz、首次失败即停**。
+
+**结果：1→100 MHz 全程 0 失败**（每档 3 轮 + 尺寸阶梯 + 单笔基线，全部逐字校验 + 首尾哨兵）。
+
+| MHz 写/读 | MHz 写/读 | MHz 写/读 | MHz 写/读 |
+|---|---|---|---|
+| 1 · 71.9 / 78.8 | 2 · 144.5 / 153.2 | 3 · 185.1 / 193.8 | 4 · 227.5 / 274.9 |
+| 5 · 263.3 / 290.2 | 6 · 363.4 / 382.2 | 7 · 404.4 / 424.3 | 8 · 445.9 / 465.8 |
+| 9 · 518.0 / 521.3 | 10 · 596.0 / 612.0 | 11 · 597.9 / 612.3 | 12 · 593.2 / 616.6 |
+| **13 · 712.6 / 726.0** | 14 · 714.2 / 726.4 | 15 · 714.0 / 723.0 | 16 · 714.3 / 729.8 |
+| **17 · 875.6 / 898.8** | 18 · 870.2 / 897.0 | 19 · 867.5 / 902.9 | 20 · 876.2 / 893.4 |
+| 21 · 876.1 / 895.6 | 22 · 868.9 / 895.2 | 23 · 901.9 / 908.0 | 24 · 873.5 / 892.5 |
+| **25 · 1144.2 / 1229.3** | 26 · 1201.9 / 1245.5 | 27 · 1194.9 / 1231.1 | 28 · 1217.2 / 1226.1 |
+| 29 · 1160.2 / 1168.2 | 30 · 1207.3 / 1212.9 | 31 · 1195.0 / 1209.9 | 32 · 1130.1 / 1171.3 |
+| 33 · 1211.0 / 1221.9 | 34 · 1189.7 / 1217.1 | 35 · 1203.0 / 1225.8 | 36 · 1143.9 / 1178.6 |
+| 37 · 1141.0 / 1213.4 | 38 · 1144.4 / 1165.2 | 39 · 1199.8 / 1223.6 | 40 · 1182.1 / 1165.4 |
+| 41 · 1150.9 / 1195.6 | 42 · 1154.3 / 1172.7 | 43 · 1144.1 / 1162.3 | 44 · 1146.6 / 1170.4 |
+| 45 · 1206.5 / 1210.9 | 46 · 1200.6 / 1233.2 | 47 · 1165.3 / 1162.0 | 48 · 1159.0 / 1173.1 |
+| 49 · 1178.0 / 1218.7 | 50 · 1194.2 / 1230.1 | 51 · 1204.2 / 1224.8 | 52 · 1210.7 / 1224.7 |
+| 53 · 1147.0 / 1165.0 | 54 · 1213.0 / 1206.4 | 55 · 1157.4 / 1164.8 | 56 · 1201.7 / 1219.1 |
+| 57 · 1200.6 / 1213.0 | 58 · 1203.9 / 1238.0 | 59 · 1287.9 / 1240.2 | 60 · 1209.0 / 1220.0 |
+| 61 · 1143.3 / 1163.6 | 62 · 1214.9 / 1232.3 | 63 · 1234.4 / 1273.2 | 64 · 1259.9 / 1282.7 |
+| 65 · 1222.6 / 1244.0 | 66 · 1216.0 / 1205.1 | 67 · 1229.6 / 1246.6 | 68 · 1249.9 / 1295.1 |
+| 69 · 1261.5 / 1273.2 | 70 · 1191.6 / 1216.6 | 71 · 1204.3 / 1229.7 | 72 · 1251.7 / 1282.9 |
+| 73 · 1206.7 / 1231.5 | 74 · 1230.2 / 1233.5 | 75 · 1219.5 / 1275.8 | 76 · 1251.0 / 1267.3 |
+| 77 · 1265.4 / 1275.8 | 78 · 1205.2 / 1223.3 | 79 · 1140.4 / 1151.8 | 80 · 1138.6 / 1171.1 |
+| 81 · 1145.1 / 1148.8 | 82 · 1211.2 / 1232.2 | 83 · 1197.6 / 1228.6 | 84 · 1195.0 / 1211.0 |
+| 85 · 1158.8 / 1149.2 | 86 · 1200.1 / 1212.0 | 87 · 1154.0 / 1176.9 | 88 · 1202.4 / 1223.0 |
+| 89 · 1206.3 / 1213.7 | 90 · 1198.7 / 1232.6 | 91 · 1153.9 / 1190.8 | 92 · 1223.4 / 1209.8 |
+| 93 · 1182.1 / 1190.0 | 94 · 1232.3 / 1262.5 | 95 · 1178.5 / 1220.2 | 96 · 1253.4 / 1273.9 |
+| 97 · 1172.7 / 1180.2 | 98 · 1268.3 / 1294.1 | 99 · 1246.8 / 1250.1 | 100 · 1211.6 / 1218.3 |
+
+（单位 kB/s，`1 kB = 1024 B`。）
+
+**读数**
+
+| 段 | 数据 |
+|---|---|
+| 1→12 MHz 近似线性 | 写 71.9 → 593.2（**8.3×**），读 78.8 → 616.6（7.8×） |
+| **台阶① 13 MHz** | 12 → 13：写 593 → 713（**+20%**），之后 13–16 平坦（712–714） |
+| **台阶② 17 MHz** | 16 → 17：写 714 → 876（**+23%**），17–24 平坦（868–902） |
+| **台阶③ 25 MHz** | 24 → 25：写 874 → 1144（**+31%**），此后进入平台 |
+| **25→100 MHz 平台** | 写 1130–1288（中位 ≈**1200**）、读 1149–1295（中位 ≈**1228**）；**再提时钟无增益** |
+
+1. **台阶 = 固件分频器的量化档**（根因见 `bug.md` **B8**，源码 `verilog/dbgIF.v`）。固件把请求值换算成
+   "每个半周期几个 100 MHz tick"：`clkDiv = floor((CLK_FREQ-1)/(2·f_req))`，实际时钟 = `CLK_FREQ/(2·clkDiv)`，
+   其中 `CLK_FREQ = 100 MHz`（`debug/dbgIF.py` 未传 `p_CLK_FREQ` ⇒ 取 `dbgIF.v:82` 默认；`i_clk` = `cd_debug`
+   = 100 MHz，`crg_ecp5.py:93`）：
+
+   | 请求 | clkDiv | **实际 SWD 时钟** | 实测写 kB/s | 模型（移位 + ≈350 µs/块固定开销） |
+   |---|---|---|---|---|
+   | 1 MHz | 50 | 1.0 MHz | 71.9 | 84 |
+   | 10–12 MHz | 4 | 12.5 MHz | 593–596 | 627 |
+   | 13–16 MHz | 3 | 16.67 MHz | 712–714 | 730 |
+   | 17–24 MHz | 2 | 25 MHz | 868–902 | 874 |
+   | **25 MHz** | **1** | **50 MHz = 最快档** | **1144** | 1088 |
+   | >25 MHz | — | **请求被拒**（`perr`，分频不变） | 1130–1288 | — |
+
+   （模型按每块 **≈5670 bit** 计 —— 504 B 只是**载荷**，SWD 线上每字 ≈45 bit：8 头 + 32 数据 + 校验 + 转向；
+   §21.1 里 `500 B = 4000 bit` 那个提示是载荷位数，不是线上位数。）
+   ⇒ 请求值只是"分频规格"：**25 MHz 正是最小能取到 `clkDiv=1` 的值**（2×25e6 = 50e6 ≤ 99,999,999），
+   再往上加**零收益**；"平台"就是分频器最快档 **CLK_FREQ/2 = 50 MHz**。
+2. **`MAX_CLOCK = CLK_FREQ/4 = 25 MHz` 是硬闸门**（`dbgIF.v:168`、`:552-558`）：`dwrite > MAX_CLOCK`
+   （或 `< MIN_CLOCK = CLK_FREQ/512 ≈ 195 kHz`）时固件置 **`perr` 且不改 `clkDiv`**。
+   ⚠ **陷阱**：分频寄存器**跨主机会话保持**，被拒即"沿用上一次的值"。若在**刚复位**的 FPGA 上直接请求
+   >25 MHz，实际时钟停在复位默认 `DEFAULT_IF_TICKS_PER_CLK = 49` ⇒ **≈1.02 MHz（≈72 kB/s）**，仅 `perr` 提示。
+   本表 26–100 MHz "看起来仍在 50 MHz"，正是因为**上一个 25 MHz 档把 clkDiv 留在了 1**（属扫描顺序的产物）。
+   ⚠ **本层未上报**：`DAP_SWJ_Clock` 只回命令级状态（`ORBMDK_HID.cpp:1321-1334`），`Clock=` 到 200 MHz 才截
+   （`ORBMDK_RDDI.cpp:2637-2644`）⇒ 1→100 MHz 全程 `ConfigureInterface -> 0`（列为**本层改进项**）。
+3. **≥25 MHz 后瓶颈不再是 SWD 时钟**：50 MHz 下每块移位仅 **≈113 µs**，实测每块 **≈420–460 µs**
+   ⇒ 其余是**与时钟无关的 ≈350 µs/块固定开销**（USB 往返 + FSM 握手）。要再快只能**减少往返次数**
+   （每包 508 B → 126 字已是上限），或**提高 debug 域频率**（`MAX_CLOCK` 与最快档都随之线性放大）。
+4. **100 MHz 请求值下全程无数据错误** ⇒ 信号裕量足够；但有效速率与 25 MHz **完全相同**（且这个"相同"
+   是分频被拒后的**沿用值**，不是真的跑到了 100 MHz）。
+5. 与 §21.1（4 KB 缓冲）同水平：1 MHz 71.9 vs 74.3；10 MHz 596.0/612.0 vs 582.1/631.5
+   ⇒ **缓冲从 4 KB 加大到 32 KB 不改变结论**。
+
+> **复现**（默认即方案 3；末位 `0` 复现 `bug.md` B7 的静默折返）：
+> ```
+> bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 32768 3 1000000        #  71.9 /  78.8 kB/s
+> bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 32768 3 10000000       # 596.0 / 612.0 kB/s
+> bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 32768 3 25000000       # 1144.2 / 1229.3 kB/s
+> bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 32768 3 100000000      # 1211.6 / 1218.3 kB/s
+> bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 32768 1 1000000 ORBMDK_RDDI.dll 0   # 期望 FAIL（B7）
+> ```
+### 烧录速率统计（TESTSPEED）
+
+把级别设为 **2**（TESTSPEED），`DAP_RegWriteRepeat` / `DAP_RegReadRepeat`
+（即 AGDI 的 `SWD_WriteBlock` / `SWD_VerifyBlock` / `SWD_ReadBlock`，flash 下载与校验的真实数据通道）
+会按方向统计字节数与耗时，限流输出到 `%TEMP%\ORBMDK_RDDI.log`：
+
+```
+[ORBMDK][00:12:34.101][TESTSPEED][RDDI][8112:9012] meter config: transport=V2/Bulk speed=Full(12Mbps) cmdPkt=508 B -> 125 words/round trip, blockTransfer=on | bus ceiling ~1465 kB/s
+[ORBMDK][00:12:34.567][TESTSPEED][RDDI][8112:9012] WRITE speed: 4096 B in 7.1 ms -> 563.4 kB/s | 9 round trips, 788.9 us/trip | window wall 47.3 ms, dap 15.0% | total 65536 B in 115.0 ms (avg 556.5 kB/s, 147 trips)
+[ORBMDK][00:12:34.589][TESTSPEED][RDDI][8112:9012] READ  speed: 388 B in 0.9 ms -> 405.2 kB/s | 1 round trips, 900.0 us/trip | window wall 2.1 ms, dap 42.9% | total 1128 B in 3.9 ms (avg 279.4 kB/s, 3 trips)
+[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter segment: wall 1218.4 ms | dap 118.9 ms (9.8%) | other 1099.5 ms (90.2%) | write 65536 B (538.0 kB/s) + read 1128 B | 150 round trips
+[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter usb: 150 cmds, out 96.2 ms (641.3 us/cmd), in 22.7 ms (151.3 us/cmd), round trip 792.6 us/cmd
+```
+
+| 项 | 约定 |
+|----|------|
+| 统计口径 | `WRITE` = 下载写入，`READ` = 回读校验；每行给出**窗口速率**与**累计平均速率**（kB/s） |
+| 往返次数 | `round trips` = 窗口内实际发生的 USB 往返数（块传输 1 次/块，逐字回退 N 次），`us/trip` 由此得出 |
+| 计时范围 | 只含 DAP 传输段（`DAP_TransferBlock` / `DAP_Transfer` 往返），日志格式化不计入 |
+| 输出频率 | 累计 `≥ 1024 字` 或 `≥ 200 ms` 才落一行；两次调用空闲 `> 500 ms` 视为上一段烧录结束，立即结算余量 |
+| 关闭开销 | 阈值高于 TESTSPEED 时连计时都不做（`ORBMDK_LogGetLevel()` 前置判断） |
+| 失败不计 | 中途返回 `RDDI_DAP_ERROR` 的那次不统计（避免把失败路径算进速率） |
+| 配置行 | 首次计量（传输层变化会重打）输出一条 `meter config:`，给出传输层 / **端口速度** / 出包字节数 / 每次往返字数 / 块传输是否生效，以及该速度的总线理论上限 |
+| 窗口墙钟 | 速率行里的 `window wall …, dap …%`：本窗口的**真实墙钟**，以及驱动（DAP 传输）在其中的占比 |
+| 段总结 | 一段连续传输结束（空闲 > 500 ms）后补打 `meter segment:`：整段的 wall / dap / other + 双向字节与往返数。**判断瓶颈在哪一层的唯一依据**。注意它是等**下一笔传输**到来时才补打的，所以日志末尾可能少最后一段 |
+| USB 拆分 | 再补一条 `meter usb:`：累计命令数，以及 OUT（发命令）与 IN（收响应）各自的耗时与每命令均值 |
+
+> **怎么读这几行**（实测样本，见 COMPAT_ANALYSIS）：
+> - **先看 `meter segment` 的 dap%**：实测一次下载里驱动只占 **~10–15%**，其余（other）在 AGDI 与
+>   目标端 flash 算法。把传输优化到 0，整体也只能快这么多 —— 所以"加速"的第一问是
+>   **瓶颈到底在不在这一层**，而不是埋头抠 USB。
+> - **再看 `meter usb` 的 out/in**：`out ↑` = 时间花在把命令包搬上线；`in ↑` = 设备应答慢
+>   （SWD 时钟 / flash 算法），驱动层改什么都没用。
+> - `us/trip` 必须与 `words/round trip` 一起看。两组实测摆在一起：`出包 64 B / 14 字 → ~95 µs/往返`、
+>   `出包 508 B / 125 字 → ~789 µs/往返`。往返耗时几乎正比于**出包字节数**（≈1.55 µs/字节），
+>   即**每个 64 字节包固定约 95 µs**，其中只有 ~43 µs 是 Full Speed 的真实线时间，
+>   剩下 **~52 µs 是每包的固定开销**。
+>   ⇒ 再靠"每次往返多带几个字"已经榨不出东西（总字节数没变），只能**让每个字节更便宜**：
+>   把链路从 Full Speed 换成 High Speed（512 B 包，同样 508 字节只需 1 个包）。
+> - `bus ceiling` 是给对照用的：实测已贴着它 = 被物理层卡死；实测只有它的 ~40%
+>   （FS 下 5 字/µs 量级）时，才值得回头查驱动与端点调度。
+> - **日志时间戳的间隔 ≠ 计量时间**：窗口计量 7.1 ms，两行时间戳却相差 ~47 ms —— 差值就是
+>   AGDI / 目标侧的时间。`window wall` 与 `meter segment` 现在直接把它打出来了。
+> - 需要传输层的详细枚举/标定过程（`[BULK]` 行）时，阈值要放到 **1(INFO) 或 0(DEBUG)** ——
+>   `ORBMDK_LogTrace` 按 INFO 级过滤，阈值 2 会把 `[BULK]` 全部丢掉。

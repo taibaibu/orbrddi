@@ -19,6 +19,8 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <share.h>   // _fsopen / _SH_DENYNO（共享模式常驻句柄）
@@ -37,6 +39,16 @@ std::mutex  g_lock;                       // 保护级别/路径/格式化/文�
 int         g_level        = ORBMDK_LOG_ERROR;
 bool        g_levelForced  = false;       // SetLevel 之后不再读文件/环境
 ULONGLONG   g_levelStamp   = 0;
+
+/*
+ * 无锁级别快照（给 ORBMDK_LogIsEnabled / ORBMDK_LogMeterEnabled 用）：
+ * 由 _publishLevel() 在每次 _resolveLevel() 之后刷新。INT_MAX = "尚未解析"，
+ * 这时闸门不知道真实阈值，要抢一次锁做首次解析（只发生一次）。
+ * 之所以要这个快照：热路径上的日志宏若先取锁再判断，锁竞争本身就是开销，
+ * 而且被过滤的日志还会白白做参数求值。
+ */
+std::atomic<int>  g_levelFast{ INT_MAX };
+std::atomic<bool> g_levelResolved{ false };
 std::string g_filePath;
 bool        g_filePathResolved = false;
 FILE*       g_file         = nullptr;  // 常驻句柄：开一次、追加多行（不再逐行开/关）
@@ -62,10 +74,11 @@ bool _tempFile(char* out, size_t cap, const char* name)
 }
 
 /**
- * 解析阈值：%TEMP%\ORBMDK_LOG_LEVEL（热更新）→ 环境变量 → 默认 ERROR。
- * 每条日志都查文件太贵，1 秒最多查一次，因此改动最多延迟 1 秒生效。
+ * 解析阈值（**调用方必须持有 g_lock**）：%TEMP%\ORBMDK_LOG_LEVEL（热更新）→
+ * 环境变量 → 默认 ERROR。每条日志都查文件太浪费，1 秒最多查一次，因此改动最多
+ * 延迟 1 秒生效。
  */
-int _resolveLevel()
+int _resolveLevelLocked()
 {
     if (g_levelForced) {
         return g_level;
@@ -105,6 +118,31 @@ int _resolveLevel()
     return g_level;
 }
 
+/** 刷新无锁快照（阈值/是否已解析）。只在持有 g_lock 时调用。 */
+void _publishLevel(int level)
+{
+    g_levelFast.store(level, std::memory_order_relaxed);
+    g_levelResolved.store(true, std::memory_order_relaxed);
+}
+
+/** 解析阈值并刷新快照（调用方必须持有 g_lock）。 */
+int _resolveLevel()
+{
+    const int level = _resolveLevelLocked();
+    _publishLevel(level);
+    return level;
+}
+
+/**
+ * 首次解析：闸门发现快照还是 INT_MAX（从未解析过）时调用。
+ * 抢不到锁就直接返回 —— 另一个线程正在解析，下一次闸门再读快照即可。
+ */
+void _ensureLevelResolved()
+{
+    std::lock_guard<std::mutex> guard(g_lock);
+    _resolveLevel();
+}
+
 const std::string& _filePath()
 {
     if (!g_filePathResolved) {
@@ -124,11 +162,6 @@ const std::string& _filePath()
 
 /**
  * 追加一行到**常驻句柄**。
- *
- * 历史实现是"每行 fopen + fputs + fclose"（理由是宿主 µVision 会独占日志文件，
- * 不关句柄外部诊断工具读不到）。代价太大：性能诊断开启时每秒几十条，每次
- * open/close 都要走一遍文件系统（%TEMP% 上还有杀软实时扫描），实测能把整段
- * 烧录时间的一大半算到"测量"自己头上 —— 测量本身成了被测对象。
  *
  * 现在改成**共享模式常驻句柄**（_fsopen + _SH_DENYNO）：外部工具在宿主运行
  * 期间照样能打开读取，而进程内只开一次。每行仍 fflush，保证外部读到的是
@@ -201,6 +234,20 @@ void _format(char* buf, size_t cap, int level, const char* module,
 }
 
 } // namespace
+
+int ORBMDK_LogIsEnabled(int level)
+{
+    if (level < ORBMDK_LOG_DEBUG || level > ORBMDK_LOG_ERROR) {
+        return 0;
+    }
+    if (g_levelFast.load(std::memory_order_relaxed) <= level) {
+        return 1;
+    }
+    if (!g_levelResolved.load(std::memory_order_relaxed)) {
+        _ensureLevelResolved();            // 只发生一次；此后纯 atomic load
+    }
+    return g_levelFast.load(std::memory_order_relaxed) <= level ? 1 : 0;
+}
 
 void ORBMDK_LogWrite(int level, const char* module, const char* fmt, ...)
 {
@@ -291,6 +338,7 @@ void ORBMDK_LogSetLevel(int level)
     std::lock_guard<std::mutex> guard(g_lock);
     g_level = level;
     g_levelForced = true;
+    _publishLevel(level);                  // 立即对闸门生效（不再等 1 秒节流）
 }
 
 int ORBMDK_LogGetLevel(void)
@@ -328,4 +376,388 @@ void ORBMDK_LogShutdown(void)
 
     // 常驻句柄必须在这里关闭：宿主会随时卸载本 DLL，句柄要跟着走。
     _closeFile();
+}
+
+/* ===========================================================================
+ * 速率计量（TESTSPEED）—— 口径与重建背景见 COMPAT_ANALYSIS.md §9.4
+ *
+ * 目前服务"烧录/校验"这条数据通道（DAP_RegWriteRepeat / DAP_RegReadRepeat）。
+ * 落四类行：meter config / WRITE|READ speed / meter segment / meter usb。
+ * 阈值 > TESTSPEED 时所有入口第一行返回（零开销）。
+ * =========================================================================== */
+
+namespace {
+
+const char* const kMeterModule = "RDDI";
+
+/* 窗口落行条件：累计 ≥1024 字（4096 B）或 ≥200 ms（README「烧录速率统计」） */
+const unsigned           kMeterFlushWords = 1024u;
+const unsigned           kMeterFlushBytes = kMeterFlushWords * 4u;
+const unsigned long long kMeterFlushUs    = 200000ull;
+/* 两次记账空闲超过此值 = 上一段连续传输结束（在下一笔到来时补打段总结） */
+const unsigned long long kMeterIdleUs     = 500000ull;
+
+/** µs 级单调时钟。QPC 分辨率 ~100 ns，远好于原 GetTickCount64 的 1 ms。 */
+unsigned long long _qpcUs()
+{
+    static const unsigned long long freq = []() -> unsigned long long {
+        LARGE_INTEGER f;
+        if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) {
+            return 1ull;
+        }
+        return (unsigned long long)f.QuadPart;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)c.QuadPart * 1000000ull / freq;
+}
+
+/** 速率：**1 kB = 1024 B**（与 §9.4 的历史数据口径一致，改了不可比）。 */
+double _kbps(unsigned bytes, unsigned long long us)
+{
+    if (us == 0) {
+        return 0.0;
+    }
+    return (double)bytes * 1000000.0 / (1024.0 * (double)us);
+}
+
+const char* _speedName(int mbps)
+{
+    switch (mbps) {
+    case 480: return "High";
+    case 12:  return "Full";
+    case 2:   return "Low";
+    default:  return "?";
+    }
+}
+
+struct MeterState {
+    /* 配置（变化时重打 meter config） */
+    std::string transport;
+    int         linkMbps      = 0;
+    int         cmdPktBytes   = 0;
+    int         wordsPerTrip  = 0;
+    int         blockTransfer = -1;      // -1 = 尚未落定，保证首次必打
+
+    /* 当前速度窗口 */
+    bool               windowActive = false;
+    unsigned long long windowStartUs = 0;   // 窗口首笔 TripBegin
+    unsigned long long windowLastUs  = 0;   // 窗口末笔记账时刻
+    unsigned long long windowDapUs   = 0;
+    unsigned           windowWriteBytes = 0;
+    unsigned           windowReadBytes  = 0;
+    unsigned           windowTrips      = 0;
+
+    /* 累计（跨段，从进程启动起从不清零） */
+    unsigned long long totalWriteDapUs = 0;
+    unsigned long long totalReadDapUs  = 0;
+    unsigned           totalWriteBytes = 0;
+    unsigned           totalReadBytes  = 0;
+    unsigned           totalTrips      = 0;
+
+    /* 当前段 */
+    bool               segActive  = false;
+    unsigned long long segStartUs = 0;
+    unsigned long long segEndUs   = 0;
+    unsigned long long segDapUs   = 0;
+    unsigned           segWriteBytes = 0;
+    unsigned           segReadBytes  = 0;
+    unsigned           segTrips      = 0;
+
+    /* meter usb：只统计 TripBegin..Account 之间（见 §9.4 首轮缺陷） */
+    bool               tripOpen = false;
+    unsigned long long lastActivityUs = 0;
+    unsigned           usbOutCmds = 0;
+    unsigned           usbInCmds  = 0;
+    unsigned long long usbOutUs   = 0;
+    unsigned long long usbInUs    = 0;
+};
+
+MeterState g_meter;
+
+/** 加统一前缀落一行（调用方必须持有 g_lock；TESTSPEED 级只落文件）。 */
+void _meterEmitLocked(const char* body)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[1024];
+    snprintf(line, sizeof(line),
+             "[ORBMDK][%02u:%02u:%02u.%03u][%s][%s][%lu:%lu] %s",
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+             kLevelName[ORBMDK_LOG_TESTSPEED], kMeterModule,
+             (unsigned long)GetCurrentProcessId(),
+             (unsigned long)GetCurrentThreadId(), body);
+    _appendLine(line);
+}
+
+void _meterResetWindowLocked()
+{
+    g_meter.windowActive     = false;
+    g_meter.windowStartUs    = 0;
+    g_meter.windowLastUs     = 0;
+    g_meter.windowDapUs      = 0;
+    g_meter.windowWriteBytes = 0;
+    g_meter.windowReadBytes  = 0;
+    g_meter.windowTrips      = 0;
+}
+
+void _meterResetSegmentLocked()
+{
+    g_meter.segActive     = false;
+    g_meter.segStartUs    = 0;
+    g_meter.segEndUs      = 0;
+    g_meter.segDapUs      = 0;
+    g_meter.segWriteBytes = 0;
+    g_meter.segReadBytes  = 0;
+    g_meter.segTrips      = 0;
+    g_meter.usbOutCmds    = 0;
+    g_meter.usbInCmds     = 0;
+    g_meter.usbOutUs      = 0;
+    g_meter.usbInUs       = 0;
+    g_meter.tripOpen      = false;
+    g_meter.lastActivityUs = 0;
+    _meterResetWindowLocked();
+}
+
+/** 落 `WRITE|READ speed` 行并按需重置窗口（调用方必须持有 g_lock）。 */
+void _meterFlushWindowLocked()
+{
+    if (g_meter.windowWriteBytes == 0 && g_meter.windowReadBytes == 0) {
+        _meterResetWindowLocked();
+        return;
+    }
+
+    const bool     isWrite = g_meter.windowWriteBytes >= g_meter.windowReadBytes;
+    const unsigned bytes   = isWrite ? g_meter.windowWriteBytes : g_meter.windowReadBytes;
+
+    const unsigned long long wallUs =
+        (g_meter.windowLastUs > g_meter.windowStartUs)
+            ? (g_meter.windowLastUs - g_meter.windowStartUs) : 0;
+
+    const unsigned long long totalDapUs = isWrite ? g_meter.totalWriteDapUs : g_meter.totalReadDapUs;
+    const unsigned           totalBytes = isWrite ? g_meter.totalWriteBytes : g_meter.totalReadBytes;
+
+    const double usPerTrip = (g_meter.windowTrips > 0)
+        ? (double)g_meter.windowDapUs / (double)g_meter.windowTrips : 0.0;
+    const double dapPct = (wallUs > 0)
+        ? (100.0 * (double)g_meter.windowDapUs / (double)wallUs) : 0.0;
+
+    char body[640];
+    snprintf(body, sizeof(body),
+             "%s speed: %u B in %.1f ms -> %.1f kB/s | %u round trips, %.1f us/trip "
+             "| window wall %.1f ms, dap %.1f%% | total %u B in %.1f ms "
+             "(avg %.1f kB/s, %u trips)",
+             isWrite ? "WRITE" : "READ", bytes,
+             (double)g_meter.windowDapUs / 1000.0, _kbps(bytes, g_meter.windowDapUs),
+             g_meter.windowTrips, usPerTrip,
+             (double)wallUs / 1000.0, dapPct,
+             totalBytes, (double)totalDapUs / 1000.0,
+             _kbps(totalBytes, totalDapUs), g_meter.totalTrips);
+    _meterEmitLocked(body);
+
+    _meterResetWindowLocked();
+}
+
+/** 补打 `meter segment` + `meter usb` 并清零段计数（调用方必须持有 g_lock）。 */
+void _meterSettleSegmentLocked()
+{
+    _meterFlushWindowLocked();             // 段结束前先把窗口余量落掉，不丢数据
+
+    const unsigned long long wallUs =
+        (g_meter.segEndUs > g_meter.segStartUs) ? (g_meter.segEndUs - g_meter.segStartUs) : 0;
+    const unsigned           cmds =
+        (g_meter.usbInCmds > g_meter.usbOutCmds) ? g_meter.usbInCmds : g_meter.usbOutCmds;
+
+    if (wallUs == 0 && g_meter.segTrips == 0 && cmds == 0) {
+        _meterResetSegmentLocked();
+        return;
+    }
+
+    const double wallMs = (double)wallUs / 1000.0;
+    const double dapMs  = (double)g_meter.segDapUs / 1000.0;
+    const double dapPct = (wallUs > 0) ? (100.0 * (double)g_meter.segDapUs / (double)wallUs) : 0.0;
+
+    char body[512];
+    snprintf(body, sizeof(body),
+             "meter segment: wall %.1f ms | dap %.1f ms (%.1f%%) | other %.1f ms (%.1f%%) "
+             "| write %u B (%.1f kB/s) + read %u B | %u round trips",
+             wallMs, dapMs, dapPct,
+             wallMs - dapMs, wallUs > 0 ? (100.0 - dapPct) : 0.0,
+             g_meter.segWriteBytes, _kbps(g_meter.segWriteBytes, g_meter.segDapUs),
+             g_meter.segReadBytes, g_meter.segTrips);
+    _meterEmitLocked(body);
+
+    if (cmds > 0) {
+        const unsigned long long rtUs = g_meter.usbOutUs + g_meter.usbInUs;
+        snprintf(body, sizeof(body),
+                 "meter usb: %u cmds, out %.1f ms (%.1f us/cmd), in %.1f ms (%.1f us/cmd), "
+                 "round trip %.1f us/cmd",
+                 cmds,
+                 (double)g_meter.usbOutUs / 1000.0, (double)g_meter.usbOutUs / (double)cmds,
+                 (double)g_meter.usbInUs / 1000.0, (double)g_meter.usbInUs / (double)cmds,
+                 (double)rtUs / (double)cmds);
+        _meterEmitLocked(body);
+    }
+
+    _meterResetSegmentLocked();
+}
+
+/** 落 `meter config` 行（调用方必须持有 g_lock）。 */
+void _meterEmitConfigLocked()
+{
+    /* 总线理论上限：mbps → MB/s → kB/s（1 kB = 1024 B） */
+    const double ceilingKbps = (double)g_meter.linkMbps * 1000000.0 / 8.0 / 1024.0;
+
+    char body[448];
+    snprintf(body, sizeof(body),
+             "meter config: transport=%s speed=%s(%dMbps) cmdPkt=%d B -> %d words/round trip, "
+             "blockTransfer=%s | bus ceiling ~%.0f kB/s",
+             g_meter.transport.c_str(), _speedName(g_meter.linkMbps), g_meter.linkMbps,
+             g_meter.cmdPktBytes, g_meter.wordsPerTrip,
+             g_meter.blockTransfer ? "on" : "off", ceilingKbps);
+    _meterEmitLocked(body);
+}
+
+/**
+ * 每次"有活动"（TripBegin / Account）时调用：空闲 >500 ms 则把上一段结算掉，
+ * 否则刷新段活动的最后时刻（调用方必须持有 g_lock）。
+ */
+void _meterActivityLocked(unsigned long long now)
+{
+    if (g_meter.segActive && g_meter.lastActivityUs != 0 &&
+        now > g_meter.lastActivityUs && (now - g_meter.lastActivityUs) > kMeterIdleUs) {
+        _meterSettleSegmentLocked();
+    }
+    if (!g_meter.segActive) {
+        g_meter.segActive  = true;
+        g_meter.segStartUs = now;
+    }
+    g_meter.lastActivityUs = now;
+    g_meter.segEndUs       = now;
+}
+
+} // namespace
+
+int ORBMDK_LogMeterEnabled(void)
+{
+    if (g_levelFast.load(std::memory_order_relaxed) <= ORBMDK_LOG_TESTSPEED) {
+        return 1;
+    }
+    if (!g_levelResolved.load(std::memory_order_relaxed)) {
+        _ensureLevelResolved();            // 只发生一次；此后纯 atomic load
+    }
+    return g_levelFast.load(std::memory_order_relaxed) <= ORBMDK_LOG_TESTSPEED ? 1 : 0;
+}
+
+unsigned long long ORBMDK_LogMeterNowUs(void)
+{
+    return _qpcUs();
+}
+
+void ORBMDK_LogMeterTripBegin(void)
+{
+    if (!ORBMDK_LogMeterEnabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    const unsigned long long now = _qpcUs();
+
+    _meterActivityLocked(now);
+    if (!g_meter.windowActive) {
+        g_meter.windowActive  = true;
+        g_meter.windowStartUs = now;       // 墙钟从窗口首笔起算（此前从记账时刻起算会 dap>wall）
+    }
+    g_meter.tripOpen = true;
+}
+
+void ORBMDK_LogMeterSetTransport(const char* transport, int linkMbps,
+                                 int cmdPktBytes, int wordsPerTrip,
+                                 int blockTransferOn)
+{
+    if (!ORBMDK_LogMeterEnabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    const char* name = (transport && *transport) ? transport : "?";
+    const int   bt   = blockTransferOn ? 1 : 0;
+
+    if (g_meter.transport == name && g_meter.linkMbps == linkMbps &&
+        g_meter.cmdPktBytes == cmdPktBytes && g_meter.wordsPerTrip == wordsPerTrip &&
+        g_meter.blockTransfer == bt) {
+        return;                            // 什么都没变，不重打
+    }
+
+    g_meter.transport     = name;
+    g_meter.linkMbps      = linkMbps;
+    g_meter.cmdPktBytes   = cmdPktBytes;
+    g_meter.wordsPerTrip  = wordsPerTrip;
+    g_meter.blockTransfer = bt;
+    _meterEmitConfigLocked();
+}
+
+void ORBMDK_LogMeterAccount(int isWrite, unsigned bytes, unsigned trips,
+                            unsigned long long dapUs)
+{
+    if (!ORBMDK_LogMeterEnabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    const unsigned long long now = _qpcUs();
+
+    _meterActivityLocked(now);
+    if (!g_meter.windowActive) {
+        g_meter.windowActive  = true;
+        g_meter.windowStartUs = now;
+    }
+    g_meter.tripOpen = false;
+
+    if (isWrite) {
+        g_meter.windowWriteBytes += bytes;
+        g_meter.segWriteBytes    += bytes;
+        g_meter.totalWriteBytes  += bytes;
+        g_meter.totalWriteDapUs  += dapUs;
+    } else {
+        g_meter.windowReadBytes  += bytes;
+        g_meter.segReadBytes     += bytes;
+        g_meter.totalReadBytes   += bytes;
+        g_meter.totalReadDapUs   += dapUs;
+    }
+    g_meter.windowDapUs += dapUs;
+    g_meter.segDapUs    += dapUs;
+    g_meter.windowTrips += trips;
+    g_meter.segTrips    += trips;
+    g_meter.totalTrips  += trips;
+    g_meter.windowLastUs = now;
+
+    if (g_meter.windowWriteBytes + g_meter.windowReadBytes >= kMeterFlushBytes ||
+        (now - g_meter.windowStartUs) >= kMeterFlushUs) {
+        _meterFlushWindowLocked();
+    }
+}
+
+void ORBMDK_LogMeterUsb(int dir, unsigned long long us)
+{
+    if (!ORBMDK_LogMeterEnabled()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> guard(g_lock);
+
+    /* 只认 TripBegin..Account 之间的往返：枚举/标定等**不受计量**的命令同样走
+     * _bulkWrite/_bulkRead，若不设这道闸，段内 19 次 DAP 往返会被记成 7107 cmds。 */
+    if (!g_meter.tripOpen) {
+        return;
+    }
+
+    if (dir == 0) {                        // OUT：把命令包搬上线
+        g_meter.usbOutCmds++;
+        g_meter.usbOutUs += us;
+    } else {                               // IN：等设备应答
+        g_meter.usbInCmds++;
+        g_meter.usbInUs += us;
+    }
 }

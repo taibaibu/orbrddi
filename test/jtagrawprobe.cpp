@@ -12,18 +12,39 @@
 //   0x00 Info  0x02 Connect  0x03 Disconnect  0x12 SWJ_Sequence
 //   0x14 JTAG_Sequence  0x15 JTAG_Configure  0x16 JTAG_IDCODE
 //
+// 2026-10-03：GetIDCODEs 只回报 DP 一个（Keil 因此只画 1 行）的旧问题已修复，详见
+// src/ORBMDK_RDDI.cpp 的 DetectTargetDapIdList（JTAG 模式按扫链结果逐 TAP 回报）。
+// 本工具的 `--no-swd --path` 仍可用于直接验证链上 2 颗（cpu + bs）。
+//
 // 构建： powershell -File test\build_test.ps1 -Source jtagrawprobe.cpp
-// 运行： bin\jtagrawprobe.exe        （目标板接好并上电；Keil 必须关闭）
+// 运行： bin\jtagrawprobe.exe [--no-swd] [--quick] [--path]
+//                            [--bitbang] [--mode-switch] [--no-stop] [--retry N] [--timeout MS]
+//       （目标板接好并上电；Keil 必须关闭）
 //
 // ⚠️ 出包一律 64 字节（短包）—— 绝不用端点 wMaxPacketSize(512) 的整包，
 //    否则固件认为传输未结束、命令永不派发（§17.2）。
 // ⚠️ 结束前恢复 SWD 并 Disconnect，绝不把设备留在 JTAG/异常态（上次的教训）。
+//
+// ⚠️⚠️ 失败处理（2026-10-03 加固）—— orbtrace 在 JTAG 下**容易挂死**：已知的一条是
+//    JTAG 模式下收到 `ID_DAP_TRANSFER_BLOCK`(cmd=0x06) 后**不回应答并停止服务 OUT 端点**，
+//    只能重新插拔 USB（COMPAT_ANALYSIS §18.9 第十步；本程序**不发送** 0x06）。
+//    ⇒ 0x06 的**专项复验**已独立成 `test\jtagblockprobe.cpp`（它会真发 0x06，风险自担）。
+//      注意该记录"**现象可靠、定性待更正**"：orbtrace 1.4.3 的固件其实**实现了** JTAG 下的
+//      块传输（见 bug.md B9），挂死根因未定性 —— 判定用 jtagblockprobe 的"每步 Ping"分界。
+//    挂死后的表现：**每一条命令都立刻 write FAILED**。旧版本"失败也继续往下打"，会把已经
+//    挂死的探针反复怼（上百条命令、每条还要等超时），看起来就是"必定卡死"。现在：
+//      ① 默认 **任一步失败即停**（`--no-stop` 关闭该行为）；
+//      ② 重发/超时收紧：默认 **1 次重发、800 ms**（`--retry N` / `--timeout MS`）；
+//      ③ **引脚位拷 [13]/[14] 与"来回切模式"的段默认不跑**，需显式 `--bitbang` /
+//         `--mode-switch`（这两段命令最密集，最可能把探针怼死）。
+//    一旦看到 `!! 首次失败`：**重新插拔探针**再跑，不要原地重试。
 
 #include <windows.h>
 #include <setupapi.h>
 #include <winusb.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "setupapi.lib")
@@ -52,6 +73,31 @@ static const GUID kIfGuid = {
 //   探测程序自己更不能先来一发 Connect(0)。
 //   --no-swd  即"JTAG-only"模式：跳过所有 Connect(0)/Connect(1)，也不做 SWD 收尾。
 static bool g_allowSwd = true;
+
+// ---------------------------------------------------------------------------
+// 失败处理（见文件头 ⚠️⚠️ 一节）。核心：**任一步失败即停**，不再对已挂死的设备继续下发。
+//   MarkFail()  记录首次失败；g_stopOnFail 为真时后续所有 Cmd/写读直接 SKIP。
+//   Aborted()   各段/各循环用它提前收尾（避免刷屏几百行 SKIP）。
+// ---------------------------------------------------------------------------
+static bool g_stopOnFail   = true;    // 首次失败即停止后续全部命令（--no-stop 关闭）
+static int  g_maxAttempts  = 1;       // Cmd() 重发次数上限（首条可能被吞；需要时 --retry 2）
+static int  g_ioTimeoutMs  = 800;     // 单条命令的写/读超时（ms；--timeout 调整）
+static bool g_doBitBang    = false;   // [13]/[14] 引脚位拷（默认关，需 --bitbang）
+static bool g_doModeSwitch = false;   // 来回切模式的段（默认关，需 --mode-switch）
+static bool g_failed       = false;   // 粘性：一旦失败就不再发命令
+
+static void MarkFail(const char* where)
+{
+    if (g_failed) return;
+    g_failed = true;
+    if (!g_stopOnFail) return;
+    printf("\n!! 首次失败：%s\n", where);
+    printf("!! 已停止后续全部命令（--no-stop 可继续下发）。\n");
+    printf("!! 若连 Info/Connect 也写不进去，说明探针已挂死 -> **重新插拔 USB** 再跑。\n");
+    printf("!! （orbtrace 在 JTAG 下的已知挂死模式见 COMPAT_ANALYSIS §18.9 第十步）\n");
+}
+
+static bool Aborted(void) { return g_stopOnFail && g_failed; }
 
 typedef struct {
     HANDLE  dev;
@@ -226,15 +272,20 @@ static int ConnectSwdIfAllowed(V2Dev* d, int port, const char* name)
 static int Cmd(V2Dev* d, const uint8_t* cmd, int cmdLen, uint8_t* resp, int respCap,
                int readMs, const char* name)
 {
+    if (Aborted()) { printf("  %-22s SKIP（已失败停止，不再下发）\n", name); return -1; }
     uint8_t tx[1024];
     memset(tx, 0, sizeof(tx));
     memcpy(tx, cmd, cmdLen);
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (!WriteOnce(d, tx, 64, 1000)) {
+    // 统一收紧读超时：挂死的设备每条都要等满超时，旧值 1.5 s × 上百条 = "卡死"观感
+    if (readMs > g_ioTimeoutMs) readMs = g_ioTimeoutMs;
+
+    for (int attempt = 0; attempt < g_maxAttempts; ++attempt) {
+        if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
             WinUsb_AbortPipe(d->winusb, d->outPipe);
             WinUsb_ResetPipe(d->winusb, d->outPipe);   // 写失败必复位，避免一直超时
-            printf("  %-22s write FAILED (attempt %d)\n", name, attempt + 1);
+            printf("  %-22s write FAILED (attempt %d/%d)\n", name, attempt + 1, g_maxAttempts);
+            if (attempt + 1 >= g_maxAttempts) MarkFail(name);
             continue;
         }
         ULONGLONG ms = 0;
@@ -246,7 +297,8 @@ static int Cmd(V2Dev* d, const uint8_t* cmd, int cmdLen, uint8_t* resp, int resp
             return n;
         }
         printf("  %-22s no response (rc=%d, %llu ms)%s\n", name, n, ms,
-               (attempt == 0) ? " -> 重发（首条可能被吞）" : "");
+               (attempt + 1 < g_maxAttempts) ? " -> 重发（首条可能被吞）" : "");
+        if (attempt + 1 >= g_maxAttempts) MarkFail(name);
     }
     return -1;
 }
@@ -384,6 +436,7 @@ static void InfoMatrix(V2Dev* d)
     uint8_t r[128];
 
     for (int t = 0; t < 2; ++t) {
+        if (Aborted()) { printf("  [10c] 提前收尾（已失败停止）\n"); return; }
         uint8_t prep[5] = {CMD_JTAG_SEQUENCE, tmsVals[t], 9, 0x5F, 0x00};
         Cmd(d, prep, sizeof(prep), r, sizeof(r), 1500, "  TMS->ShiftDR");
 
@@ -409,14 +462,16 @@ static void InfoMatrix(V2Dev* d)
 //   每条命令只读一段就可能把 TDO 数据误判成"固件不回"。
 static void MultiSeg(V2Dev* d, const uint8_t* cmd, int cmdLen, const char* name, int segs)
 {
+    if (Aborted()) { printf("  %-24s SKIP（已失败停止）\n", name); return; }
     uint8_t tx[1024];
     memset(tx, 0, sizeof(tx));
     memcpy(tx, cmd, cmdLen);
 
-    if (!WriteOnce(d, tx, 64, 1000)) {
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
         WinUsb_AbortPipe(d->winusb, d->outPipe);
         WinUsb_ResetPipe(d->winusb, d->outPipe);
         printf("  %-24s write FAILED\n", name);
+        MarkFail(name);
         return;
     }
     printf("  %-24s", name);
@@ -424,7 +479,7 @@ static void MultiSeg(V2Dev* d, const uint8_t* cmd, int cmdLen, const char* name,
     for (int i = 0; i < segs; ++i) {
         uint8_t r[256];
         ULONGLONG ms = 0;
-        const int n = ReadOnce(d, r, sizeof(r), (i == 0) ? 1000 : 400, &ms);
+        const int n = ReadOnce(d, r, sizeof(r), (i == 0) ? g_ioTimeoutMs : 400, &ms);
         if (n <= 0) { printf("  [seg%d rc=%d]", i, n); break; }
         printf("  [seg%d len=%d%s]", i, n, (ms > 200) ? " 迟到" : "");
         Hex(r, n);
@@ -492,16 +547,19 @@ static int PinsRead(V2Dev* d, int readMs, int verbose, const char* tag)
 // 静默版：驱动 out 中 sel 选中的引脚并读回（用于位拷，不打日志）
 static int PinsDriveQuiet(V2Dev* d, uint8_t out, uint8_t sel)
 {
+    if (Aborted()) return -1;
     uint8_t tx[64];
     memset(tx, 0, sizeof(tx));
     tx[0] = CMD_SWJ_PINS; tx[1] = out; tx[2] = sel;
-    if (!WriteOnce(d, tx, 64, 1000)) {
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
         WinUsb_AbortPipe(d->winusb, d->outPipe);
         WinUsb_ResetPipe(d->winusb, d->outPipe);
+        MarkFail("SWJ_Pins(引脚驱动)");
         return -1;
     }
     uint8_t r[64];
-    const int n = ReadOnce(d, r, sizeof(r), 1000, NULL);
+    const int n = ReadOnce(d, r, sizeof(r), g_ioTimeoutMs, NULL);
+    if (n < 1) MarkFail("SWJ_Pins(引脚读回)");
     return (n >= 1) ? r[n - 1] : -1;
 }
 
@@ -569,12 +627,18 @@ static void SwjClock(V2Dev* d, uint32_t hz, int verbose)
 //   AP CSW 读 0x03 | AP TAR 写 0x05 | AP DRW 读 0x0F
 static uint32_t DapRead(V2Dev* d, uint8_t request, int* stOut, const char* name)
 {
+    if (Aborted()) { printf("  %-22s SKIP（已失败停止）\n", name); return 0; }
     uint8_t tx[64];
     memset(tx, 0, sizeof(tx));
     tx[0] = 0x05; tx[1] = 0; tx[2] = 1; tx[3] = request;
-    if (!WriteOnce(d, tx, 64, 1000)) { printf("  %-22s write FAILED\n", name); return 0; }
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
+        printf("  %-22s write FAILED\n", name);
+        MarkFail(name);
+        return 0;
+    }
     uint8_t r[64];
-    const int n = ReadOnce(d, r, sizeof(r), 1500, NULL);
+    const int n = ReadOnce(d, r, sizeof(r), g_ioTimeoutMs, NULL);
+    if (n <= 0) MarkFail(name);
     uint32_t v = 0;
     if (n >= 7) memcpy(&v, &r[3], 4);
     const int st = (n >= 2) ? r[1] : -1;
@@ -585,13 +649,19 @@ static uint32_t DapRead(V2Dev* d, uint8_t request, int* stOut, const char* name)
 
 static void DapWrite(V2Dev* d, uint8_t request, uint32_t val, const char* name)
 {
+    if (Aborted()) { printf("  %-22s SKIP（已失败停止）\n", name); return; }
     uint8_t tx[64];
     memset(tx, 0, sizeof(tx));
     tx[0] = 0x05; tx[1] = 0; tx[2] = 1; tx[3] = request;
     memcpy(&tx[4], &val, 4);
-    if (!WriteOnce(d, tx, 64, 1000)) { printf("  %-22s write FAILED\n", name); return; }
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
+        printf("  %-22s write FAILED\n", name);
+        MarkFail(name);
+        return;
+    }
     uint8_t r[64];
-    const int n = ReadOnce(d, r, sizeof(r), 1500, NULL);
+    const int n = ReadOnce(d, r, sizeof(r), g_ioTimeoutMs, NULL);
+    if (n <= 0) MarkFail(name);
     printf("  %-22s n=%-2d status=%d (val=0x%08X)\n", name, n,
            (n >= 2) ? r[1] : -1, val);
 }
@@ -600,13 +670,19 @@ static void DapWrite(V2Dev* d, uint8_t request, uint32_t val, const char* name)
 static int JtagSeqRaw(V2Dev* d, uint8_t op, uint8_t info, uint8_t count,
                       const uint8_t* tdi, int tdiLen, const char* name)
 {
+    if (Aborted()) { printf("  %-30s SKIP（已失败停止）\n", name); return 0; }
     uint8_t tx[64];
     memset(tx, 0, sizeof(tx));
     tx[0] = op; tx[1] = info; tx[2] = count;
     if (tdi && tdiLen) memcpy(&tx[3], tdi, (size_t)tdiLen);
-    if (!WriteOnce(d, tx, 64, 1000)) { printf("  %-30s write FAILED\n", name); return 0; }
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
+        printf("  %-30s write FAILED\n", name);
+        MarkFail(name);
+        return 0;
+    }
     uint8_t r[64];
-    const int n = ReadOnce(d, r, sizeof(r), 1500, NULL);
+    const int n = ReadOnce(d, r, sizeof(r), g_ioTimeoutMs, NULL);
+    if (n <= 0) MarkFail(name);
     printf("  %-30s n=%-3d :", name, n);
     for (int i = 0; i < n && i < 10; ++i) printf(" %02X", r[i]);
     printf("\n");
@@ -634,14 +710,16 @@ static int QuickOpcodeTest(void)
         uint8_t tx[64];
         memset(tx, 0, sizeof(tx));
         tx[0] = 0x0C; tx[1] = 2; tx[2] = 4; tx[3] = 5;
-        if (WriteOnce(&d, tx, 64, 800)) {
+        if (!Aborted() && WriteOnce(&d, tx, 64, g_ioTimeoutMs)) {
             uint8_t r[64];
-            const int n = ReadOnce(&d, r, sizeof(r), 1000, NULL);
+            const int n = ReadOnce(&d, r, sizeof(r), g_ioTimeoutMs, NULL);
+            if (n <= 0) MarkFail("Configure@0x0C");
             printf("  %-30s n=%-3d :", "Configure@0x0C(2,[4,5])", n);
             for (int i = 0; i < n && i < 8; ++i) printf(" %02X", r[i]);
             printf("\n");
         } else {
             printf("  Configure@0x0C write FAILED\n");
+            MarkFail("Configure@0x0C");
         }
     }
     {
@@ -659,12 +737,18 @@ static int QuickOpcodeTest(void)
     {
         const uint8_t ops[2] = { 0x0D, 0x16 };
         for (int i = 0; i < 2; ++i) {
+            if (Aborted()) { printf("  IDCODE@0x%02X SKIP（已失败停止）\n", ops[i]); break; }
             uint8_t tx[64];
             memset(tx, 0, sizeof(tx));
             tx[0] = ops[i];
-            if (!WriteOnce(&d, tx, 64, 800)) { printf("  IDCODE@0x%02X write FAILED\n", ops[i]); continue; }
+            if (!WriteOnce(&d, tx, 64, g_ioTimeoutMs)) {
+                printf("  IDCODE@0x%02X write FAILED\n", ops[i]);
+                MarkFail("IDCODE(quick)");
+                continue;
+            }
             uint8_t r[64];
-            const int n = ReadOnce(&d, r, sizeof(r), 1000, NULL);
+            const int n = ReadOnce(&d, r, sizeof(r), g_ioTimeoutMs, NULL);
+            if (n <= 0) MarkFail("IDCODE(quick)");
             printf("  %-30s n=%-3d :", (ops[i] == 0x0D) ? "IDCODE@0x0D" : "IDCODE@0x16", n);
             for (int k = 0; k < n && k < 10; ++k) printf(" %02X", r[k]);
             printf("\n");
@@ -682,15 +766,21 @@ static int QuickOpcodeTest(void)
 //   响应 [0x14][status][TDO nB]          数据字节数 = ceil(位数/8)，LSB first
 static void JtagSeq1(V2Dev* d, int bits, int tmsLevel, int capture, uint8_t* tdoOut, const char* name)
 {
+    if (Aborted()) { printf("  %-26s SKIP（已失败停止）\n", name); return; }
     uint8_t tx[64];
     memset(tx, 0, sizeof(tx));
     const int nbytes = (bits + 7) / 8;
     tx[0] = 0x14;
     tx[1] = 1;                                                  // 段数
     tx[2] = (uint8_t)((bits & 0x3F) | (tmsLevel ? 0x40 : 0) | (capture ? 0x80 : 0));
-    if (!WriteOnce(d, tx, 64, 1000)) { printf("  %-26s write FAILED\n", name); return; }
+    if (!WriteOnce(d, tx, 64, g_ioTimeoutMs)) {
+        printf("  %-26s write FAILED\n", name);
+        MarkFail(name);
+        return;
+    }
     uint8_t r[64];
-    const int n = ReadOnce(d, r, sizeof(r), 1500, NULL);
+    const int n = ReadOnce(d, r, sizeof(r), g_ioTimeoutMs, NULL);
+    if (n <= 0) MarkFail(name);
     printf("  %-26s n=%-3d :", name, n);
     for (int i = 0; i < n && i < 12; ++i) printf(" %02X", r[i]);
     printf("\n");
@@ -760,6 +850,24 @@ int main(int argc, char** argv)
         if (argv[i] && strcmp(argv[i], "--path") == 0) {
             path = true;
         }
+        // ---- 加固相关开关（见文件头 ⚠️⚠️） ----
+        if (argv[i] && strcmp(argv[i], "--no-stop") == 0) {
+            g_stopOnFail = false;                 // 失败后仍继续下发（默认不会）
+        }
+        if (argv[i] && strcmp(argv[i], "--bitbang") == 0) {
+            g_doBitBang = true;                   // 打开 [13]/[14] 引脚位拷
+        }
+        if (argv[i] && strcmp(argv[i], "--mode-switch") == 0) {
+            g_doModeSwitch = true;                // 打开"来回切模式"的段
+        }
+        if (argv[i] && strcmp(argv[i], "--retry") == 0 && i + 1 < argc) {
+            g_maxAttempts = atoi(argv[++i]);
+            if (g_maxAttempts < 1) g_maxAttempts = 1;
+        }
+        if (argv[i] && strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) {
+            g_ioTimeoutMs = atoi(argv[++i]);
+            if (g_ioTimeoutMs < 50) g_ioTimeoutMs = 50;
+        }
     }
     if (path) {
         return JtagPathTest();
@@ -770,6 +878,13 @@ int main(int argc, char** argv)
     printf("=== JTAG 通路直连探测（原始 CMSIS-DAP 帧，出包固定 64 字节短包）===\n");
     printf("模式：%s\n", g_allowSwd ? "完整（会先做 Connect(0)，仅供对照）"
                                    : "JTAG-only（--no-swd：绝不先碰 SWD，用于上电后的首次连接）");
+    printf("策略：%s | 重发 %d 次 | 超时 %d ms | 引脚位拷[13/14] %s | 模式来回切段 %s\n",
+           g_stopOnFail ? "任一步失败即停" : "失败继续（--no-stop）",
+           g_maxAttempts, g_ioTimeoutMs,
+           g_doBitBang ? "开（--bitbang）" : "关",
+           g_doModeSwitch ? "开（--mode-switch）" : "关");
+    printf("注意：本程序**不发送** cmd=0x06（ID_DAP_TRANSFER_BLOCK）—— 该命令在 JTAG 模式下\n");
+    printf("      会让 orbtrace 挂死、须重新插拔（COMPAT_ANALYSIS §18.9 第十步）。\n");
     V2Dev d;
     if (!V2Open(&d)) { printf("打开设备失败\n"); return 1; }
     printf("opened: in=0x%02X out=0x%02X\n", d.inPipe, d.outPipe);
@@ -783,8 +898,12 @@ int main(int argc, char** argv)
     printf("\n[2] 关键判定：Connect(2) = JTAG\n");
     const int m2 = Connect2(&d, 2, "Connect(2 JTAG)");
 
-    printf("\n[3] 若上面回的是 SWD，再试 Connect(1) 作对照\n");
-    ConnectSwdIfAllowed(&d, 1, "Connect(1 SWD)");
+    if (g_doModeSwitch) {
+        printf("\n[3] 若上面回的是 SWD，再试 Connect(1) 作对照\n");
+        ConnectSwdIfAllowed(&d, 1, "Connect(1 SWD)");
+    } else {
+        printf("\n[3] SKIP（来回切模式的段，需 --mode-switch）\n");
+    }
 
     printf("\n[4] Connect(2) 之后再问一次模式（看是否可切）\n");
     Connect2(&d, 2, "Connect(2 JTAG) #2");
@@ -849,19 +968,23 @@ int main(int argc, char** argv)
         MultiSeg(&d, cap, sizeof(cap), "Info(0xF0) 对照", 3);
     }
 
-    printf("\n[10e] ★ 补发 SWD->JTAG 切换序列(0xE73C) 后重扫 —— SWJ-DP 模式记忆假说\n");
-    Connect2(&d, 2, "Connect(2 JTAG)");
-    SwjSwitchToJtag(&d);
-    Connect2(&d, 2, "Connect(2 JTAG) 再选");
-    JtagConfigure(&d, 1, 4);
-    JtagIdcode(&d, "JTAG_IDCODE 切换后");
+    if (g_doModeSwitch) {
+        printf("\n[10e] ★ 补发 SWD->JTAG 切换序列(0xE73C) 后重扫 —— SWJ-DP 模式记忆假说\n");
+        Connect2(&d, 2, "Connect(2 JTAG)");
+        SwjSwitchToJtag(&d);
+        Connect2(&d, 2, "Connect(2 JTAG) 再选");
+        JtagConfigure(&d, 1, 4);
+        JtagIdcode(&d, "JTAG_IDCODE 切换后");
 
-    printf("\n[10f] 变体：先发切换序列、再 Connect(2)，然后扫链\n");
-    ConnectSwdIfAllowed(&d, 1, "Connect(1 SWD)");
-    SwjSwitchToJtag(&d);
-    Connect2(&d, 2, "Connect(2 JTAG)");
-    JtagConfigure(&d, 1, 4);
-    JtagIdcode(&d, "JTAG_IDCODE 变体");
+        printf("\n[10f] 变体：先发切换序列、再 Connect(2)，然后扫链\n");
+        ConnectSwdIfAllowed(&d, 1, "Connect(1 SWD)");
+        SwjSwitchToJtag(&d);
+        Connect2(&d, 2, "Connect(2 JTAG)");
+        JtagConfigure(&d, 1, 4);
+        JtagIdcode(&d, "JTAG_IDCODE 变体");
+    } else {
+        printf("\n[10e]/[10f] SKIP（来回切模式的段，需 --mode-switch）\n");
+    }
 
     printf("\n[12] ★ 引脚电平读取（判定 TDO/nRESET 的真实状态）\n");
     PinsRead(&d, 1000, 1, "Pins read #1");
@@ -873,34 +996,43 @@ int main(int argc, char** argv)
         PinsRead(&d, 1000, 1, "Pins read #3 (TMS=TDI=0)");
     }
 
-    printf("\n[13] ★ 引脚位拷扫 IDCODE（完全绕开 gateware 的 JTAG 引擎）\n");
-    Connect2(&d, 2, "Connect(2 JTAG)");
-    BitBangIdcode(&d);
-
-    printf("\n[14] ★ 拉低 nRESET（复位态下扫链；目标固件复用 JTAG 引脚时的标准解法）\n");
-    {
-        PinsDriveQuiet(&d, 0x00, PIN_NRESET);          // nRESET=0，保持复位
-        PinsRead(&d, 1000, 1, "Pins read @reset");
+    if (g_doBitBang) {
+        printf("\n[13] ★ 引脚位拷扫 IDCODE（完全绕开 gateware 的 JTAG 引擎）\n");
         Connect2(&d, 2, "Connect(2 JTAG)");
-        JtagConfigure(&d, 1, 4);
-        JtagIdcode(&d, "JTAG_IDCODE @reset");
         BitBangIdcode(&d);
-        PinsDriveQuiet(&d, PIN_NRESET, PIN_NRESET);    // 释放复位
-        PinsRead(&d, 1000, 1, "Pins read @release");
+
+        printf("\n[14] ★ 拉低 nRESET（复位态下扫链；目标固件复用 JTAG 引脚时的标准解法）\n");
+        {
+            PinsDriveQuiet(&d, 0x00, PIN_NRESET);          // nRESET=0，保持复位
+            PinsRead(&d, 1000, 1, "Pins read @reset");
+            Connect2(&d, 2, "Connect(2 JTAG)");
+            JtagConfigure(&d, 1, 4);
+            JtagIdcode(&d, "JTAG_IDCODE @reset");
+            BitBangIdcode(&d);
+            PinsDriveQuiet(&d, PIN_NRESET, PIN_NRESET);    // 释放复位
+            PinsRead(&d, 1000, 1, "Pins read @release");
+        }
+    } else {
+        printf("\n[13]/[14] SKIP（引脚位拷约 80 条引脚命令，最易把探针怼死；需 --bitbang）\n");
     }
 
-    printf("\n[15] ★ JTAG 时钟扫描（orbtrace 官方：JTAG 10-12Mbps 就到顶，Keil 传的是 10MHz）\n");
-    {
-        const uint32_t clocks[5] = { 100000u, 500000u, 1000000u, 4000000u, 10000000u };
-        for (int i = 0; i < 5; ++i) {
-            printf("  --- SWJ_Clock = %u Hz ---\n", (unsigned)clocks[i]);
-            SwjClock(&d, clocks[i], 1);
-            Connect2(&d, 2, "  Connect(2 JTAG)");
-            JtagConfigure(&d, 1, 4);
-            JtagIdcode(&d, "  JTAG_IDCODE");
-            BitBangIdcode(&d);
-            ConnectSwdIfAllowed(&d, 1, "  Connect(1 SWD 复位模式)");
+    if (g_doModeSwitch) {
+        printf("\n[15] ★ JTAG 时钟扫描（orbtrace 官方：JTAG 10-12Mbps 就到顶，Keil 传的是 10MHz）\n");
+        {
+            const uint32_t clocks[5] = { 100000u, 500000u, 1000000u, 4000000u, 10000000u };
+            for (int i = 0; i < 5; ++i) {
+                if (Aborted()) { printf("  [15] 提前收尾（已失败停止）\n"); break; }
+                printf("  --- SWJ_Clock = %u Hz ---\n", (unsigned)clocks[i]);
+                SwjClock(&d, clocks[i], 1);
+                Connect2(&d, 2, "  Connect(2 JTAG)");
+                JtagConfigure(&d, 1, 4);
+                JtagIdcode(&d, "  JTAG_IDCODE");
+                if (g_doBitBang) BitBangIdcode(&d);
+                ConnectSwdIfAllowed(&d, 1, "  Connect(1 SWD 复位模式)");
+            }
         }
+    } else {
+        printf("\n[15] SKIP（时钟扫描里含来回切模式，需 --mode-switch；引脚位拷另需 --bitbang）\n");
     }
 
     printf("\n[16] ★ 链配置候选扫描（OpenOCD 报本板是 2 个 TAP：cpu IR=4 + bs IR=5）\n");
@@ -919,6 +1051,7 @@ int main(int argc, char** argv)
             { 3, c3,  "  JTAG_Configure(3, [4,5,4])" },
         };
         for (int i = 0; i < 4; ++i) {
+            if (Aborted()) { printf("  [16] 提前收尾（已失败停止）\n"); break; }
             printf("  --- 候选 %d: count=%d ---\n", i + 1, cands[i].n);
             Connect2(&d, 2, "  Connect(2 JTAG)");
             JtagConfigureN(&d, cands[i].n, cands[i].irs, cands[i].tag);
@@ -935,6 +1068,7 @@ int main(int argc, char** argv)
             { 1, n4,  "JTAG_Configure(1,[4])  " },
         };
         for (int c = 0; c < 2; ++c) {
+            if (Aborted()) { printf("  [17] 提前收尾（已失败停止）\n"); break; }
             printf("  === 链配置：%s ===\n", cfgs[c].tag);
             Connect2(&d, 2, "Connect(2 JTAG)");
             JtagConfigureN(&d, cfgs[c].n, cfgs[c].irs, cfgs[c].tag);
@@ -966,14 +1100,16 @@ int main(int argc, char** argv)
             uint8_t tx[64];
             memset(tx, 0, sizeof(tx));
             tx[0] = 0x0C; tx[1] = 2; tx[2] = 4; tx[3] = 5;      // 标准 JTAG_Configure
-            if (WriteOnce(&d, tx, 64, 1000)) {
+            if (!Aborted() && WriteOnce(&d, tx, 64, g_ioTimeoutMs)) {
                 uint8_t r[64];
-                const int n = ReadOnce(&d, r, sizeof(r), 1500, NULL);
+                const int n = ReadOnce(&d, r, sizeof(r), g_ioTimeoutMs, NULL);
+                if (n <= 0) MarkFail("JTAG_Configure@0x0C");
                 printf("  %-30s n=%-3d :", "JTAG_Configure@0x0C(2,[4,5])", n);
                 for (int i = 0; i < n && i < 8; ++i) printf(" %02X", r[i]);
                 printf("\n");
             } else {
                 printf("  JTAG_Configure@0x0C write FAILED\n");
+                MarkFail("JTAG_Configure@0x0C");
             }
         }
 
@@ -993,9 +1129,10 @@ int main(int argc, char** argv)
             uint8_t tx[64];
             memset(tx, 0, sizeof(tx));
             tx[0] = 0x0D;
-            if (WriteOnce(&d, tx, 64, 1000)) {
+            if (!Aborted() && WriteOnce(&d, tx, 64, g_ioTimeoutMs)) {
                 uint8_t r[64];
-                const int n = ReadOnce(&d, r, sizeof(r), 1500, NULL);
+                const int n = ReadOnce(&d, r, sizeof(r), g_ioTimeoutMs, NULL);
+                if (n <= 0) MarkFail("JTAG_IDCODE@0x0D");
                 printf("  %-30s n=%-3d :", "JTAG_IDCODE@0x0D", n);
                 for (int i = 0; i < n && i < 10; ++i) printf(" %02X", r[i]);
                 printf("\n");
@@ -1012,6 +1149,10 @@ int main(int argc, char** argv)
     }
 
     V2Close(&d);
+    if (g_failed) {
+        printf("\n[!!] 本次已出现首个失败并按策略停止。若探针此后仍无响应 -> 重新插拔 USB 再跑；\n");
+        printf("     继续原地重试只会重复失败（orbtrace 的挂死不会自己恢复）。\n");
+    }
     printf("\n=== done ===\n");
     if (!g_allowSwd) {
         printf("\n[提醒] 本次是 JTAG-only 模式。若上面 IDCODE 仍为 0，请给**目标断电重新上电**\n");

@@ -1,0 +1,1053 @@
+================================================================================
+ orbtrace 1.4.3 —— JTAG 下 0x05 / 0x06 挂死 的固件级修复方案（补丁作业书）
+================================================================================
+ 目标源码基线 : C:\Users\taibaibu\Desktop\orbtrace-1.4.3   （探针 gateware）
+ 对照参考版本 : C:\Users\taibaibu\Desktop\orbtrace-1.4.4
+                已核查：R1(§1) / ACK 捕获门控(§2) / case5-6 无超时(§3)
+                在 1.4.4 里【依然存在】—— 所以"升级到 1.4.4"不能解决本问题。
+                见 §7 版本对照。
+
+ 涉及文件（相对 orbtrace 仓库根）：
+   verilog/jtagIF.v              JTAG 物理层状态机（跑在探针 FPGA 里）
+   verilog/dbgIF.v               调试命令状态机（跑在探针 FPGA 里）
+   orbtrace/debug/cmsis_dap.py   CMSIS-DAP 命令层（Migen，同在一块 FPGA 里）
+
+ 为什么要改（一句话）：
+   JTAG 下 0x05(ID_DAP_TRANSFER) / 0x06(ID_DAP_TRANSFER_BLOCK) 100% 挂死，
+   唯一恢复手段是 USB 插拔。根因不是"固件没实现这条命令"，而是三个缺陷叠加：
+     F1  ACK 语义接反                → 健康 DP 的正常 OK 被判成 WAIT
+     F2  多 TAP 链里 ACK 被旁路器件覆盖 → 正常 ACK 码被污染成 ERROR/FAULT
+     F3  重试链的握手等待【无超时】    → 一旦进去就永远出不来 ⇒ busy 恒 1 ⇒
+                                          OUT 端点停摆 ⇒ 连 Info 都发不进去
+   F1+F2 决定"这笔事务会不会进重试环"，F3 决定"进去之后能不能出来"。
+   只要修 F1+F2（让正常事务不进重试环）或修 F3（让它能出来），挂死即消失。
+   ⇒ 最小可用补丁 = F1 + F2 + F11 + F3 + F4。
+
+ 用法：
+   1) 按 §1~§6 逐条改代码（每条给出"现状原文 → 替换文本"，可直接复制检索）。
+   2) 用 orbtrace 原有 gateware 构建流程重新生成 bitstream 并烧写探针
+      （构建/烧写命令以仓库自带 README / 构建脚本为准，本文只给源码补丁）。
+   3) 按 §8 验收、按 §9 回归（确认没把 SWD 弄坏）。
+   4) 行号均为 1.4.3 实测行号；1.4.4 若行号漂移，用"现状原文"搜索定位。
+
+ 标注约定：
+   【NEW】= 新增行   【FIX】= 修改行   【DEL】= 删除行，便于手工 diff。
+   Verilog 为 Verilog-2001 风格（与原文一致，未使用 SystemVerilog 语法）。
+
+--------------------------------------------------------------------------------
+ §0 补丁清单与优先级
+--------------------------------------------------------------------------------
+ 编号 严重度 文件              位置(1.4.3)        问题                              必须?
+ F1   ★★★   verilog/dbgIF.v   :280-282          JTAG ACK 映射接反                 必须
+ F2   ★★★   verilog/jtagIF.v  :169-206          ACK 捕获未按 devcount==dev 门控    必须
+ F11  ★★★   verilog/jtagIF.v  :182-188          abort 判据 !=2 应为"非 OK"         必须
+ F3   ★★★   cmsis_dap.py      :835-883          重试握手无看门狗                   必须
+ F4   ★★★   verilog/dbgIF.v   :662-679,:629-651  WAIT_INFERIOR_* 无超时            必须
+ F5   ★★☆   verilog/jtagIF.v  :242-273          irlenx 字段为 0 ⇒ WRITEIR 死循环   强烈建议
+ F6   ★★☆   cmsis_dap.py      :484-493          Count=0 ⇒ dev 被截成 7             强烈建议
+ F7   ★★☆   cmsis_dap.py      :192,:495-510     jtag_ircount 5 位回卷(>6 TAP)      建议
+ F8   ★★☆   verilog/dbgIF.v   :527-547,:705-733 三处漏写 active_mode               强烈建议
+ F9   ★☆☆   verilog/dbgIF.v   :593-594          CMD_CLR_ERR 不清 perr              建议
+ F10  ★☆☆   verilog/jtagIF.v  :101-289          无异步复位 / 无 default 分支       建议
+ F12  ★★☆   jtagIF.v/dbgIF/cmsis_dap.py        0x16 读 ID 取错器件 + 忽略索引     建议
+
+ 最小可用集：F1 + F2 + F11 + F3 + F4
+ 完整集：F1 ~ F10 + F12
+
+--------------------------------------------------------------------------------
+ §1 F1 —— JTAG ACK 语义接反（最致命，改 1 行）
+--------------------------------------------------------------------------------
+ 文件：verilog/dbgIF.v
+ 位置：1.4.3 :280-282（1.4.4 :280-282 完全相同，未修）
+
+ 【现状原文】
+   // Map JTAG ACK conditions into SWD/CMSIS-DAP ones
+   assign ack           = (active_mode==MODE_SWD)?swd_ack:(jtag_ack==1)?ACK_WAIT
+			  :((jtag_ack==2)?ACK_OK:ACK_ERROR);
+
+ 【为什么错】
+   jtagIF 里 ack[2:0] 就是 ADIv5 协议的三位 ACK，按 LSB-first 收进 ack[0..2]：
+       OK = 3'b001 = 1     WAIT = 3'b010 = 2     FAULT = 3'b100 = 4
+   dbgIF 的常量（:161-163）也是 ADIv5 值：ACK_OK=1、ACK_WAIT=2、ACK_ERROR=4。
+   两套编码【本来就是同一套】，根本不需要"转换"。
+   但源码把 1 当成 WAIT、把 2 当成 OK —— 恰好接反。原作者在 :159 的注释
+   "// Ack return codes (CMSIS/SWD versions...not the same at the JTAG versions (!!!))"
+   正是把这个 bug 当成"编码不同"记录了下来。
+   后果：DP 正常回 OK(=1) ⇒ 被翻译成 ACK_WAIT ⇒ 每笔正常访问都进重试环。
+
+ 【替换文本】
+   // Map JTAG ACK conditions into SWD/CMSIS-DAP ones
+   // 【FIX】ADIv5 JTAG ACK 与 CMSIS/SWD ACK 是同一套编码：
+   //        OK=001=1  WAIT=010=2  FAULT=100=4（其它值为 ERROR）
+   assign ack           = (active_mode==MODE_SWD)?swd_ack
+			  :(jtag_ack==ACK_OK)?ACK_OK
+			  :(jtag_ack==ACK_WAIT)?ACK_WAIT
+			  :ACK_ERROR;
+
+ 【影响面】
+   - 仅改 MODE_JTAG 分支；MODE_SWD 走 swd_ack，完全不受影响。
+   - jtag_ack==0（器件未驱动 TDO/悬空=1 时读到 7，读到 0 说明链没接）仍映射 ERROR，
+     与原行为一致，属于"该报错"的情况，正确。
+
+ 【验证】§8 步骤 V1。
+
+--------------------------------------------------------------------------------
+ §2 F2 + F11 —— jtagIF 的 ACK 捕获门控 & abort 判据
+--------------------------------------------------------------------------------
+ 文件：verilog/jtagIF.v
+ 位置：1.4.3 :169-206（ST_JTAG_TRANSFER 的 rising 分支；1.4.4 :185-220 相同，未修）
+
+ 【现状原文】
+	       if (rising)  // Read Device -> Host --------------------------------------------------------
+		 begin
+		    tdxcount <= tdxcount+1;
+		    windex   <= windex+1;
+
+		    case (tdxcount)
+		      0: ack[0]<=tdo;
+		      1: ack[1]<=tdo;
+		      2:
+			begin
+			   ack[2]<=tdo;
+			   windex<=0;
+
+			   // If ack is wait then abort
+			   if ({tdo,ack[1],ack[0]}!=2)
+			     begin
+				tmsbits <= 6'b000110;
+				jtag_state <= ST_JTAG_TMSOUT;
+			     end
+			end
+		      default: dread[windex] <= tdo;
+		    endcase // case (tdxcount)
+
+		    // In bypass for every device except the target, so only 1 bit
+		    if ((devcount!=dev) || (34==tdxcount))
+		      begin
+			 if (devcount==ndevs)
+			      jtag_state <= ST_JTAG_TMSOUT;
+			 else
+			   begin
+			      devcount <= devcount + 1;
+			      tdxcount <= 0;
+			   end
+		      end
+		 end // if (rising)
+
+ 【两个缺陷】
+   (a) F2：case(tdxcount) 没有做 `devcount==dev` 门控。而下面那段"旁路推进"逻辑
+       在 devcount!=dev 时【每次 rising 都会执行】：它把 devcount+1、tdxcount<=0。
+       于是链上每一个非目标器件都只贡献 1 个 bit，且这 1 个 bit 走到 case 的
+       `0: ack[0]<=tdo;` —— 直接把【旁路器件的 TDO】写进 ack[0]，覆盖掉目标器件
+       刚刚捕获的 ACK 最低位。
+       本项目实测链为 2 TAP（target=dev0、dev1=bypass）：dev0 先收 3 位 ACK(=001 OK)，
+       随后 dev1 的旁路位 TDO 覆盖 ack[0] ⇒ 结果可能是 000 / 101 / 001(碰巧) …
+       实测该笔返回 ack=4(ERROR) 就是被这一条污染的。
+   (b) F11：注释写 `// If ack is wait then abort`，代码却是 `... != 2`（即"不是 WAIT 就
+       退出"）。ADIv5 规则是：ACK=OK 才有 32 位有效数据；WAIT/FAULT 后应尽快离开 DR。
+       所以正确判据是"【不是 OK】就提前离开"，即 `!= 3'b001`。现状对正常 OK 会
+       提前 TMSOUT ⇒ 32 位读数据永远采不到（这也是"读不出数据"的一个独立原因）。
+
+ 【替换文本】（整块替换上面的 if (rising) 段）
+	       if (rising)  // Read Device -> Host --------------------------------------------------------
+		 begin
+		    tdxcount <= tdxcount+1;
+		    windex   <= windex+1;
+
+		    // 【FIX】F2: 只有目标器件才有 ACK；旁路器件只移 1 位，绝不能覆盖 ack
+		    if (devcount==dev)
+		      case (tdxcount)
+			0: ack[0]<=tdo;
+			1: ack[1]<=tdo;
+			2:
+			  begin
+			     ack[2]<=tdo;
+			     windex<=0;
+
+			     // 【FIX】F11: ADIv5 —— 只有 ACK=OK(001) 才有 32 位有效数据；
+			     //       其余（WAIT/FAULT/NODEV）立即离开 DR，不再采样。
+			     if ({tdo,ack[1],ack[0]}!=3'b001)
+			       begin
+				  tmsbits    <= 6'b000110;
+				  jtag_state <= ST_JTAG_TMSOUT;
+			       end
+			  end
+			default: dread[windex] <= tdo;
+		      endcase // case (tdxcount)
+		    else
+		      // 【NEW】旁路器件的 1 个 TDO 位丢弃，且本次不得改动 ack[]/dread[]
+		      ;
+
+		    // In bypass for every device except the target, so only 1 bit
+		    if ((devcount!=dev) || (34==tdxcount))
+		      begin
+			 if (devcount==ndevs)
+			      jtag_state <= ST_JTAG_TMSOUT;
+			 else
+			   begin
+			      devcount <= devcount + 1;
+			      tdxcount <= 0;
+			   end
+		      end
+		 end // if (rising)
+
+ 【注意】
+   - `else ;` 那句是为了让结构对称、可读；也可以直接写成
+     `if (devcount==dev) case(...) endcase`，效果相同。
+   - 不要删掉 `windex <= windex+1;`：目标器件里它是数据位索引，与 case 内的
+     `windex<=0` 配合构成 32 位循环；旁路器件那一次 +1 不影响结果（随后 tdxcount
+     清零、devcount 推进，目标器件阶段会重新对齐）。若你想更严格，可把它也放进
+     `if (devcount==dev)` 里，但实测两种都可用（保守起见建议保留原样，最小改动）。
+
+ 【验证】§8 步骤 V2（读 DP IDCODE / RDBUFF 必须回 OK=1）。
+
+--------------------------------------------------------------------------------
+ §3 F3 —— cmsis_dap.py：DAP_TransferBlock 的重试握手加看门狗
+--------------------------------------------------------------------------------
+ 文件：orbtrace/debug/cmsis_dap.py
+ 位置：1.4.3 :208-213（信号区）、:835-883（case4/5/6）
+       1.4.4 对应 :212-217、:1103-1130+ —— 代码【一字未改】，同样有本缺陷。
+
+ 【为什么必须加】
+   tfB_txb 的状态链是：  4 发 go → 5 等"引擎离开 IDLE" → 6 等"引擎回到 IDLE" → 8 收尾。
+   状态 5/6 判据全部来自 `self.dbg_done`（= dbgIF 的 done，即 dbgIF 处于 ST_DBG_IDLE）。
+   而这段代码【没有任何超时】：
+       - 若 dbgIF 卡在 WAIT_INFERIOR_START / _FINISH（§4 的两处无超时状态），
+         done 恒 0 ⇒ case5 或 case6 永远等待；
+       - `busy` 由 elaborate 里 `m.d.sync += self.busy.eq(1)`（:1158）每拍默认置 1，
+         只有写路径 case0-3 的 :832 会清 0 ⇒ 卡住时 busy 恒 1。
+   busy=1 的直接后果：命令层不再从 OUT 端点取包 ⇒ 上位机 1500 ms 超时，
+   【连 Info(0x00) 都发不进去】，只能插拔 USB。这就是实测的"真挂死"。
+   ⇒ 看门狗的作用：即使引擎侧真的不推进，也要让 tfB_txb 走到 8、把响应吐出去、
+     把 busy 清掉，让主机拿到一个明确的 ack=ERROR（而不是整条 USB 通道陪葬）。
+
+ 【补丁 3.1】新增常量（紧跟在 :85-89 的 ACK 常量之后）
+   # dbgIF ACK Codes
+   # ===============
+   ACK_OK                   = 1
+   ACK_WAIT                 = 2
+   ACK_ERROR                = 4
+
+   # 【NEW】F3: 重试握手看门狗。按 FPGA sys 时钟折算，约 10ms @100MHz。
+   #        必须显著小于上位机 CMSIS-DAP 超时（本工程实测 1500ms），
+   #        又要大于正常一笔 JTAG 事务的耗时（1MHz TCK 下几十 us）。
+   TFR_HANDSHAKE_TIMEOUT    = 0xFFFFF      # 20 bits, ~10ms @100MHz
+
+ 【补丁 3.2】新增信号（在 :208-213 "Support for DAP_Transfer_Block" 区内）
+       # Support for DAP_Transfer_Block
+       self.tfB_txb        = Signal(4)      # TFR Block State machine index (12 states)
+       self.Bretries       = Signal(16)     # Retry counter for WAIT
+       self.transferBCount = Signal(16)     # Number of transfers 1..65535
+       self.readBDelay     = Signal()       # We are doing a posted read
+       self.readBIgnore    = Signal()       # Don't swallow this data, we're starting to post
+       self.tfB_timeout    = Signal(20)     # 【NEW】F3: handshake watchdog (block)
+       self.tfr_timeout    = Signal(20)     # 【NEW】F3: handshake watchdog (DAP_Transfer)
+
+ 【补丁 3.3】case4 —— 装载看门狗（:835-840）
+ 【现状原文】
+            # We have the command and any needed data, action it ---------------------------------------
+            with m.Case(4):
+                m.d.sync += [
+                    self.dbgif.go.eq(1),
+                    self.Bretries.eq(self.Bretries-1),
+                    self.tfB_txb.eq(5)
+                ]
+
+ 【替换文本】
+            # We have the command and any needed data, action it ---------------------------------------
+            with m.Case(4):
+                m.d.sync += [
+                    self.dbgif.go.eq(1),
+                    self.Bretries.eq(self.Bretries-1),
+                    self.tfB_timeout.eq(TFR_HANDSHAKE_TIMEOUT),   # 【NEW】F3
+                    self.tfB_txb.eq(5)
+                ]
+
+ 【补丁 3.4】case5 —— 加"引擎不接受 go"的超时（:843-848）
+ 【现状原文】
+            # Wait for command to be accepted ----------------------------------------------------------
+            with m.Case(5):
+                with m.If(~self.dbg_done):
+                    m.d.sync += [
+                        self.dbgif.go.eq(0),
+                        self.tfB_txb.eq(6)
+                        ]
+
+ 【替换文本】
+            # Wait for command to be accepted ----------------------------------------------------------
+            with m.Case(5):
+                with m.If(~self.dbg_done):
+                    m.d.sync += [
+                        self.dbgif.go.eq(0),
+                        self.tfB_txb.eq(6)
+                        ]
+                # 【NEW】F3: 引擎始终不离开 IDLE（含 TCK 停摆 / active_mode 错）⇒ 报错收尾
+                with m.Elif(self.tfB_timeout==0):
+                    m.d.sync += [
+                        self.dbgif.go.eq(0),
+                        self.txBlock.bit_select(24,8).eq(Cat(C(ACK_ERROR,3),C(0,1),C(0,4))),
+                        self.tfB_txb.eq(8)
+                    ]
+                with m.Else():
+                    m.d.sync += self.tfB_timeout.eq(self.tfB_timeout-1)
+
+ 【补丁 3.5】case6 —— 加"引擎永不回 IDLE"的超时（:851-883）
+   本块原有结构是：
+            with m.Case(6):
+                with m.If(self.dbg_done==1):
+                    <原有全部逻辑，最后一行是 with m.Else(): self.tfB_txb.eq(8)>
+   在该 `with m.If(...)` 之后、【同一缩进层级】插入下面三行组（即把 Elif/Else 接在
+   原 If 后面，构成 If/Elif/Else 三支）：
+
+                # 【NEW】F3: 引擎永不回 IDLE（jtagIF 状态机不推进）⇒ 报错收尾
+                with m.Elif(self.tfB_timeout==0):
+                    m.d.sync += [
+                        self.txBlock.bit_select(24,8).eq(Cat(C(ACK_ERROR,3),C(0,1),C(0,4))),
+                        self.tfB_txb.eq(8)
+                    ]
+                with m.Else():
+                    m.d.sync += self.tfB_timeout.eq(self.tfB_timeout-1)
+
+   提示：`with m.Elif(...)` / `with m.Else()` 在 Migen 中必须紧跟对应的 If 语句、
+   中间不能插入别的语句，所以这三行组要直接接在原 `with m.If(self.dbg_done==1):`
+   整块的末尾（即原 `self.tfB_txb.eq(8)` 那一行之后），缩进与 `with m.If` 相同。
+
+ 【补丁 3.6】DAP_Transfer（0x05）同样处理（tfr_txb 状态机，:686-702）
+   `0x05` 用的是另一套 `tfr_txb`：case6 发 go / case7 等 ~dbg_done / case8 等 dbg_done，
+   同样【无超时】（1.4.4 :923-940 亦然）。补法完全一样：
+     - 信号：已在上面的 3.2 里加了 `self.tfr_timeout`；
+     - 发 go 的那一档（1.4.3 :686-695，`m.Case(6)`）里补
+       `self.tfr_timeout.eq(TFR_HANDSHAKE_TIMEOUT),`
+     - 等待档（1.4.3 :697-702 的 `m.Case(7)` 与随后的 `m.Case(8)`）各补一组
+       `with m.Elif(self.tfr_timeout==0): → 写 ack=ERROR、跳 case10`
+       `with m.Else(): self.tfr_timeout.eq(self.tfr_timeout-1)`
+       （收尾档号以原文为准：`0x05` 的错误收尾在 case10，`0x06` 在 case8。）
+
+ 【超时值怎么定】
+   本文给的 TFR_HANDSHAKE_TIMEOUT = 0xFFFFF（≈1.05M 拍）：
+     - sys 时钟 100 MHz ⇒ ≈10.5 ms；
+     - 正常一笔 JTAG 事务在 1 MHz TCK 下约 100~200 拍 TCK ⇒ 远小于 10 ms；
+     - 上位机 CMSIS-DAP 超时（本工程实测 1500 ms）远大于 10 ms。
+   若你希望"重试预算用完才报错"，可把超时设成 > waitRetry × 单笔耗时 的值；
+   但注意：看门狗的目的不是替代重试上限，而是【保证一定出得来】。
+
+ 【副作用与风险】
+   - 引入了一个 20 位计数器，资源开销可忽略。
+   - 若超时设得过小（例如 20 位但 sys 时钟极低），可能把"慢但正常"的事务误判为错误。
+     设 10 ms 量级对 1 MHz~10 MHz TCK 都是安全的。
+   - 超时后返回的 ack=ERROR 是"明确失败"，比"整条 USB 陪葬"好得多；主机侧可重试。
+
+ 【验证】§8 步骤 V3（故意制造不推进条件，必须"秒回 ERROR 且端点存活"）。
+
+--------------------------------------------------------------------------------
+ §4 F4 —— dbgIF：给 WAIT_INFERIOR_START / _FINISH 加超时（真正的根因修复）
+--------------------------------------------------------------------------------
+ 文件：verilog/dbgIF.v
+ 位置：1.4.3 :629-651（_FINISH）、:662-679（_START）
+       1.4.4 对应段落【同样没有超时】（1.4.4 只加了 perr 清理与 active_mode 修正）。
+
+ 【为什么必须加】
+   这两个状态是"等下层引擎动起来/停下来"的唯一出口：
+       ST_DBG_WAIT_INFERIOR_START  : 等 `~jtag_idle`（引擎离开 IDLE）
+       ST_DBG_WAIT_INFERIOR_FINISH : 等 ` jtag_idle`（引擎回到 IDLE）
+   两者都【没有等待上限】。当 jtagIF 由于任何原因不推进（§5 的 irlenx=0、
+   §2 修之前的 ACK 误判导致的异常路径、TCK 停摆等），done 恒 0 ⇒
+   cmsis_dap 的 case5/6 永久等待 ⇒ busy 恒 1 ⇒ 挂死。
+   加超时之后：最坏情况也只会得到一次"perr=1 + ack=ERROR"的明确失败，
+   USB 端点始终存活（done 会回到 1）。
+
+ 【补丁 4.1】新增参数（加在 :117-127 的 parameter 区，例如 MIN_IDLE_CYCLES 之后）
+   parameter TICKS_PER_USEC=CLK_FREQ/1000000;
+   parameter DEFAULT_IF_TICKS_PER_CLK=((CLK_FREQ+(DEFAULT_SWCLK>>1))/(DEFAULT_SWCLK<<1))-1;
+   parameter MIN_IDLE_CYCLES=2;
+   // 【NEW】F4: 下层引擎启动/完成的最长等待时间（usecsdown 是 23 位，最大约 8.4s）
+   parameter INFERIOR_TIMEOUT_USEC=10000;      // 10 ms，远小于上位机 1500ms 超时
+
+ 【补丁 4.2】在 5 个"进入 WAIT_INFERIOR_START"的入口装载看门狗
+   原理：usecsdown/usecsdiv 是全局的 us 定时器（顶部 :427-431 自动递减），
+   只要进入 WAIT_INFERIOR_* 之前把它装载成非 0 即可。5 个入口分别是：
+
+   (1) CMD_TRANSACT（:480-502）—— 在 `dbg_state <= ST_DBG_WAIT_INFERIOR_START;` 前加两行：
+			       active_mode   <= commanded_mode;
+			       ir            <= (apndp?JTAG_APACC:JTAG_DPACC);
+			       usecsdown     <= INFERIOR_TIMEOUT_USEC;   // 【NEW】F4
+			       usecsdiv      <= TICKS_PER_USEC-1;        // 【NEW】F4
+			       dbg_state     <= ST_DBG_WAIT_INFERIOR_START;
+
+   (2) CMD_JTAG_REG（:471-478）—— 同样加两行：
+			       ir             <= JTAG_UNKNOWN;
+			       active_mode    <= commanded_mode;
+			       jtag_cmd       <= JTAG_CMD_IR;
+			       usecsdown      <= INFERIOR_TIMEOUT_USEC;  // 【NEW】F4
+			       usecsdiv       <= TICKS_PER_USEC-1;       // 【NEW】F4
+			       dbg_state      <= ST_DBG_WAIT_INFERIOR_START;
+
+   (3) CMD_JTAG_GET_ID（:527-532）：
+                        CMD_JTAG_GET_ID:
+                          begin
+                             commanded_mode   <= MODE_JTAG;
+                             active_mode      <= MODE_JTAG;            // 见 §6 F8
+                             jtag_cmd         <= JTAG_CMD_READID;
+                             usecsdown        <= INFERIOR_TIMEOUT_USEC; // 【NEW】F4
+                             usecsdiv         <= TICKS_PER_USEC-1;      // 【NEW】F4
+                             dbg_state        <= ST_DBG_WAIT_INFERIOR_START;
+                          end
+
+   (4) CMD_JTAG_RESET（:534-540）：
+                        CMD_JTAG_RESET:
+                          begin
+                             commanded_mode <= MODE_JTAG;
+                             active_mode    <= MODE_JTAG;              // 见 §6 F8
+			     ir             <= JTAG_UNKNOWN;
+                             jtag_cmd       <= JTAG_CMD_RESET;
+                             usecsdown      <= INFERIOR_TIMEOUT_USEC;  // 【NEW】F4
+                             usecsdiv       <= TICKS_PER_USEC-1;       // 【NEW】F4
+                             dbg_state      <= ST_DBG_WAIT_INFERIOR_START;
+                          end
+
+   (5) ST_DBG_HANDLE_TRANSACT（:654-660）—— IR→TFR 的"第二笔"启动，也必须装载：
+	       ST_DBG_HANDLE_TRANSACT:
+		 begin
+		    JTAG_trans_os <= 0;
+		    jtag_cmd      <= JTAG_CMD_TFR;
+		    usecsdown     <= INFERIOR_TIMEOUT_USEC;   // 【NEW】F4
+		    usecsdiv      <= TICKS_PER_USEC-1;        // 【NEW】F4
+                    dbg_state     <= ST_DBG_WAIT_INFERIOR_START;
+                 end
+
+ 【补丁 4.3】WAIT_INFERIOR_START 加超时（:662-679 整块替换）
+ 【现状原文】
+	       // =========================================================================================
+               ST_DBG_WAIT_INFERIOR_START: // Waiting for inferior to start its task ======================
+                 begin
+                    case (active_mode)
+                      MODE_SWD:
+                        if (~swd_idle)
+                          dbg_state <= ST_DBG_WAIT_INFERIOR_FINISH;
+
+                      MODE_JTAG:
+                        if (~jtag_idle)
+                          dbg_state <= ST_DBG_WAIT_INFERIOR_FINISH;
+
+                      default:
+                        begin
+                           perr      <= 1'b1;
+                           dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                        end
+                    endcase // case (active_mode)
+                 end
+
+ 【替换文本】
+	       // =========================================================================================
+               ST_DBG_WAIT_INFERIOR_START: // Waiting for inferior to start its task ======================
+                 begin
+                    // 【NEW】F4: 引擎永不启动 ⇒ 报错收尾，绝不无限等待
+                    if (!usecsdown)
+                      begin
+                         perr      <= 1'b1;
+                         dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                      end
+                    else
+                      case (active_mode)
+                        MODE_SWD:
+                          if (~swd_idle)
+                            begin
+                               // 重新装载给 FINISH 等待使用
+                               usecsdown <= INFERIOR_TIMEOUT_USEC;  // 【NEW】F4
+                               usecsdiv  <= TICKS_PER_USEC-1;       // 【NEW】F4
+                               dbg_state <= ST_DBG_WAIT_INFERIOR_FINISH;
+                            end
+
+                        MODE_JTAG:
+                          if (~jtag_idle)
+                            begin
+                               usecsdown <= INFERIOR_TIMEOUT_USEC;  // 【NEW】F4
+                               usecsdiv  <= TICKS_PER_USEC-1;       // 【NEW】F4
+                               dbg_state <= ST_DBG_WAIT_INFERIOR_FINISH;
+                            end
+
+                        default:
+                          begin
+                             perr      <= 1'b1;
+                             dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                          end
+                      endcase // case (active_mode)
+                 end
+
+ 【补丁 4.4】WAIT_INFERIOR_FINISH 加超时（:629-651 整块替换）
+ 【现状原文】
+	       // =========================================================================================
+               ST_DBG_WAIT_INFERIOR_FINISH: // Waiting for inferior to complete its task ==================
+                 begin
+                    case (active_mode)
+                      MODE_SWD:
+                        if (swd_idle)
+                          begin
+                             dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                             perr      <= swd_perr;
+                          end // if (swd_idle)
+
+                      MODE_JTAG:
+                        if (jtag_idle)
+                          begin
+                             dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                          end
+
+                      default:
+                        begin
+                           perr      <= 1'b1;
+                           dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                        end
+                    endcase // case (active_mode)
+                 end // case: ST_DBG_WAIT_INFERIOR_FINISH
+
+ 【替换文本】
+	       // =========================================================================================
+               ST_DBG_WAIT_INFERIOR_FINISH: // Waiting for inferior to complete its task ==================
+                 begin
+                    // 【NEW】F4: 引擎永不完成 ⇒ 报错收尾（perr=1 会让上层回 ACK_ERROR）
+                    if (!usecsdown)
+                      begin
+                         perr      <= 1'b1;
+                         dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                      end
+                    else
+                      case (active_mode)
+                        MODE_SWD:
+                          if (swd_idle)
+                            begin
+                               dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                               perr      <= swd_perr;
+                            end // if (swd_idle)
+
+                        MODE_JTAG:
+                          if (jtag_idle)
+                            begin
+                               dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                            end
+
+                        default:
+                          begin
+                             perr      <= 1'b1;
+                             dbg_state <= ST_DBG_WAIT_GOCLEAR;
+                          end
+                      endcase // case (active_mode)
+                 end // case: ST_DBG_WAIT_INFERIOR_FINISH
+
+ 【为什么足够】
+   加了这两个超时后，无论 jtagIF 怎么卡，dbgIF 都会在 ≤10 ms 内回 IDLE：
+       ⇒ done 拉高 ⇒ cmsis_dap 的 case5/6/7/8 拿到 dbg_done=1
+       ⇒ 读 ack = ERROR(4) + perr=1 ⇒ 走"立即错误返回"分支
+       ⇒ busy 清 0 ⇒ USB 端点存活 ⇒ 主机拿到明确失败而不是超时。
+   注意：perr 会让 §3 的 Elif 分支命中（`(ack!=OK)|perr`），所以两侧配合是自洽的。
+
+ 【取舍】
+   - 正常一笔 JTAG 事务耗时 ~100~200 us（1 MHz TCK），10 ms 上限不会误杀。
+   - 若你的 TCK 低于 ~20 kHz（CLK_FREQ/MIN_CLOCK 限制下不太可能），请把
+     INFERIOR_TIMEOUT_USEC 调大（最大 8388607 ≈ 8.4 s）。
+
+ 【验证】§8 步骤 V3、V4。
+
+--------------------------------------------------------------------------------
+ §5 F5 —— irlenx 字段为 0 ⇒ ST_JTAG_WRITEIR 死循环（防雷两层）
+--------------------------------------------------------------------------------
+ 文件：verilog/jtagIF.v（:242-273）、verilog/dbgIF.v（:572-578）
+       1.4.4 的完成判据【一字未改】（1.4.4 jtagIF.v :269/:277），仍然有这个雷。
+
+ 【机理】
+   `ST_JTAG_WRITEIR` 用 `tdxcount[4:0]+1 == irlenx[5*devcount +:5]` 作为"这一位是
+   本器件 IR 的最后一位"的判据。若该字段为 0（例如 0x15 DAP_JTAG_Configure 没有下发、
+   或 dev 索引越过了配置过的器件、或主机发了个 0），那么这个等式【永不成立】
+   ⇒ tdxcount 一直加、devcount 不推进、jtag_state 永远停在 WRITEIR
+   ⇒ jtag_idle 恒 0 ⇒ dbgIF 停在 WAIT_INFERIOR_FINISH（修 §4 之前就是永久挂死）
+   ⇒ cmsis_dap busy 恒 1 ⇒ USB 端点停摆。
+
+ 本工程实测链是 2 TAP、irlenx={4,5}（合法），所以不是它触发的挂死；
+ 但它是"另一个 100% 会挂死的配置"，必须一并防住 —— 因为主机一旦发错 Count 就会踩到。
+
+ 【补丁 5.1】jtagIF.v —— FSM 兜底（:242-273 整块替换）
+ 【现状原文】
+	  ST_JTAG_WRITEIR: // SETIR Supporting states =====================================================
+	    begin
+	       tmsbits <= 6'b000010;
+	       tmscount <= 2;
+	       next_state <= ST_JTAG_IDLE;
+
+	       if (falling)
+		 begin
+		    tdi <= (devcount==dev)?ir[tdxcount]:1'b1;
+
+		    // If we are on the last bit then signal tms to leave
+		    if ((devcount==ndevs) && (tdxcount[4:0]+1 == irlenx[ 5*devcount +:5 ] ))
+		      tms <= 1'b1;
+		 end
+
+	       if (rising)
+		 begin
+		    tdxcount <= tdxcount+1;
+
+		    if ( tdxcount[4:0]+1 == irlenx[ 5*devcount +:5 ] )
+
+		      begin
+			 if (devcount==ndevs)
+			   jtag_state <= ST_JTAG_TMSOUT;
+			 else
+			   begin
+			      devcount <= devcount + 1;
+			      tdxcount <= 0;
+			   end
+		      end
+		 end
+            end // case: ST_JTAG_WRITEIR
+
+ 【替换文本】
+	  ST_JTAG_WRITEIR: // SETIR Supporting states =====================================================
+	    begin
+	       tmsbits <= 6'b000010;
+	       tmscount <= 2;
+	       next_state <= ST_JTAG_IDLE;
+
+	       if (falling)
+		 begin
+		    tdi <= (devcount==dev)?ir[tdxcount]:1'b1;
+
+		    // If we are on the last bit then signal tms to leave
+		    // 【FIX】F5: 字段为 0 时也要能离开（当作 1 位处理），否则 FSM 会死循环
+		    if ((devcount==ndevs) &&
+			((irlenx[ 5*devcount +:5 ]==5'd0) ||
+			 (tdxcount[4:0]+1 == irlenx[ 5*devcount +:5 ] )))
+		      tms <= 1'b1;
+		 end
+
+	       if (rising)
+		 begin
+		    tdxcount <= tdxcount+1;
+
+		    // 【FIX】F5: 原判据在 irlenx 字段为 0 时【永不成立】⇒ 无限自旋。
+		    //        这里把 0 视为"立即完成本器件"，保证一定能走到 TMSOUT。
+		    if ((irlenx[ 5*devcount +:5 ]==5'd0) ||
+			(tdxcount[4:0]+1 == irlenx[ 5*devcount +:5 ]))
+		      begin
+			 if ((devcount==ndevs) || (irlenx[ 5*devcount +:5 ]==5'd0))
+			   jtag_state <= ST_JTAG_TMSOUT;
+			 else
+			   begin
+			      devcount <= devcount + 1;
+			      tdxcount <= 0;
+			   end
+		      end
+		 end
+            end // case: ST_JTAG_WRITEIR
+
+ 【补丁 5.2】dbgIF.v —— 在配置阶段就拒绝非法链（:572-578）
+ 先加组合校验逻辑（放在 // JTAG Related 声明区之后、主 always 之前即可）：
+
+   // 【NEW】F5: 链上任一器件的 IR 长度字段为 0 都会让 ST_JTAG_WRITEIR 卡死，提前判掉
+   reg     ir_cfg_bad;
+   integer ci;
+   always @(*)
+     begin
+        ir_cfg_bad = 1'b0;
+        for (ci=0; ci<6; ci=ci+1)
+          if ((ci<=dev) && (dwrite[5*ci +:5]==5'd0))
+            ir_cfg_bad = 1'b1;
+     end
+
+ 然后改 CMD_SET_JTAG_CFG：
+ 【现状原文】
+                        CMD_SET_JTAG_CFG: // Set JTAG Config ----------------------------------------------
+                          begin
+			     ndevs        <= dev;
+			     irlenx       <= dwrite[29:0];
+			     ir           <= JTAG_UNKNOWN;
+                             dbg_state    <= ST_DBG_WAIT_GOCLEAR;
+                          end
+
+ 【替换文本】
+                        CMD_SET_JTAG_CFG: // Set JTAG Config ----------------------------------------------
+                          begin
+			     ndevs        <= dev;
+			     irlenx       <= dwrite[29:0];
+			     ir           <= JTAG_UNKNOWN;
+                             // 【NEW】F5: 非法（任一 IR 长度为 0）就置 perr 直接返回，
+                             //          上层 RESP_Wait_Done 会把它变成 0xFF 错误响应
+                             perr         <= ir_cfg_bad;
+                             dbg_state    <= ST_DBG_WAIT_GOCLEAR;
+                          end
+
+   注意 perr 在同一拍的 ST_DBG_IDLE 开头（:439）刚被清 0，这里再置位，Verilog
+   非阻塞赋值在同一 always 块内"后写优先"，所以实际生效的是 ir_cfg_bad。
+
+ 【补丁 5.3】cmsis_dap.py —— 更早一层校验（:495-510，RESP_JTAG_Configure_Process）
+ 把每个 5 位 IR 长度的检查加进收集循环：
+
+ 【现状原文】
+        with m.If(self.streamOut.valid & self.streamOut.ready):
+            m.d.sync += [
+                self.dbgif.dwrite.bit_select( self.jtag_ircount,5 ).eq(self.streamOut.payload.bit_select(0,5)),
+                self.jtag_ircount.eq(self.jtag_ircount+5)
+            ]
+            with m.If(self.streamOut.last):
+                m.d.sync += self.dbgif.go.eq(1)
+                m.next = 'DAP_Wait_Done'
+
+ 【替换文本】
+        with m.If(self.streamOut.valid & self.streamOut.ready):
+            # 【NEW】F5: IR 长度为 0 是非法配置（会让 jtagIF 卡死），直接拒绝本次配置
+            with m.If(self.streamOut.payload.bit_select(0,5)==0):
+                m.d.sync += [
+                    self.txBlock.bit_select(8,8).eq(0xff),
+                    self.busy.eq(0)
+                ]
+                m.next = 'RESPOND'
+            with m.Else():
+                m.d.sync += [
+                    self.dbgif.dwrite.bit_select( self.jtag_ircount,5 ).eq(self.streamOut.payload.bit_select(0,5)),
+                    # 【FIX】F7: 位宽与边界（见 §6 F7）
+                    self.jtag_ircount.eq(self.jtag_ircount+5)
+                ]
+                with m.If(self.streamOut.valid & (self.jtag_ircount>=25)):
+                    # 【NEW】F7: 最多 6 个器件（0..5），超过就不再接收
+                    m.d.sync += [
+                        self.txBlock.bit_select(8,8).eq(0xff),
+                        self.busy.eq(0)
+                    ]
+                    m.next = 'RESPOND'
+                with m.Elif(self.streamOut.last):
+                    m.d.sync += self.dbgif.go.eq(1)
+                    m.next = 'DAP_Wait_Done'
+
+   （`txBlock.bit_select(8,8)` 是 CMSIS-DAP 响应第 2 字节的 perr/状态位，
+     `0xff` 与 RESP_Wait_Done 里 `Mux(self.dbgif.perr,0xff,0)` 的用法一致。）
+
+--------------------------------------------------------------------------------
+ §6 其余同族缺陷（F6~F10、F12）—— 建议一并修
+--------------------------------------------------------------------------------
+
+### F6 —— DAP_JTAG_Configure(0x15)：Count=0 时 dev 被截断成 7
+ 文件：orbtrace/debug/cmsis_dap.py   位置：:484-493
+
+ 【现状原文】
+    def RESP_JTAG_Configure_Setup(self, m):
+        # <b:0x15> <b:Count> n x [ <b:IRLength> ]
+        # Set IR Length for Chain
+
+        m.d.sync += [
+            self.dbgif.command.eq( CMD_SET_JTAG_CFG ),
+            self.jtag_ircount.eq(0),
+            self.dbgif.dev.eq(self.rxBlock.bit_select(8,4)-1)
+            ]
+        m.next='JTAG_Configure_PROCESS';
+
+ 【问题】
+   `bit_select(8,4)` 是 4 位。Count=0 时 `0-1 = 4'hF`，赋给 3 位的 `dbgif.dev`
+   被截断成 7 ⇒ dbgIF 认为链上有 8 个器件，配出越界的 irlenx（配合 §5 的雷 ⇒ 挂死）。
+   Count>6 同样越界（dbgIF 最多支持 6 个器件，见 dbgIF.v:58-64 注释）。
+
+ 【替换文本】
+    def RESP_JTAG_Configure_Setup(self, m):
+        # <b:0x15> <b:Count> n x [ <b:IRLength> ]
+        # Set IR Length for Chain
+
+        # 【NEW】F6: Count 必须在 1..6 之间（dbgIF 最多 6 个器件、IR 长度表 30 位）
+        with m.If((self.rxBlock.bit_select(8,4)==0) | (self.rxBlock.bit_select(8,4)>6)):
+            m.d.sync += [
+                self.txBlock.bit_select(8,8).eq(0xff),
+                self.busy.eq(0)
+            ]
+            m.next = 'RESPOND'
+        with m.Else():
+            m.d.sync += [
+                self.dbgif.command.eq( CMD_SET_JTAG_CFG ),
+                self.jtag_ircount.eq(0),
+                self.dbgif.dev.eq(self.rxBlock.bit_select(8,4)-1)
+                ]
+            m.next='JTAG_Configure_PROCESS';
+
+### F7 —— jtag_ircount 位宽 / 回卷
+ 文件：orbtrace/debug/cmsis_dap.py   位置：:192、:495-510
+
+ 【问题】
+   `self.jtag_ircount = Signal(5)`（:192），每收一个器件 +5。6 个器件到 30，
+   5 位够用；但若主机发了 >6 个字段（无上界校验时），35 会回卷成 3 ⇒
+   `dwrite.bit_select(3,5)` 把第 8 个字段写进了第 1 个字段的位置，静默写坏 irlenx。
+   配合 §5 的雷会挂死，或者让 IR 长度表悄悄错位。
+
+ 【两种改法（任选其一）】
+   (a) 最小改动（推荐）：保持 Signal(5)，用 §5.3 里已经加入的
+       `self.jtag_ircount>=25` ⇒ 报错返回 的上界校验。此时最多收 6 个字段
+       （0,5,10,15,20,25），30 不会再被写到（第 7 个字段会被拒）。
+   (b) 彻底改法：`self.jtag_ircount = Signal(6)`，并把上界判断改成
+       `self.jtag_ircount>=30`，同时在计数器到达 30 后强制 `m.next='RESPOND'`。
+
+   注意：dbgIF 的 `irlenx` 只有 30 位（`reg [29:0] irlenx`，:192），
+   所以"最多 6 个器件"是硬上限，不能靠加宽 cmsis_dap 侧来突破。
+
+### F8 —— dbgIF：三处漏写 active_mode（1.4.4 已补，1.4.3 没有）
+ 文件：verilog/dbgIF.v   位置：:527-547、:705-733
+
+ 【问题】
+   `ST_DBG_WAIT_INFERIOR_START` / `_FINISH` 是按 `active_mode` 做 case 的（:631、:664）。
+   而下列命令【只设 commanded_mode，不设 active_mode】，于是 case 落到 `default`
+   ⇒ `perr<=1` + 回 WAIT_GOCLEAR ⇒ 命令"报错返回"而不是执行：
+       CMD_JTAG_GET_ID   ⇒ 0x16 DAP_JTAG_IDCODE 永远失败（实测"回全 0"）
+       CMD_JTAG_RESET    ⇒ 0x15 之外的 TAP reset 失败
+       CMD_SET_SWJ       ⇒ 模式切回 SWJ 失败
+   另外 `ST_DBG_ESTABLISH_MODE` 走完模式切换波形后【不恢复 active_mode】，
+   会一直停在 MODE_LOCAL（1.4.4 :721-726 才补上）。
+
+ 【替换文本 1】CMD_JTAG_GET_ID（:527-532）
+                        CMD_JTAG_GET_ID: // Get ID of specified JTAG device -------------------------------
+                          begin
+                             commanded_mode   <= MODE_JTAG;
+                             active_mode      <= MODE_JTAG;   // 【NEW】F8
+                             jtag_cmd         <= JTAG_CMD_READID;
+                             dbg_state        <= ST_DBG_WAIT_INFERIOR_START;
+                          end
+
+ 【替换文本 2】CMD_JTAG_RESET（:534-540）
+                        CMD_JTAG_RESET: // Reset all JTAG TAPs --------------------------------------------
+                          begin
+                             commanded_mode <= MODE_JTAG;
+                             active_mode    <= MODE_JTAG;     // 【NEW】F8
+			     ir             <= JTAG_UNKNOWN;
+                             jtag_cmd       <= JTAG_CMD_RESET;
+                             dbg_state      <= ST_DBG_WAIT_INFERIOR_START;
+                          end
+
+ 【替换文本 3】CMD_SET_SWJ（:542-547）
+                        CMD_SET_SWJ: // Set SWJ mode ------------------------------------------------------
+                          begin
+                             commanded_mode <= MODE_LOCAL;
+                             active_mode    <= MODE_SWJ;      // 【NEW】F8
+			     ir             <= JTAG_UNKNOWN;
+                             dbg_state      <= ST_DBG_WAIT_GOCLEAR;
+                          end
+
+ 【替换文本 4】ST_DBG_ESTABLISH_MODE 收尾（:715-719）
+			 if (state_step==127)
+			   begin
+			      local_tgtclk<=1'b1;
+			      active_mode <= commanded_mode;   // 【NEW】F8: 恢复目标模式
+			      dbg_state<=ST_DBG_WAIT_GOCLEAR;
+			   end
+
+   注意：`0x14 DAP_JTAG_SEQUENCE` 走 CMD_PINS_WRITE，会在 :445 把 active_mode
+   写成 MODE_SWJ —— 这是【设计如此】（位流模式下由主机完全控制引脚）。
+   副作用：发过 0x14 之后再发 0x16，因 active_mode==MODE_SWJ 仍会失败；
+   若你要"0x14 与 0x16 混用"，需要在 0x16 前先发 CMD_SET_JTAG（0x15 之外的
+   模式建立命令由 cmsis_dap 侧触发，见 dbgIF.v:516-525）。
+
+### F9 —— CMD_CLR_ERR 不清 perr
+ 文件：verilog/dbgIF.v   位置：:593-594（1.4.4 :596-600 已修）
+
+ 【现状原文】
+                        CMD_CLR_ERR: // Clear error status ------------------------------------------------
+                          dbg_state       <= ST_DBG_WAIT_GOCLEAR;
+
+ 【替换文本】
+                        CMD_CLR_ERR: // Clear error status ------------------------------------------------
+                          begin
+                             perr            <= 1'b0;        // 【NEW】F9
+                             dbg_state       <= ST_DBG_WAIT_GOCLEAR;
+                          end
+
+ 【后果说明】不清 perr 时，任何一次错误都会永久粘滞：后续 RESP_Wait_Done（cmsis_dap.py:325）
+   会把 perr 变成 0xFF 返回 ⇒ 之后所有命令都报错，只能整芯片复位。
+
+### F10 —— jtagIF 无异步复位 / 无 default 分支
+ 文件：verilog/jtagIF.v   位置：:101-289（1.4.4 已加）
+
+ 【现状】`rst` 端口在 dbgIF.v:318-320 一直连着，但 jtagIF 模块内【完全没用】；
+   `case (jtag_state)` 也没有 `default`，未知编码会让 FSM 卡在不可恢复的悬空态。
+
+ 【替换文本】把 always 块改成带复位、带 default：
+   always @(posedge clk, posedge rst)
+     begin
+        if (rst)                                  // 【NEW】F10
+          begin
+             jtag_state <= ST_JTAG_IDLE;
+             tdxcount   <= 0;
+             devcount   <= 0;
+             tmscount   <= 0;
+             windex     <= 0;
+             tms        <= 1'b1;                  // TMS=1 让 TAP 保持复位
+             tdi        <= 1'b0;
+          end
+        else
+          case (jtag_state)
+            ... 原有各状态（内容不变）...
+	    default:                              // 【NEW】F10
+	      begin
+		 jtag_state <= ST_JTAG_IDLE;
+		 tdxcount   <= 0;
+		 devcount   <= 0;
+	      end
+          endcase // case (jtag_state)
+     end // always @ (posedge clk, posedge rst)
+
+ 【注意】加复位后 `jtag_state` 的 `stateCopy` 调试打印段（:74-97）不受影响。
+   另：1.4.4 的复位分支只清了 tdxcount/devcount，这里多清 tms 是更稳的做法
+   （TMS=1 使 TAP 停在 TEST-LOGIC-RESET，避免上电时随机进入数据寄存器）。
+
+### F12 —— 0x16 DAP_JTAG_IDCODE：取错器件（读的是链上最后一个 ID）
+ 文件：verilog/jtagIF.v（:207-229）+ orbtrace/debug/cmsis_dap.py（:514-525）
+
+ 【问题】
+   (a) `ST_JTAG_IDDATA` 里 `dread[tdxcount] <= tdo;` 【没有 devcount==dev 门控】
+       ⇒ 链上每个器件的 ID 都往同一个 dread 写，最后留下的是【最后一个器件】的 ID。
+   (b) `RESP_JTAG_IDCODE_Setup`（:514-525）把请求里的 JTAGIndex 只写进了
+       `self.dbgif.dwrite`（dbgIF 的 CMD_JTAG_GET_ID 根本没用它），
+       ⇒ 实际读的是 `dbgif.dev` 里残留的器件号，而不是主机指定的那个。
+
+ 【替换文本 a】jtagIF.v ST_JTAG_IDDATA（:207-229）
+	       if (rising)
+		 begin
+		    tdxcount <= tdxcount+1;
+		    // 【FIX】F12: 只保留目标器件的 ID
+		    if (devcount==dev)
+		      dread[tdxcount] <= tdo;
+
+		    // For ID read it's always 32 bits...
+		    if (5'h1f==tdxcount)
+		      begin
+			 if (devcount==ndevs)
+			   jtag_state <= ST_JTAG_READID_DONE;
+			 else
+			   begin
+			      devcount <= devcount + 1;
+			      tdxcount <= 0;
+			   end
+		      end
+                 end
+
+ 【替换文本 b】cmsis_dap.py RESP_JTAG_IDCODE_Setup（:514-525）
+    def RESP_JTAG_IDCODE_Setup(self, m):
+        # <b:0x16> <b:JTAGIndex>
+        # Request ID code for specified device
+        m.d.sync += [
+            self.dbgif.command.eq(CMD_JTAG_GET_ID),
+            self.dbgif.dev.eq(self.rxBlock.bit_select(8,3)),   # 【NEW】F12: 真正选中该器件
+            self.dbgif.dwrite.eq( self.rxBlock.bit_select(8,8) ),
+            self.txLen.eq(6),
+            self.txBlock.bit_select(16,32).eq(0),
+            self.dbgif.go.eq(1)
+            ]
+
+        m.next = 'JTAG_IDCODE_Process'
+
+   注意：`dbgif.dev` 是 dbgIF 的内部寄存器（由 cmsis_dap 驱动），
+   在一次 0x16 之后它会被改成这个值，后续 CMD_TRANSACT 会沿用 —— 这与
+   CMD_TRANSACT 里 `if (current_dev!=dev)` 的判断配合（dbgIF.v:485），是自洽的。
+
+--------------------------------------------------------------------------------
+ §7 1.4.3 / 1.4.4 版本对照（结论：升级到 1.4.4【不能】解决挂死）
+--------------------------------------------------------------------------------
+ 缺陷  1.4.3                        1.4.4                        是否已在 1.4.4 修
+ F1    dbgIF.v:280-282              dbgIF.v:280-282              ❌ 未修（逐字相同）
+ F2    jtagIF.v:169-206             jtagIF.v:185-220             ❌ 未修
+ F11   jtagIF.v:182-188             jtagIF.v:198-204             ❌ 未修
+ F3    cmsis_dap.py:835-883         cmsis_dap.py:1101-1131       ❌ 未修（无看门狗）
+ F4    dbgIF.v:629-679              dbgIF.v:625-685              ❌ 未修（无超时）
+ F5    jtagIF.v:242-273             jtagIF.v:~269-300            ❌ 未修（判据相同）
+ F6    cmsis_dap.py:484-493         cmsis_dap.py:706-711         ❌ 未修（-1 截断相同）
+ F8    dbgIF.v 三处                 dbgIF.v:527-550              ✅ 已修（1.4.4 补齐）
+ F9    dbgIF.v:593-594              dbgIF.v:~596-600             ✅ 已修
+ F10   jtagIF.v 无复位              jtagIF.v:101-316             ✅ 已加 posedge rst
+
+ ⇒ 也就是说：把 1.4.3 换成 1.4.4，只白拿 F8/F9/F10 三个"次要项"，
+   而真正导致 0x05/0x06 挂死的 F1/F2/F11/F3/F4 一个都没修。
+   本补丁对 1.4.4 同样适用（行号按 §0 表里 1.4.4 那一列替换即可）。
+
+--------------------------------------------------------------------------------
+ §8 验收流程（改完必须逐条过）
+--------------------------------------------------------------------------------
+ 前置：已烧写新 bitstream；上位机用本工程的 test/jtagblockprobe（或 CMSIS-DAP 工具）。
+       注意先发 0x15 DAP_JTAG_Configure（Count=2, IRLength=4,5）再发数据类命令，
+       否则 irlenx 全是 0（即使有 §5 的兜底，也读不到正确数据）。
+
+ V1  JTAG 下读 DP IDCODE（0x05 或 0x06 均可）
+     期望：ack = 1(OK)，数据 = 目标 DP 的真实 ID（Cortex-M 常见 0x2BA01477），
+           perr = 0，耗时 < 5 ms。
+     判据：修复前这里 100% 挂死；修复后必须每次成功。
+     （若 ack 仍是 2(WAIT) 或 4(ERROR)：说明 §1 或 §2 没改对，回去核对。）
+
+ V2  多 TAP 一致性
+     连发 20 次 V1，读数必须【每次都相同】。
+     若偶发 4(ERROR)/0xFFFFFFFF：说明 §2 的 devcount 门控没生效（旁路器件还在覆盖 ack）。
+
+ V3  强制超时路径（专门验证 §3 + §4）
+     临时把 TFR_HANDSHAKE_TIMEOUT 改成 0x100、INFERIOR_TIMEOUT_USEC 改成 10，
+     然后发 V1。
+     期望：立刻返回 ack=4(ERROR)，随后【紧跟着发 0x00 Info 必须正常应答】，
+           busy 已清 0，不需要插拔。
+     这条是"防挂死"的核心证据：以前这里会死锁，现在必须能自愈。
+
+ V4  非法配置（验证 §5 F5）
+     0x15 Count=2 但 IRLength 填 {0, 5}。
+     期望：立即返回错误（0xFF 状态字节），不挂死，随后命令照常。
+
+ V5  长跑
+     连续 200 次 0x06（JALL 读）+ 20 次 0x15 配置，中间不断插拔。
+     期望：全程无一次需要插拔，无一次 1500 ms 超时。
+
+--------------------------------------------------------------------------------
+ §9 回归检查（不能把 SWD 弄坏）
+--------------------------------------------------------------------------------
+ R1  SWD 必须完全不受影响：§1 只改 `(active_mode==MODE_SWD)?swd_ack:...` 的后半段；
+     §2/§5/§10 改的都是 jtagIF（SWD 走 swdIF，两个独立模块）。
+ R2  用原来的 SWD 流程（0x02 DAP_Connect → 0x03 SWJ_Pins → 0x05 SWD 读 DP IDCODE）
+     跑一遍，ID 必须不变、无新增错误。
+ R3  0x14 DAP_JTAG_SEQUENCE（纯位流）回归：应保持原行为（走 CMD_PINS_WRITE，
+     active_mode=MODE_SWJ），不因 §6 F8 而改变。
+ R4  0x0A DAP_WriteABORT / 0x08 DAP_Delay / 0x09 DAP_ResetTarget 回归：
+     这些不经过 WAIT_INFERIOR_*，加超时后行为不变（只在"永不推进"时才会有差异）。
+ R5  复位（0x09）+ CMD_CLR_ERR：修 §6 F9 后，perr 应当能真正清掉；
+     验证"报一次错 → 发清除错误 → 再读必须正常"。
+
+--------------------------------------------------------------------------------
+ §10 关于"读"的语义（固件修好后，主机侧仍要注意）
+--------------------------------------------------------------------------------
+ 这是【协议语义】不是固件缺陷，单独说明，免得改完固件后以为还没修好。
+
+ `cmsis_dap.py` 里（1.4.3 :800 附近）：
+     self.readBDelay.eq((self.isJTAG & self.rxBlock.bit_select(33,1)) | ...)
+ 含义：JTAG 读（以及 SWD 对 AP 的读）是 ADIv5 的【posted read】——
+ 发出的读事务当拍【不返回数据】，读结果要由【下一笔事务】（通常是同类读或
+ RDBUFF）带回来。所以：
+   - 单发一笔 0x06(JTAG, R) 时，`count` 不计入、数据是空 —— 这是【正确行为】，
+     和固件修的"挂死"是两件事；
+   - 要拿到数据，正确序列是：先发读（posted），再发一笔"回收"读（例如 DP RDBUFF
+     0x0D，或再发同一 AP 读），从【后一笔】的响应里取数据；
+   - 这也解释了旧现象里的"第一笔秒回、count=0"。
+ ⇒ 修完 F1~F4 之后，请用 0x0D DP RDBUFF（或第二笔读）来收数据做验证，
+   不要拿"第一笔没有数据"当失败。
+
+--------------------------------------------------------------------------------
+ §11 回退方法（逐条可逆）
+--------------------------------------------------------------------------------
+ 每条补丁都是就地替换、相互独立，回退只需还原下列文件区域：
+   还原 F1  ：dbgIF.v   :280-282          （1 行 assign）
+   还原 F2/F11：jtagIF.v :169-206          （一个 if(rising) 块）
+   还原 F3  ：cmsis_dap.py                 （删 self.tfB_timeout/tfr_timeout 声明、
+                                            :85-89 的常量、case4/5/6 的 3 组 If/Elif/Else）
+   还原 F4  ：dbgIF.v   :117-127 参数、5 个入口各 2 行、:629-651、:662-679 两个状态块
+   还原 F5  ：jtagIF.v  :242-273、dbgIF.v CMD_SET_JTAG_CFG + ir_cfg_bad、cmsis_dap F5.3
+   还原 F6~F10/F12：见 §6 各自的"现状原文"块
+ 建议：改之前把 verilog/ 与 orbtrace/debug/ 整体拷一份备份目录，改完逐条对照本文件 §0 清单。
+
+--------------------------------------------------------------------------------
+ §12 最后的提醒
+--------------------------------------------------------------------------------
+ 1) 本文件所有行号都基于你机器上的：
+      C:\Users\taibaibu\Desktop\orbtrace-1.4.3
+      C:\Users\taibaibu\Desktop\orbtrace-1.4.4
+    换机器/换版本请用"现状原文"搜索定位，不要死记行号。
+ 2) 修完请回报三件事，便于确认是否还需追加补丁：
+      - V1 的 ack 与 ID 值；
+      - V3 的超时自愈是否成立（关键！）；
+      - 是否还有"只能插拔"的残余场景，若有，记下当时的命令序列。
+ 3) 如果只想先验证"能不能不挂死"，只打 §1+§2+§3+§4（四次改动）就够了；
+    §5~§6 是同一家族的地雷，建议随后一并补。
+
+============================== 文件结束 ==============================

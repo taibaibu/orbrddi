@@ -10,10 +10,12 @@ param(
 $AllSources = @(
     "ORBMDK_RDDI_FullTest.cpp",     # 全面功能测试（40 项，含完整导出扫描）
     "ORBMDK_BlockTransferTest.cpp", # 块传输提速/越界验证
+    "ORBMDK_RAM_SpeedTest.cpp",     # RAM 读写吞吐（绕开 Keil/AGDI，测设备侧极限）
     "swdprobe.cpp",                 # SWD 通路功能回归（V2 或 V1，见用法）
     "hidprobe.cpp",                 # CMSIS-DAP v1 (HID) 极简回归
     "jtagprobe.cpp",                # JTAG 端到端（走本层 DLL）
     "jtagrawprobe.cpp",             # JTAG 裸帧/引脚级诊断（绕开本层）
+    "jtagblockprobe.cpp",           # JTAG 下 ID_DAP_TRANSFER_BLOCK(0x06) 专项复验（绕开本层）
     "v2rawprobe.cpp"                # V2 裸帧/包长/分片诊断（绕开本层）
 )
 
@@ -142,8 +144,8 @@ $SourceBaseName = [System.IO.Path]::GetFileNameWithoutExtension($Source)
 $ExeFile = Join-Path $BinDir "$SourceBaseName.exe"
 $ObjFile = Join-Path $ScriptDir "$SourceBaseName.obj"
 
-# Compiler flags
-$CompilerFlags = "/c /nologo /MD /W3 /EHsc /std:c++17 /utf-8"
+# Compiler flags（/O2 的口径见 build.ps1；测试工具与 DLL 保持同一优化等级）
+$CompilerFlags = "/c /nologo /O2 /MD /W3 /EHsc /std:c++17 /utf-8"
 $CompilerFlags += " /D_WINDOWS"
 $CompilerFlags += " /I`"$ScriptDir\..\include`""
 $CompilerFlags += " /I`"$VCTools\include`""

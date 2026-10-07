@@ -1,5 +1,8 @@
 # ORBMDK_RDDI.dll 使用手册
 
+> ⚠️ **文件名带 `.bak` 属历史原因** —— 本手册内容对应**当前 0.5.0** 的导出接口，**并非过期文档**；
+> 保留后缀只是尚未改名。**API 使用请以本文为准**。
+
 本文给出 `ORBMDK_RDDI.dll` **全部 RDDI 导出函数**的调用用例。
 
 - 导出方式：每个函数都带 `RDDI_FUNC`（`extern "C" __declspec(dllexport)`），共 **78+ 个**，纯 C ABI。
@@ -47,7 +50,7 @@
 //   ORBMDK_ORBTRACE_PID = 0x3443
 
 // 版本（定义于 include/ORBMDK.h）
-//   ORBMDK_VERSION_STRING = "1.0.0"
+//   ORBMDK_VERSION_STRING = "0.5.0"
 ```
 
 `RDDIHandle` 是 `int` 类型，**从 1 开始编号，0 恒为无效句柄**。

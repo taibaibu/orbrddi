@@ -22,11 +22,6 @@
 
 // ============================================================================
 // 日志（统一实现见 src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）
-//
-// ★ 2026-09-30：删除了本文件自己的 HID_LogLevel / HID_Log 与那套宏 ——
-//   它原来只走 stdout/DebugView、**不落盘**，级别也只认环境变量（启动固定），
-//   与 RDDI 那套重复且能力不对等。现在两者完全一致：
-//   落盘 + %TEMP%\ORBMDK_LOG_LEVEL 热更新 + 统一格式（时间戳/进程线程号）。
 // ============================================================================
 #define ORBMDK_LOG_MODULE "HID"
 #define LOG_HID_DEBUG(...) ORBMDK_LOG_DEBUG(__VA_ARGS__)
@@ -36,14 +31,8 @@
 
 // ---------------------------------------------------------------------------
 // 命令级日志（与 ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
-//
-// 为什么必须有：V1(HID) 路径下的 DAP 命令原本**完全不可见**（默认阈值 ERROR 且
-// 当时 HID 根本不落文件）。实测排障时表现为"AGDI 在 CMSIS_DAP_Connect 之后什么都
-// 不做就断开"，而 HID 命令其实一直在发。
-//
 // ⚠ 2026-10-03：按"**最底层日志统一 INFO**"的口径改为 ORBMDK_LOG_INFO ——
 // 传输/命令级日志是排障必备，阈值设为 INFO(1) 时即可见，并会送宿主（Keil）日志窗口。
-// （此前用 ORBMDK_LOG_TRACE：等级同为 INFO，但**只落文件**、不进宿主窗口。）
 // ---------------------------------------------------------------------------
 #define HidTrace(...) ORBMDK_LOG_INFO(__VA_ARGS__)
 
@@ -472,7 +461,7 @@ int ORBMDK_HID_HasV1Candidate(void)
     if (g_v1ProbeResult == 0) {
         // 只在"从未发现"变"仍然没发现"的第一次打日志（TTL 到点会重扫，别刷屏）
         if (!g_v1ProbeLogged) {
-            LOG_HID_WARN("总线上未发现 CMSIS-DAP v1 候选（无首选表命中，也无"
+            LOG_HID_INFO("总线上未发现 CMSIS-DAP v1 候选（无首选表命中，也无"
                          "UsagePage=0xFF00 且负载恰好 64 的接口）—— ifNo=1 将如实"
                          "标注为未检测到");
             g_v1ProbeLogged = true;
@@ -1100,6 +1089,11 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
     }
     memcpy(&reportOut[g_hidPlan.payloadOff], cmd, cmdLen);
 
+    // meter usb：OUT（把命令报告发出去）的耗时。这里不用 RAII 计时器是因为
+    // 该函数的读阶段还要单独计时，且写阶段的失败 return 不记账（沿用"失败不计"口径）。
+    const int meterWriteOn = ORBMDK_LogMeterEnabled();
+    const unsigned long long writeT0 = meterWriteOn ? ORBMDK_LogMeterNowUs() : 0ull;
+
     if (g_hidPlan.writeIsFeature) {
         // 没有 Output 报告的老式 DAPLink：命令走控制传输（同步调用，无 OVERLAPPED）
         if (!HidD_SetFeature(g_hDevice, reportOut.data(), (ULONG)reportOut.size())) {
@@ -1136,6 +1130,10 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
             }
         }
         CloseHandle(writeOl.hEvent);
+    }
+
+    if (meterWriteOn) {
+        ORBMDK_LogMeterUsb(0, ORBMDK_LogMeterNowUs() - writeT0);
     }
 
     std::vector<uint8_t> reportIn(g_hidPlan.inputLen ? g_hidPlan.inputLen : HID_MAX_PACKET_SIZE, 0);
@@ -1175,7 +1173,12 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
     size_t payloadStart = 0;
     for (int attempt = 0; attempt < 3; ++attempt) {
         bytesRead = 0;
-        const int rc = readReport(reportIn.data(), reportIn.size(), &bytesRead);
+        // meter usb：IN（等应答）耗时。用作用域包住调用本身，重试时每轮各计一次。
+        int rc = HID_RC_OK;
+        {
+            orbmdk::MeterUsbTimer usbTimer(1);
+            rc = readReport(reportIn.data(), reportIn.size(), &bytesRead);
+        }
         if (rc != HID_RC_OK) return rc;
         if (bytesRead == 0) return HID_RC_EMPTY_RESPONSE;
 
@@ -1461,6 +1464,122 @@ int DAP_Transfer(int dapId, uint8_t request, uint32_t* data)
     return status;
 }
 
+int DAP_TransferMultiMax(void)
+{
+    // 出包 = 3 + 5*count（每笔 1 字节请求 + 写笔 4 字节数据）；
+    // 入包 = 4 + 4*reads（每读笔 4 字节）。取两者共同约束的较小值。
+    const int pkt   = ORBMDK_USB_Bulk_GetMaxCommandBytes();       // 0 = HID / 未连接
+    const int avail = (pkt > 0) ? pkt : static_cast<int>(CMSIS_DAP_V1_PAYLOAD_MAX);
+
+    int n = (avail - 3) / 5;
+    const int nResp = (avail - 4) / 4;
+    if (n > nResp) {
+        n = nResp;
+    }
+    if (n < 1) {
+        n = 1;
+    }
+    if (n > 100) {
+        n = 100;                       // 栈缓冲硬上限（见 DAP_TransferMulti 的数组尺寸）
+    }
+    return n;
+}
+
+int DAP_TransferMulti(int dapId, const DAP_XferItem* items, int count,
+                      uint32_t* rdata, int* respCount)
+{
+    if (respCount) {
+        *respCount = 0;
+    }
+    const int limit = DAP_TransferMultiMax();
+    if (!items || count <= 0 || count > limit) {
+        LOG_HID_ERROR("DAP_TransferMulti: bad count=%d (limit=%d)", count, limit);
+        return DAP_RES_ERROR;
+    }
+
+    uint8_t  cmd[3 + 5 * 100];
+    uint8_t  resp[4 + 4 * 100] = {};
+    size_t   len = 0;
+
+    cmd[len++] = ID_DAP_TRANSFER;
+    cmd[len++] = static_cast<uint8_t>(dapId);
+    cmd[len++] = static_cast<uint8_t>(count);
+    for (int i = 0; i < count; ++i) {
+        const uint8_t rq = items[i].request;
+        cmd[len++] = rq;
+        // 跟 4 字节的三种情况：写笔 / 匹配值(bit4) / 匹配掩码(bit5)
+        if ((rq & 0x02) == 0 || (rq & 0x10) != 0 || (rq & 0x20) != 0) {
+            const uint32_t v = items[i].data;
+            memcpy(&cmd[len], &v, 4);
+            len += 4;
+        }
+    }
+
+    size_t respLen = sizeof(resp);
+    const int result = ORBMDK_HID_DAPCommand(cmd, len, resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
+    if (result != 0) {
+        LOG_HID_ERROR("DAP_TransferMulti: command failed result=%d (count=%d)", result, count);
+        return DAP_RES_ERROR;
+    }
+    if (respLen < 4) {
+        LOG_HID_ERROR("DAP_TransferMulti: resp too short respLen=%zu", respLen);
+        return DAP_RES_ERROR;
+    }
+
+    // 响应布局与单笔一致：[报告ID][0x05][完成笔数][Transfer Response][读笔数据...]
+    const int     done   = resp[2];
+    const uint8_t tr     = resp[3];
+    if (respCount) {
+        *respCount = done;
+    }
+
+    int status;
+    switch (tr & 0x07) {
+        case 1: status = DAP_RES_OK;     break;   // ACK OK
+        case 2: status = DAP_RES_WAIT;   break;   // ACK WAIT
+        case 4: status = DAP_RES_FAULT;  break;   // ACK FAULT
+        case 7: status = DAP_RES_NO_ACK; break;   // ACK NO_ACK
+        default: status = DAP_RES_ERROR; break;
+    }
+    if (tr & 0x10) {                              // Bit 4: Value Mismatch
+        status = DAP_RES_VALUE_MISMATCH;
+    }
+
+    // 读笔的数据按**请求顺序**依次排列（写笔与掩码伪笔不占位）
+    size_t off = 4;
+    int reads = 0;
+    for (int i = 0; i < done && (off + 4) <= respLen; ++i) {
+        if ((items[i].request & 0x02) != 0) {
+            const uint32_t v = static_cast<uint32_t>(resp[off]) |
+                               (static_cast<uint32_t>(resp[off + 1]) << 8) |
+                               (static_cast<uint32_t>(resp[off + 2]) << 16) |
+                               (static_cast<uint32_t>(resp[off + 3]) << 24);
+            if (rdata) {
+                rdata[i] = v;
+            }
+            off += 4;
+            ++reads;
+        }
+    }
+
+    LOG_HID_DEBUG("DAP_TransferMulti: count=%d done=%d reads=%d ack=0x%X status=%d",
+                  count, done, reads, static_cast<unsigned>(tr & 0x07), status);
+
+    if (done != count) {
+        // 固件提前中断。**两种性质要分开**（由调用方决定怎么处置）：
+        //   - status == DAP_RES_VALUE_MISMATCH：这是 match 的**正常语义**（等值没等到），
+        //     调用方应"已完成的部分照收、未执行的按逐笔老路重做"，**不是故障**；
+        //   - 其它（FAULT/WAIT/NO_ACK）或"莫名停下"（done<count 却没有失配位）：
+        //     按失败上抛，与逐笔路径在首个失败处返回一致。
+        LOG_HID_WARN("DAP_TransferMulti: 固件只完成 %d/%d 笔 (resp=0x%02X, status=%d)",
+                     done, count, static_cast<unsigned>(tr), status);
+        if (status == DAP_RES_OK) {
+            status = DAP_RES_ERROR;      // 停下却没说原因：当异常处理
+        }
+    }
+    return status;
+}
+
 int DAP_TransferBlock(int dapId, uint16_t count, uint8_t request,
                       const uint32_t* writeData, uint32_t* readData)
 {
@@ -1656,7 +1775,11 @@ int DAP_JTAG_Sequence(const JtagSeg* segs, int segCount,
         }
     }
 
-    uint8_t resp[128] = {};
+    // 响应缓冲：JTAG 序列命令（位流拼接式批量写已作废，见 ORBMDK_RDDI.cpp 顶部结论）会让本命令的
+    // 捕获数据一次到几百字节。V2/Bulk 一包可到 ~508 B，故按 520 开缓冲（原 128 会在
+    // 批量时截断 TDO，表现为"ACK 解析/数据错位"）。V1/HID 只有 64 B 报文，
+    // 调用方按传输层把批大小收到 4 字（响应 3+5*4=23 B）以内。
+    uint8_t resp[520] = {};
     size_t respLen = sizeof(resp);
     const int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0) return -1;

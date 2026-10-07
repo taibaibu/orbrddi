@@ -24,7 +24,9 @@
  *   2. Overrun : the data array is wrapped in 8 canary words on each side;
  *                any corruption is reported immediately (targets the bug above).
  *   3. Boundary: word counts 1 / 13 / 14 / 15 / 28 / 64 -- covers the
- *                kMaxBlockWords = 14 chunk boundary.
+ *                kMaxBlockWords = 14 chunk boundary. (All <= 64 words, i.e. well
+ *                inside one TAR block: the >1-block TAR defect (bug.md B7) is NOT
+ *                reachable from this tool -- use ORBMDK_RAM_SpeedTest for that.)
  *   4. Speed   : prints the per-case write/read timings of the block path.
  *                There is no serial baseline any more -- the driver has no
  *                switch to turn block transfer off.
@@ -341,6 +343,10 @@ static double RunRound(const char* tag, uint32_t addr,
         a.WriteReg(h, 0, RID_AP_TAR, (int)0xE000EDF0);
         a.WriteReg(h, 0, RID_AP_DRW, (int)0xA05F0003);   /* halt */
         Sleep(20);
+        /* CSW is AddrInc=single: the write above auto-incremented TAR to
+         * DHCSR+4, so a bare DRW read fetched DCRSR (0) and printed
+         * "[NOT halted]" even on a perfectly halted core. Re-arm TAR first. */
+        a.WriteReg(h, 0, RID_AP_TAR, (int)0xE000EDF0);
         int dhcsr = 0;
         a.ReadReg(h, 0, RID_AP_DRW | REG_RNW, &dhcsr);
         printf("  DHCSR -> 0x%08X %s\n", (unsigned)dhcsr,

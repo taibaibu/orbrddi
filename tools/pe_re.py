@@ -17,6 +17,7 @@ pe_re.py — Keil AGDI / RDDI DLL 逆向分析小工具
     names   <dll> [regex]                扫描文件内符号名（ASCII + UTF-16LE）
     dis     <dll> <VA|导出名> [len]      按 VA 或导出名线性反汇编（注释字符串立即数）
     hex     <dll> <VA> [len]            按 VA 十六进制转储（含 ASCII 列）
+    off     <dll> <VA> [len]            按 VA 求「节名 + 文件偏移」并转储原始字节（打补丁用）
     xref    <dll> <子串>                 找字符串及其代码引用点
     refs    <dll> <VA> [--all]           找「绝对引用某 VA」的位置（默认只扫 .text）
     slots   <dll> <起VA> <止VA> [段2...]  GetProcAddress 指针槽映射 + 调用点统计
@@ -482,6 +483,22 @@ def cmd_hex(path, va, length=256):
         print('0x%08X  %-47s  %s' % (va + i, hx, asc))
 
 
+def cmd_off(path, va, length=16):
+    """按 VA 求「所属节 + 文件偏移」，并转储原始字节（供写补丁定位用）。"""
+    pe = PE(path)
+    o = pe.va2o(va)
+    if o is None:
+        print('VA 0x%08X 不在任何节内' % va)
+        return
+    rva = va - pe.imagebase
+    sec = next((nm for nm, vaddr, vsize, raddr, rsize in pe.secs
+                if vaddr <= rva < vaddr + max(vsize, rsize)), '?')
+    data = pe.d[o:o + length]
+    print('VA 0x%08X  RVA 0x%06X  file 0x%06X  [%s]  imagebase 0x%08X'
+          % (va, rva, o, sec, pe.imagebase))
+    print('  bytes: ' + ' '.join('%02X' % b for b in data))
+
+
 # ---------------------------------------------------------------------------
 USAGE = __doc__
 
@@ -528,6 +545,12 @@ def main(argv):
             return 1
         cmd_hex(path, int(rest[0], 16),
                 int(rest[1], 0) if len(rest) > 1 else 256)
+    elif cmd == 'off':
+        if not rest:
+            print('需要 <VA>')
+            return 1
+        cmd_off(path, int(rest[0], 16),
+                int(rest[1], 0) if len(rest) > 1 else 16)
     else:
         print(USAGE)
         return 1

@@ -1,13 +1,19 @@
 # ORBMDK - ORBTrace CMSIS-DAP RDDI 驱动层
 
-ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，兼容 [elaphureLinkAGDI](https://github.com/fly2046/elaphureLinkAGDI)，使 ORBTrace 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
+> **版本 `0.5.0`**（2026-10-03）· 驱动自身发版号，定义于 `include/ORBMDK.h`（`ORBMDK_VERSION_STRING`），
+> 经 `ORBMDK_GetVersionString()` / `ORBMDK_GetVersion()` 暴露。
+> ⚠️ **与上报给 Keil 的协议版本串是两回事**：后者 = 设备 `DAP_Info(0x04)`，主版本经归一化**抬到 ≥ 2**
+> （2026-10-01 放开 SWO 流式门控，见"USB 传输实现 → WinUSB Bulk 模式"与 `COMPAT_ANALYSIS.md` §17.5），
+> **不要**与本版本号联动。发版历史见文末[版本记录](#版本记录)。
+
+ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，使 ORBTrace 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
 
 ## 架构
 
 ```
 Keil uVision (IDE)
        │
-       ▼ (通过 elaphureLinkAGDI，加载 elaphureRddi.dll,elaphureLinkAGDI就是KEIL AGDI)
+       ▼ (通过 KEIL AGDI)
    ORBMDK_RDDI.dll (RDDI 接口)
        │
        ▼
@@ -27,8 +33,8 @@ Keil uVision (IDE)
 ```
 
 **注意**:
-- **AGDI 层 = Keil 的 "CMSIS-DAP Debugger" = elaphureLinkAGDI**，三者是同一个东西；ORBMDK 仅实现其下的 RDDI 驱动层。
-- AGDI 层按固定文件名加载 RDDI 层 DLL：Keil 原版 "CMSIS-DAP Debugger" 加载 **`CMSIS_DAP.dll`**（elaphureLink 定制版为 `elaphureRddi.dll`）。ORBMDK 构建产物为 `ORBMDK_RDDI.dll`，部署时需重命名为实际生效的那个名字（见"安装"）。
+- **AGDI 层 = Keil 的 "CMSIS-DAP Debugger" ；ORBMDK 仅实现其下的 RDDI 驱动层。
+- AGDI 层按固定文件名加载 RDDI 层 DLL：Keil 原版 "CMSIS-DAP Debugger" 加载 **`CMSIS_DAP.dll`**。ORBMDK 构建产物为 `ORBMDK_RDDI.dll`，部署时需重命名为实际生效的那个名字（见"安装"）。
 
 ## 项目结构
 
@@ -43,6 +49,7 @@ ORBMDK/
 │   ├── ORBMDK_ETM_Decoder.h    # ETM 解码器
 │   ├── ORBMDK_HID.h            # USB HID 层定义
 │   ├── ORBMDK_ITM_Decoder.h    # ITM 解码器
+│   ├── ORBMDK_Log.h            # 统一日志接口
 │   ├── ORBMDK_OFLOW.h          # OFLOW 时间戳协议解码
 │   ├── ORBMDK_RDDI.h           # RDDI 接口定义（78 个导出）
 │   ├── ORBMDK_Symbols.h        # 符号解析接口 (Objdump/DWARF)
@@ -57,31 +64,58 @@ ORBMDK/
 │   ├── ORBMDK_USB_Bulk.cpp     # USB Bulk V2 传输层
 │   ├── ORBMDK_Trace.cpp        # Trace 解码器适配层
 │   ├── ORBMDK_ITM_Decoder.cpp  # ITM 解码器实现
+│   ├── ORBMDK_Log.cpp          # 统一日志实现（多 Sink / 级别热更新）
 │   ├── ORBMDK_ETM_Decoder.cpp  # ETM 解码器实现
 │   ├── ORBMDK_TPIU_Decoder.cpp # TPIU 解码器实现
 │   ├── ORBMDK_COBS.cpp         # COBS 编解码
 │   ├── ORBMDK_OFLOW.cpp        # OFLOW 协议解码
 │   ├── ORBMDK_Coverage.cpp     # 代码覆盖率分析
 │   └── ORBMDK_Symbols.cpp      # 符号解析实现
-├── deprecated/                  # 废弃文件（不参与编译）
 ├── obj/                         # 编译中间文件
-├── test/                        # 测试工具（清单见"验证"一节）
+├── test/                        # 测试 / 诊断工具（10 个 .cpp + 1 个构建脚本，清单见"验证"）
 │   ├── ORBMDK_RDDI_FullTest.cpp # 全面功能测试（40 项，含完整导出扫描）
 │   ├── ORBMDK_BlockTransferTest.cpp # 块传输提速 / 越界验证
+│   ├── ORBMDK_RAM_SpeedTest.cpp # RAM 读写吞吐（绕开 Keil/AGDI，测设备侧极限）
 │   ├── swdprobe.cpp             # SWD 通路功能回归（V2 / V1，PASS-FAIL 统计）
 │   ├── hidprobe.cpp             # CMSIS-DAP v1 (HID) 极简回归
 │   ├── jtagprobe.cpp            # JTAG 端到端（走本层 DLL）
 │   ├── jtagrawprobe.cpp         # JTAG 裸帧 + 引脚级诊断（绕开本层）
+│   ├── jtagblockprobe.cpp       # JTAG 下固件 0x06 专项复验（绕开本层，每步判活）
 │   ├── v2rawprobe.cpp           # V2 裸帧 / 包长 / 分片诊断（绕开本层）
-│   └── build_test.ps1           # 测试构建脚本（-All 重建全部）
-├── bin/                         # 编译输出
+│   ├── ifacedump.cpp            # 接口清点（列全 VID/PID 下所有接口与端点，只读）
+│   └── build_test.ps1           # 测试构建脚本（-All 重建全部，-Source 单个）
+├── tools/                       # 一次性辅助脚本（Python，不参与编译）
+│   ├── agdi_ver.py             # 从 AGDI/Keil DLL 中提取版本串
+│   ├── pe_re.py                # PE 导出表 / 节表速查（逆向辅助）
+│   ├── patch_agdi_etb.py       # 放开 `CMSIS_AGDI.dll` 的 Trace Port 下拉（改第三方二进制，实验用，见 §17.9(7)）
+│   └── _rsrc_scan.py           # 资源表 / 对话框模板 / 导入表速查（T0/T1 侦察用，临时脚本）
+├── bin/                         # 编译输出（DLL 与测试 exe 都落在这里）
 │   └── ORBMDK_RDDI.dll         # RDDI 驱动 DLL
 ├── .vscode/
 │   └── c_cpp_properties.json   # IntelliSense 配置（参数与 build.ps1 一致）
-├── build.ps1                    # PowerShell 构建脚本
+├── build.ps1                    # PowerShell 构建 / 部署脚本
 ├── README.md                    # 本文档
-└── COMPAT_ANALYSIS.md           # 兼容性分析与实现状态
+├── COMPAT_ANALYSIS.md           # AGDI 逆向分析 · ABI 兼容性结论 · 实现状态
+├── bug.md                       # 实现细节 · 缺陷定性 · 排查笔记（JTAG 相关见 B9 / B11.8）
+├── Todo.md                      # 未完成项（只列待办，不写实现细节）
+├── PATCH_orbtrace-1.4.3_JTAG_fixes.txt  # 固件侧 JTAG 可选修复补丁（基于 orbtrace 1.4.3，含完整代码）
+├── Usage.md.bak                 # 历史快照（不参与构建 / 部署）
+└── Todo.md.bak                  # 历史快照（不参与构建 / 部署）
 ```
+
+### 文档导航
+
+| 文档 | 收什么 | 什么时候看 |
+|------|--------|------------|
+| `README.md` | 构建 / 安装 / 验证 / 不可破坏的实现约束 | 上手、改代码前 |
+| `COMPAT_ANALYSIS.md` | AGDI 逆向分析、ABI 兼容性结论、历史现场记录 | 需要"为什么这么写"的依据 |
+| `bug.md` | 实现细节、缺陷定性、排查笔记（JTAG 相关见 B9 / B11.8） | 复现某现象、查根因 |
+| `Todo.md` | **只有未完成项** | 想知道还差什么 |
+| `Usage.md.bak` | 驱动的 API 使用手册（快速开始 + 各导出函数调用示例） | 想集成、或直接调本层 DLL 时 |
+| `PATCH_orbtrace-1.4.3_JTAG_fixes.txt` | 探针固件（orbtrace 门级 Verilog + Amaranth）侧的可选改动 | 想让固件侧 JTAG 通路更完备时 |
+
+> 约定（勿混）：AGDI 逆向与 ABI 结论只进 `COMPAT_ANALYSIS.md`；实现细节与排查过程只进 `bug.md`；
+> `Todo.md` 只列未完成项。固件补丁因为是**另一个仓库**的改动，单独成文件，不写进上面三份。
 
 ## 构建
 
@@ -167,41 +201,56 @@ RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指�
 
 ```powershell
 .\test\build_test.ps1 -All              # 一次重建全部工具（改完 DLL 后常用）
+.\test\build_test.ps1 -Source ifacedump.cpp   # 只建单个工具（ifacedump 不在 -All 清单内）
+
 .\bin\ORBMDK_RDDI_FullTest.exe          # 全面功能测试（40 项）
 .\bin\swdprobe.exe                      # SWD 回归：ifNo=0 (V2 / Bulk)
 .\bin\swdprobe.exe ORBMDK_RDDI.dll v1   # SWD 回归：ifNo=1 (V1 / HID)
+.\bin\jtagblockprobe.exe --skip-05 --stage 2  # JTAG 下固件 0x06 通路复验（⚠️ 可能需插拔 USB）
 ```
 
 测试程序默认从**自身所在目录**加载 `ORBMDK_RDDI.dll`（`build_test.ps1` 把 exe 与 DLL 都输出到 `bin\`），
 也可用参数显式指定：`.\bin\ORBMDK_RDDI_FullTest.exe <dll路径>`。
 
-### 测试工具清单（2026-09-30 整理）
+### 测试工具清单（2026-10-03 更新）
 
 | 工具 | 层次 | 用途 / 何时用 |
 |------|------|----------------|
 | `ORBMDK_RDDI_FullTest.exe` | 走 DLL | 全面功能测试 40 项 + 完整导出扫描；**改完 DLL 先跑它** |
 | `ORBMDK_BlockTransferTest.exe <ramAddr>` | 走 DLL | 块传输正确性与哨兵越界验证（flash 下载热路径，§13.7） |
+| `ORBMDK_RAM_SpeedTest.exe [ramAddr] [bytes] [rounds] [clockHz] [dll] [windowWords]` | 走 DLL | RAM 读写**吞吐**（绕开 Keil/AGDI，测设备侧极限）；`windowWords` 用来 A/B 切换"按 4 KB TAR 块切分"与"整块一次写完"（后者可复现 B7 缺陷） |
 | `swdprobe.exe [dll] [v1]` | 走 DLL | SWD 通路回归：导出自检 / 适配器字段 / 版本串闸门 / 假冒指针回归 / AP 寄存器解码 / halt-PC-RAM / 日志回调，末尾给出 PASS-FAIL 统计。默认 V2，加 `v1` 走 HID |
 | `hidprobe.exe` | 走 DLL | HID(V1) 极小回归（比 `swdprobe ... v1` 更快更薄） |
 | `jtagprobe.exe` | 走 DLL | JTAG 端到端：`Port=JTAG` → 扫链 → IR 长度 → DP 上电（验证**本层** JTAG 建链） |
 | `jtagrawprobe.exe` | 直连 WinUSB | JTAG 原始帧 + **引脚电平读取** + **手工位拷贝扫 TAP** + 时钟扫描；用于判定"固件 / 接线"卡在哪一层（§18.9） |
+| `jtagblockprobe.exe [选项]` | 直连 WinUSB | **JTAG 下固件 `0x06` 专项复验**：每步之后立即 Ping，判定"可用 / 未处理但存活 / 无应答"三类。⚠️ **会真的发 `0x06`**，出现无应答时**须重新插拔 USB**；默认任一步失败即停（`--no-stop` 关闭），从 `count=1` 起（`--stage N` 可只跑到第 N 步）。目标上电后**第一次连接就要用 JTAG**（本目标 SWJ-DP 的 `JTAG←SWD` 单向） |
 | `v2rawprobe.exe [pad]` | 直连 WinUSB | V2 出包长度与响应分片定标（§17.2 的"整包 = wMaxPacketSize"陷阱） |
+| `ifacedump.exe [vid] [pid]` | 只读枚举 | 列出某 VID/PID 下**所有**可见接口（WinUSB / CMSIS-DAP / HID）与端点，判断复合设备到底有几个功能口、哪个才是 DAP 通道。默认 `0D28:0204`。**不发任何 USB 命令、不改设备状态**；不在 `build_test.ps1 -All` 清单里，需 `-Source ifacedump.cpp` 单独构建 |
 
-> **直连工具会独占设备**：`jtagrawprobe` / `v2rawprobe` 运行前必须关闭 Keil（或让它退出调试会话），
-> 否则会与 µVision 抢同一个 WinUSB 接口，两侧都报错。它们会在结束前恢复 SWD 并 Disconnect。
+> **直连工具会独占设备**：`jtagrawprobe` / `jtagblockprobe` / `v2rawprobe` 运行前必须关闭 Keil
+> （或让它退出调试会话），否则会与 µVision 抢同一个 WinUSB 接口，两侧都报错。
+> `jtagrawprobe` 会在结束前恢复 SWD 并 Disconnect；**`jtagblockprobe` 默认不切回 SWD**
+> （本目标 `JTAG←SWD` 单向，切回去本上电周期内就再也进不了 JTAG），需要时用 `--restore-swd`。
 
 **改名对照（旧 → 新，2026-09-30）**：`orbprobe` / `orbprobe2` / `orbprobe3` / `ORBMDK_RDDI_Test`
 四者合并为 **`swdprobe`**；`v1probe` → **`hidprobe`**；`v2padprobe` → **`v2rawprobe`**；
 `jtagprobe2` → **`jtagrawprobe`**（`jtagprobe` 名字保留给"走本层 DLL"的那个）。
 `COMPAT_ANALYSIS.md` 的历史章节保留当时的旧文件名，属现场记录，不再逐一回改。
 
-在 ORBTrace + STM32F1 目标上实测 **40/40 全部通过**：
+**新增（2026-10-03）**：`jtagblockprobe`（JTAG 下固件 `0x06` 专项复验）、
+`ifacedump`（接口清点）、`ORBMDK_RAM_SpeedTest`（RAM 吞吐）。
+
+在 ORBTrace + STM32F1 目标上**曾**实测 **40/40 全部通过**：
 
 ```
 DAP_ReadReg(DP_IDCODE)    PASS   IDCODE: 0x2BA01477
 DAP_ReadReg(AP_IDR)       PASS   AP IDR: 0x24770011
 TEST SUMMARY: PASSED 40 / FAILED 0 / ALL TESTS PASSED
 ```
+
+> ⚠️ **当前复现结果是 `PASSED 22 / FAILED 20`**，原因是**测试程序自身**的 `DAP_REG_*` 常量与
+> `include/ORBMDK_DAP.h` 编号脱节，**不是驱动回归**（见 `COMPAT_ANALYSIS.md` §13.5）。
+> 该项已列为 0.5.0 **发版阻塞项** → `Todo.md` §**18.11**。
 
 ---
 
@@ -295,6 +344,15 @@ DAP_SWJ_Sequence(56, {0xFF×7}) → (16, {0x9E,0xE7}) → (56, {0xFF×7}) → (8
 | 4 | FAULT | `DAP_RES_FAULT`(2) |
 | 7 | NO_ACK（SWDIO 未被驱动） | `DAP_RES_NO_ACK`(3) |
 
+> 上表是 **SWD** 通路（固件透传 `swdIF` 的 ACK）。**JTAG** 通路的 ACK 不进固件的映射，
+> 由本层从 TDO 位流自行解码后走同一张表（见下节）。
+
+### JTAG 通路实现方式
+
+探针固件在 JTAG 上只当"通用位流发生器"用：本层只发 `0x14 DAP_JTAG_Sequence` 把 TMS/TDI 位流打到线上、回收 TDO，
+选 IR / 组 35 位 DR / 解码 ACK / 处理 posted read 等 ADIv5 语义全部由本层 `src/ORBMDK_RDDI.cpp` 实现
+（`DapTransferFor` 按模式分岔：SWD 走固件 `0x05`，JTAG 走本层引擎，故 `0x05`/`0x06` 与块传输在 JTAG 下一概不用）。
+
 ### 日志策略
 
 统一实现在 **`src/ORBMDK_Log.cpp`**（接口 `include/ORBMDK_Log.h`）—— 所有模块
@@ -305,7 +363,6 @@ DAP_SWJ_Sequence(56, {0xFF×7}) → (16, {0x9E,0xE7}) → (56, {0xFF×7}) → (8
 | 默认级别 | **ERROR** |
 | 行格式 | `[ORBMDK][HH:MM:SS.mmm][级别][模块][PID:TID] 消息` |
 | 过滤时机 | 在构造日志字符串**之前**判断级别，被过滤时零开销 |
-| 临时恢复（推荐） | 文件 **`%TEMP%\ORBMDK_LOG_LEVEL`**，内容 `0=DEBUG 1=INFO 2=TESTSPEED 3=VERBOSE 4=REV1 5=REV2 6=REV3 7=WARN 8=ERROR`；µVision 运行中改**最多 1 秒生效**，删掉文件即恢复默认，**不用重启 IDE** |
 | 环境变量 | `ORBMDK_LOG_LEVEL`（0–8）、`ORBMDK_LOG_FILE`（日志路径，默认 `%TEMP%\ORBMDK_RDDI.log`）；只在进程启动读一次 |
 | 命令级日志 | V1/V2 每条 DAP 命令往返按 **INFO** 级参与级别过滤、只落盘并带时间戳；阈值设为 INFO/DEBUG 时才输出，默认 ERROR 下不落盘 |
 | 宿主通道 | `RDDI_SetLogCallback` 已接通：日志会转发给 AGDI/Keil 的日志窗口（级别自动映射） |
@@ -318,59 +375,13 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 > PowerShell 下写级别文件请用 `[IO.File]::WriteAllText("$env:TEMP\ORBMDK_LOG_LEVEL","2")`，
 > 不要用 `Set-Content`（PS 5.1 默认 UTF-16，驱动按 ASCII 解析会读不出数字）。
 
-### 烧录速率统计（TESTSPEED）
-
-把级别设为 **2**（TESTSPEED），`DAP_RegWriteRepeat` / `DAP_RegReadRepeat`
-（即 AGDI 的 `SWD_WriteBlock` / `SWD_VerifyBlock` / `SWD_ReadBlock`，flash 下载与校验的真实数据通道）
-会按方向统计字节数与耗时，限流输出到 `%TEMP%\ORBMDK_RDDI.log`：
-
-```
-[ORBMDK][00:12:34.101][TESTSPEED][RDDI][8112:9012] meter config: transport=V2/Bulk speed=Full(12Mbps) cmdPkt=508 B -> 125 words/round trip, blockTransfer=on | bus ceiling ~1465 kB/s
-[ORBMDK][00:12:34.567][TESTSPEED][RDDI][8112:9012] WRITE speed: 4096 B in 7.1 ms -> 563.4 kB/s | 9 round trips, 788.9 us/trip | window wall 47.3 ms, dap 15.0% | total 65536 B in 115.0 ms (avg 556.5 kB/s, 147 trips)
-[ORBMDK][00:12:34.589][TESTSPEED][RDDI][8112:9012] READ  speed: 388 B in 0.9 ms -> 405.2 kB/s | 1 round trips, 900.0 us/trip | window wall 2.1 ms, dap 42.9% | total 1128 B in 3.9 ms (avg 279.4 kB/s, 3 trips)
-[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter segment: wall 1218.4 ms | dap 118.9 ms (9.8%) | other 1099.5 ms (90.2%) | write 65536 B (538.0 kB/s) + read 1128 B | 150 round trips
-[ORBMDK][00:12:35.291][TESTSPEED][RDDI][8112:9012] meter usb: 150 cmds, out 96.2 ms (641.3 us/cmd), in 22.7 ms (151.3 us/cmd), round trip 792.6 us/cmd
-```
-
-| 项 | 约定 |
-|----|------|
-| 统计口径 | `WRITE` = 下载写入，`READ` = 回读校验；每行给出**窗口速率**与**累计平均速率**（kB/s） |
-| 往返次数 | `round trips` = 窗口内实际发生的 USB 往返数（块传输 1 次/块，逐字回退 N 次），`us/trip` 由此得出 |
-| 计时范围 | 只含 DAP 传输段（`DAP_TransferBlock` / `DAP_Transfer` 往返），日志格式化不计入 |
-| 输出频率 | 累计 `≥ 1024 字` 或 `≥ 200 ms` 才落一行；两次调用空闲 `> 500 ms` 视为上一段烧录结束，立即结算余量 |
-| 关闭开销 | 阈值高于 TESTSPEED 时连计时都不做（`ORBMDK_LogGetLevel()` 前置判断） |
-| 失败不计 | 中途返回 `RDDI_DAP_ERROR` 的那次不统计（避免把失败路径算进速率） |
-| 配置行 | 首次计量（传输层变化会重打）输出一条 `meter config:`，给出传输层 / **端口速度** / 出包字节数 / 每次往返字数 / 块传输是否生效，以及该速度的总线理论上限 |
-| 窗口墙钟 | 速率行里的 `window wall …, dap …%`：本窗口的**真实墙钟**，以及驱动（DAP 传输）在其中的占比 |
-| 段总结 | 一段连续传输结束（空闲 > 500 ms）后补打 `meter segment:`：整段的 wall / dap / other + 双向字节与往返数。**判断瓶颈在哪一层的唯一依据**。注意它是等**下一笔传输**到来时才补打的，所以日志末尾可能少最后一段 |
-| USB 拆分 | 再补一条 `meter usb:`：累计命令数，以及 OUT（发命令）与 IN（收响应）各自的耗时与每命令均值 |
-
-> **怎么读这几行**（实测样本，见 COMPAT_ANALYSIS）：
-> - **先看 `meter segment` 的 dap%**：实测一次下载里驱动只占 **~10–15%**，其余（other）在 AGDI 与
->   目标端 flash 算法。把传输优化到 0，整体也只能快这么多 —— 所以"加速"的第一问是
->   **瓶颈到底在不在这一层**，而不是埋头抠 USB。
-> - **再看 `meter usb` 的 out/in**：`out ↑` = 时间花在把命令包搬上线；`in ↑` = 设备应答慢
->   （SWD 时钟 / flash 算法），驱动层改什么都没用。
-> - `us/trip` 必须与 `words/round trip` 一起看。两组实测摆在一起：`出包 64 B / 14 字 → ~95 µs/往返`、
->   `出包 508 B / 125 字 → ~789 µs/往返`。往返耗时几乎正比于**出包字节数**（≈1.55 µs/字节），
->   即**每个 64 字节包固定约 95 µs**，其中只有 ~43 µs 是 Full Speed 的真实线时间，
->   剩下 **~52 µs 是每包的固定开销**。
->   ⇒ 再靠"每次往返多带几个字"已经榨不出东西（总字节数没变），只能**让每个字节更便宜**：
->   把链路从 Full Speed 换成 High Speed（512 B 包，同样 508 字节只需 1 个包）。
-> - `bus ceiling` 是给对照用的：实测已贴着它 = 被物理层卡死；实测只有它的 ~40%
->   （FS 下 5 字/µs 量级）时，才值得回头查驱动与端点调度。
-> - **日志时间戳的间隔 ≠ 计量时间**：窗口计量 7.1 ms，两行时间戳却相差 ~47 ms —— 差值就是
->   AGDI / 目标侧的时间。`window wall` 与 `meter segment` 现在直接把它打出来了。
-> - 需要传输层的详细枚举/标定过程（`[BULK]` 行）时，阈值要放到 **1(INFO) 或 0(DEBUG)** ——
->   `ORBMDK_LogTrace` 按 INFO 级过滤，阈值 2 会把 `[BULK]` 全部丢掉。
-
 ---
 
 ## 功能
 
 ### 支持的调试协议
 - **SWD** (Serial Wire Debug)
-- **JTAG**
+- **JTAG** - 扫链 / 多 TAP 器件枚举 / DP+AP 访问；IR/DR 时序由本层位流引擎生成（见["JTAG 通路实现方式"](#jtag-通路实现方式)）
 - **USB HID V1** - 标准 CMSIS-DAP
 - **USB Bulk V2** - 高速传输 (WinUSB) ✅ 已实现
 
@@ -378,7 +389,6 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - 内存读写（字节、半字、字、块）
 - 核心寄存器访问
 - 目标复位
-- 电源控制
 - **Trace 数据采集** (ITM/ETM/SWO/TPIU)
 - **PC 采样** (ETM/ITM PC Sampling) ✅ 已实现
 
@@ -538,9 +548,11 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - 选谁就必须是谁：选中的通道打不开时**直接报错**，绝不静默换到另一条
   （静默降级会把"V2 坏了"伪装成"能用"，详见 `COMPAT_ANALYSIS.md` §17.4）。
 - `RDDI_Open` 阶段（用户尚未选定接口）按"V2 优先、不可用才 V1"先打开一条。
-- `Firmware Version` 一栏固定上报驱动自持的 `1.0.0`（**不是**设备自报值）：设备自报的
-  `2.1.0`（主版本 2）会让 Keil/AGDI 切到一条走不通的"多 DAP 设备"分支，表现为
-  `RDDI-DAP Error`（单变量对照实验见 §17.5）。设备真实版本仍会写进日志。
+- `Firmware Version` 一栏上报**设备自报的 `DAP_Info(0x04)` 协议版本串**，但**主版本被归一化抬到 ≥ 2**
+  （设备自报 `2.1.0` → 上报 `2.1.0`；自报 `1.x` → 抬成 `2.x`；问不到设备才兜底 `1.0.0`）。原因：AGDI 对该串
+  做 `cmp eax,2`，主版本 ≥ 2 才会进入 SWO 流式的 `TraceTransport=Stream`（还需 caps `0x40`）+ streaming sink
+  注册分支 —— 这半门控与 caps `0x40` **必须同侧**，2026-10-01 已一并**放开**（§17.5 / `Todo.md.bak` §18.10-C）。
+  设备真实版本原串仍会写进日志。
 
 > V2 的 DAP 命令包按**端点 wMaxPacketSize** 发送（orbtrace 实测 = 64 字节）。
 > 出包长度由驱动**自动标定**：先用短包(64)向设备问 `DAP_Info(0xFF)` 拿它自报的
@@ -571,17 +583,6 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - 支持 1-4 字节 PC 值 (小端序)
 
 ---
-
-## 与 elaphureLink 的关系
-
-本项目基于 elaphureLink 的架构设计，提供独立的 RDDI 驱动层：
-
-| 组件 | 来源 |
-|------|------|
-| AGDI 层 | [elaphureLinkAGDI](https://github.com/fly2046/elaphureLinkAGDI) |
-| RDDI 驱动层 | ORBMDK (本项目) |
-
-ORBMDK 专注于底层通信和协议实现，与 AGDI 层解耦。
 
 ## 开发
 
@@ -617,13 +618,41 @@ ORBMDK 专注于底层通信和协议实现，与 AGDI 层解耦。
                   应用数据输出
 ```
 
+## 版本记录
+
+### 0.5.0（2026-10-03）—— 首次文档化发版
+
+**功能**
+
+- V1(HID) / V2(Bulk) 双传输层，Keil 适配器列表里可选可切换；**V2 已实机可用**（完整调试 + 下载）。
+- SWD / JTAG 双通路建链（JTAG 只用固件通用位流命令 `0x14`，ADIv5 语义全部在本仓库实现）。
+- 块传输（`DAP_TransferBlock`）能力探测 + 逐字校验，**适用 SWD**；JTAG 侧禁用（实测会挂死探针）。
+- PC 采样（DWT/ITM）、Trace 解码骨架（ITM / ETM / TPIU）、符号解析（PDB / DWARF）。
+- 统一日志子系统：多 Sink、`%TEMP%\ORBMDK_LOG_LEVEL` 热更新、宿主日志回调。
+- **78 个** RDDI 导出函数；静态 CRT（`/MT`），产物零运行库依赖。
+
+**已知限制 / 未完成**（完整清单见 [`Todo.md`](Todo.md)）
+
+- `ORBMDK_RDDI_FullTest` 因**测试自身**常量陈旧，复现为 `22/20`（**发版阻塞**，§18.11）。
+- `Trace Enable` 走不通：探针固件 1.4.3 **无 SWO 命令族**（定性见 `bug.md` **B12**），需刷 1.4.4。
+- 多调试器并存时无法指定目标；设备拔出无探活。
+- 并列 Trace 端口 / ETB 在 AGDI v1.33.24 里**无代码路径**（建议结案）。
+
+**兼容性**
+
+- 宿主：Keil µVision + 官方 `CMSIS_AGDI.dll` **v1.33.24**（行为逆向见 [`COMPAT_ANALYSIS.md`](COMPAT_ANALYSIS.md)）。
+- 探针固件：**orbtrace 1.4.3**（1.4.4 命令层差异清单见 `bug.md` B10-D）。
+- 编译器：MSVC（静态 CRT）；MinGW-w64 GCC 与 VS2013 及更早**不支持**。
+
+> 版本号定义于 `include/ORBMDK.h`（`ORBMDK_VERSION_STRING`）；
+> **与"上报给 Keil 的协议版本串"无关**（后者是 CMSIS-DAP 协议版本，来源 = 设备 `DAP_Info(0x04)`，
+> 主版本归一化抬到 ≥ 2，见 `COMPAT_ANALYSIS.md` §17.5）。
+
 ## 参考资料
 
 - [CMSIS-DAP 规范](https://arm-software.github.io/CMSIS_5/DAP/html/index.html)
 - [ARM Debug Interface 规范](https://developer.arm.com/documentation/ihi0031/latest/)
-- [elaphureLink 项目](https://github.com/elaphureLink/elaphureLink)
-- [elaphureLinkAGDI 项目](https://github.com/fly2046/elaphureLinkAGDI)
-- [ORBTrace 项目](https://github.com/orbcode/orbtrace)
+- [ORBTrace 项目](https://github.com/orbcode/orbtrace) —— 探针固件；JTAG 通路只用它的通用位流命令 `0x14`，ADIv5 语义全部在本仓库实现（见["JTAG 通路实现方式"](#jtag-通路实现方式)），固件侧可选改动见 [`PATCH_orbtrace-1.4.3_JTAG_fixes.txt`](PATCH_orbtrace-1.4.3_JTAG_fixes.txt)
 - [orbuculum 项目](https://github.com/orbcode/orbuculum) - Trace 解码参考
 
 ## 许可证

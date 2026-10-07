@@ -109,6 +109,48 @@ int DAP_ConfigureSWD(uint8_t config);
 
 // Core DAP Operations
 int DAP_Transfer(int dapId, uint8_t request, uint32_t* data);
+
+// 多笔传输（CMSIS-DAP DAP_Transfer 的 count>1 形式）：
+//   请求：[0x05][dapId][count] [req0][extra0(4B, 视请求位)] [req1]...
+//   响应：[报告ID][0x05][实际完成笔数][Transfer Response][读笔数据依次排列]
+//
+// 一笔 = 一个请求字节 + 可选 4 字节。**请求位置 1（写笔）或位 4/位 5（匹配/掩码）时
+// 都跟 4 字节**，语义按位区分：
+//   bit1 = RnW        ：0=写（4 字节 = 写数据）、1=读（结果按顺序回填 rdata）
+//   bit4 = MATCH_VALUE：读笔，4 字节 = **匹配值**（固件会按 match_retry 内部重试）
+//   bit5 = MATCH_MASK ：伪写笔，4 字节 = **匹配掩码**（只更新固件状态，不做总线访问）
+//
+// ⚠ 四条语义已对**两家固件源码**逐一核实，**一致**（orbtrace `cmsis_dap.py` / CherryDAP `DAP/Source/DAP.c`）：
+//   1) 固件的比较式是 `(data & match_mask) != match_value` —— **匹配值不参与掩码**，
+//      所以主机必须传"已与掩码相与后的期望值"（DAP.c:782 / cmsis_dap.py:973）；
+//   2) `MATCH_MASK` 是**持久状态**（不在单笔上生效），要单独发一笔，且一直有效到下次改写
+//      （DAP.c:864-867 / cmsis_dap.py:894-903）；
+//   3) 失配时固件 `break`，**中断后续笔**，且失配那笔不计入 respCount
+//      （DAP.c:783-788,890 / cmsis_dap.py:975-980）；
+//   4) ★ **匹配读不回数据**：`MATCH_VALUE` 分支结束后直接出循环，"Store data" 只在
+//      **普通读**分支里（DAP.c:832-836 vs :755-788 / cmsis_dap.py:995-1012）。⇒ 主机**不能**
+//      用匹配读来取值，它只能用于"等待条件成立"。实测确认：`done=2` 且无失配位，但读回全 0。
+//      （因此"把 WaitForValue 编进批量"这条路在 HSLinkPro 上走不通，见 §9.6。）
+//
+// count>1（多笔）**两家固件都支持**：orbtrace `transferTCount` 为 8 bit（≤255，
+//   cmsis_dap.py:198,776），CherryDAP 亦同。本层 `DAP_TransferMultiMax()` 远低于该上限
+//   （V1/HID 12、V2/511 B 101），故不受固件侧限制。
+//
+// 返回与 DAP_Transfer 同一套 DAP_RES_*（失配 → DAP_RES_VALUE_MISMATCH）。
+// ⚠ 本层**只用它走 SWD 会话**：实测 CherryDAP 在 JTAG 下不回 `DAP_Transfer(0x05)`
+//   （见 COMPAT_ANALYSIS §18.9）；orbtrace 其实两者都处理（`cmsis_dap.py` 的 isJTAG 分支），
+//   但这里保守起见不区分 —— JTAG 走 `DAP_JTAG_Sequence`，不受影响。
+typedef struct {
+    uint8_t  request;   // 请求字节（见上）
+    uint32_t data;      // 写数据 / 匹配值 / 匹配掩码（不需要时为 0）
+} DAP_XferItem;
+
+int DAP_TransferMulti(int dapId, const DAP_XferItem* items, int count,
+                      uint32_t* rdata, int* respCount);
+
+/// 一条 DAP_Transfer 命令最多能带几笔（按当前出包长度：V1/HID = 12，V2/511 B = 101）
+int DAP_TransferMultiMax(void);
+
 int DAP_TransferBlock(int dapId, uint16_t count, uint8_t request, const uint32_t* writeData, uint32_t* readData);
 int DAP_TransferAbort(int dapId);
 int DAP_WriteAbort(int dapId, uint32_t abort);

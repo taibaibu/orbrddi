@@ -139,7 +139,11 @@ Write-Host ""
 # 用 VS2022(14.4x) 编译却跑在 14.29 上会直接崩在 MSVCP140.dll（0xc0000005）。
 # /MT 让本 DLL 不再依赖 MSVCP140/VCRUNTIME140/UCRT，宿主进程里是哪个版本都无所谓。
 # RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指针），静态 CRT 是安全的。
-$CompilerFlags = "/c /nologo /MT /W3 /EHsc /std:c++17 /utf-8"
+#
+# /O2（最大化速度）：脚本原先没写任何 /O*，MSVC 默认是 /Od（禁用优化，cl /? 里标注"默认"）。
+# 实测瓶颈在 USB 往返（150~600 µs/次），CPU 侧只是 ns 级 —— 开 /O2 属"顺手拉满"，**不是提速手段**。
+# 排障若想单步/断点更直观，去掉 /O2 即回到 /Od（只改这一处，其他开关都不用动）。
+$CompilerFlags = "/c /nologo /O2 /MT /W3 /EHsc /std:c++17 /utf-8"
 $CompilerFlags += " /D_WINDOWS /D_USRDLL /DORBMDK_EXPORTS /DWIN32 /D_WINDLL"
 $CompilerFlags += " /DNOMINMAX /DWIN32_LEAN_AND_MEAN"
 $CompilerFlags += " /D_CRT_SECURE_NO_WARNINGS"  # 禁用 deprecated 警告

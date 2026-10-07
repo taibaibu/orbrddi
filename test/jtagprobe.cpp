@@ -6,6 +6,10 @@
 // Preconditions: the target board MUST have TDI/TDO physically wired (SWD-only boards
 //   can never work; the log then stops at "scan returned no IDCODE (TDI/TDO unconnected?)").
 //
+// 2026-10-03: GetIDCODEs 曾只回报 DP 一个（count=1），与 GetIRLengths 的 count=2 不一致，
+// Keil 因此只画 1 行。已修复：JTAG 模式下按扫链结果逐 TAP 回报（src/ORBMDK_RDDI.cpp
+// DetectTargetDapIdList），本工具现在两者一致（count=2，id 含 0x4BA00477 + 0x06413041）。
+//
 // Build: powershell -File test\build_test.ps1 -Source jtagprobe.cpp
 // Run  : bin\jtagprobe.exe            (board connected and powered)
 //
@@ -32,8 +36,20 @@ typedef int (*PFN_CMSIS_DAP_JTAG_GetIRLengths)(RDDIHandle, int*, uint8_t*);
 typedef int (*PFN_CMSIS_DAP_JTAG_GetIDCODEs)(RDDIHandle, int*, uint32_t*);
 typedef int (*PFN_DAP_ReadReg)(RDDIHandle, const int, const int, int*);
 typedef int (*PFN_DAP_WriteReg)(RDDIHandle, const int, const int, const int);
+/* 批量自检用（2026-10-03 新增；验证 ORBMDK_RDDI.cpp 的 JtagApWriteBurst） */
+typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, const int, const int, const int, const int*);
+typedef int (*PFN_DAP_RegReadRepeat)(RDDIHandle, const int, const int, const int, int*);
 
 #define RID_DP_CTRLSTAT 1
+#define RID_DP_SELECT   2
+#define RID_AP_CSW      4   /* 低 16 位编号：AP A[3:2]=0 */
+#define RID_AP_TAR      5   /* 低 16 位编号：AP A[3:2]=1 */
+#define RID_AP_DRW      7   /* 低 16 位编号：AP A[3:2]=3 */
+#define RID_RnW         0x00010000
+/* CSW = Size[2:0]=2(32 位) | AddrInc[5:4]=01(**单步自增**，OpenOCD 的 ADDRINC_SINGLE)
+   | DeviceEn(0x20000000) | HPROT。注意：0x42 的 AddrInc=00 是"不自增"（所有访问同地址），
+   首跑失败（read[0]==pattern[N-1]、恰 1 字一致）即此症状。 */
+#define CSW_32BIT_INCR  0x23000052
 
 // ---------------------------------------------------------------------------
 // Stage tracking + watchdog
@@ -206,6 +222,10 @@ int main(int argc, char** argv)
         (PFN_CMSIS_DAP_JTAG_GetIDCODEs)GetProcAddress(dll, "CMSIS_DAP_JTAG_GetIDCODEs");
     PFN_DAP_ReadReg pRd = (PFN_DAP_ReadReg)GetProcAddress(dll, "DAP_ReadReg");
     PFN_DAP_WriteReg pWr = (PFN_DAP_WriteReg)GetProcAddress(dll, "DAP_WriteReg");
+    PFN_DAP_RegWriteRepeat pWrRepeat =
+        (PFN_DAP_RegWriteRepeat)GetProcAddress(dll, "DAP_RegWriteRepeat");
+    PFN_DAP_RegReadRepeat pRdRepeat =
+        (PFN_DAP_RegReadRepeat)GetProcAddress(dll, "DAP_RegReadRepeat");
     Stage(2, "GetProcAddress done: Open=%p Close=%p Cfg=%p Num=%p Conn=%p Irl=%p Ids=%p Rd=%p Wr=%p",
           (void*)pOpen, (void*)pClose, (void*)pCfg, (void*)pNum, (void*)pConn,
           (void*)pIrl, (void*)pIds, (void*)pRd, (void*)pWr);
@@ -282,6 +302,88 @@ int main(int argc, char** argv)
         int v = 0;
         const int rcAp = pRd(h, 0, 7 /*AP bank0xF reg0xC = IDR*/, &v);
         Stamp("   AP_IDR rc=%d = 0x%08X (expect 0x24770011)", rcAp, (unsigned)v);
+    }
+
+    // -----------------------------------------------------------------------
+    // JTAG burst write/read self-check (added 2026-10-03).
+    // Verifies ORBMDK_RDDI.cpp:JtagApWriteBurst (many 36-bit DR writes packed into
+    // ONE ID_DAP_JTAG_SEQUENCE) end-to-end, without Keil:
+    //     DP SELECT=0 -> AP TAR=base -> DAP_RegWriteRepeat(AP DRW, N)
+    //                 -> DAP_RegReadRepeat(AP DRW|RnW, N) -> compare word by word.
+    // N=60 is the pure burst path (V2/Bulk limit); N=61 additionally exercises the
+    // "burst + single-word tail" fallback. Both stay inside the 20 KB SRAM.
+    // -----------------------------------------------------------------------
+    Stage(11, "JTAG burst write/read self-check ...");
+    if (pWrRepeat && pRdRepeat) {
+        const int cases[2] = { 60, 61 };
+        for (int c = 0; c < 2; ++c) {
+            const int n = cases[c];
+            int pattern[64] = {0};
+            int back[64]    = {0};
+            for (int i = 0; i < n; ++i) {
+                pattern[i] = (int)(0xA5A50000u | (unsigned)i);
+            }
+            const unsigned base = 0x20000000u + (unsigned)(c * 0x1000);
+            const int rcSel = pWr(h, 0, RID_DP_SELECT, 0);
+            /* 必须先配 CSW：32 位 + **自增**，否则每个字都写/读同一地址（见上方说明） */
+            const int rcCsw = pWr(h, 0, RID_AP_CSW, (int)CSW_32BIT_INCR);
+            int cswBack = 0;
+            pRd(h, 0, RID_AP_CSW, &cswBack);
+            const int rcTar = pWr(h, 0, RID_AP_TAR, (int)base);
+
+            const ULONGLONG t0 = GetTickCount64();
+            const int rcW = pWrRepeat(h, 0, n, RID_AP_DRW, pattern);
+            const ULONGLONG dtW = GetTickCount64() - t0;
+            /* 写完 N 字后 TAR 已自增到块尾，读之前必须拉回 base */
+            pWr(h, 0, RID_AP_TAR, (int)base);
+            const ULONGLONG t1 = GetTickCount64();
+            const int rcR = pRdRepeat(h, 0, n, RID_AP_DRW | RID_RnW, back);
+            const ULONGLONG dtR = GetTickCount64() - t1;
+
+            int bad = 0;
+            int firstBad = -1;
+            for (int i = 0; i < n; ++i) {
+                if (back[i] != pattern[i]) {
+                    if (firstBad < 0) firstBad = i;
+                    ++bad;
+                }
+            }
+            const double kBw = (dtW > 0) ? (double)(n * 4) / (double)dtW : 0.0;
+            const double kBr = (dtR > 0) ? (double)(n * 4) / (double)dtR : 0.0;
+            Stamp("   N=%d @0x%08X  sel=%d csw=%d(0x%08X) tar=%d  "
+                  "W rc=%d (%llu ms, %.0f kB/s)  R rc=%d (%llu ms, %.0f kB/s)  mismatch=%d",
+                  n, base, rcSel, rcCsw, (unsigned)cswBack, rcTar, rcW,
+                  (unsigned long long)dtW, kBw, rcR, (unsigned long long)dtR, kBr, bad);
+            if (firstBad >= 0) {
+                Stamp("   first mismatch at word %d: wrote 0x%08X read 0x%08X",
+                      firstBad, (unsigned)pattern[firstBad], (unsigned)back[firstBad]);
+                char dump[512] = {0};
+                int off = 0;
+                for (int i = 0; i < 8 && i < n; ++i) {
+                    off += snprintf(dump + off, sizeof(dump) - off, " [%d]w=%08X r=%08X%s",
+                                    i, (unsigned)pattern[i], (unsigned)back[i],
+                                    (pattern[i] == back[i]) ? "" : "!");
+                }
+                Stamp("   head:%s", dump);
+                char d2[512] = {0};
+                int o2 = 0;
+                for (int i = 0; i < 8; ++i) {
+                    pWr(h, 0, RID_AP_TAR, (int)(base + (unsigned)i * 4u));
+                    int v = 0;
+                    pRd(h, 0, RID_AP_DRW | RID_RnW, &v);
+                    o2 += snprintf(d2 + o2, sizeof(d2) - o2, " @%d=%08X", i, (unsigned)v);
+                }
+                Stamp("   mem:%s", d2);
+            }
+            Stamp("   => %s", (rcW == 0 && rcR == 0 && bad == 0)
+                                  ? "[PASS] burst write/read consistent"
+                                  : "[FAIL] burst self-check failed");
+            if (rcW != 0 || rcR != 0 || bad != 0) {
+                rc = 3;
+            }
+        }
+    } else {
+        Stamp("   (DAP_RegWriteRepeat/DAP_RegReadRepeat not exported -> skipped)");
     }
 
     Stage(11, "RDDI_Close ...");

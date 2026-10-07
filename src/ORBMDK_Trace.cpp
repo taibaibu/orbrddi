@@ -454,7 +454,7 @@ void ORBMDK_Trace_SetAltAddrEncode(ORBMDK_Trace_Handle handle, bool usingAlt)
 // 的 TraceBaudrate= 驱动（见 ORBMDK_RDDI.cpp 的 CMSIS_DAP_ConfigureDebugger）。
 //
 // 为什么不再留成空函数：空函数会让人以为"波特率根本没被配置"，进而改错层
-// （Todo.md §18.10-C 阶段 3 专门点了这一条）。
+// （Todo.md.bak §18.10-C 阶段 3 专门点了这一条）。
 void ORBMDK_Trace_SWO_SetBaud(ORBMDK_Trace_Handle handle, uint32_t clock, uint32_t baud)
 {
     if (!handle) return;

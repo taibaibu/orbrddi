@@ -27,11 +27,16 @@
 #define ORBMDK_INTERNAL                 // 静态库或直接包含时不导出
 #endif
 
-// Version info
-#define ORBMDK_VERSION_MAJOR  1
-#define ORBMDK_VERSION_MINOR  0
+// Version info —— 驱动自身发版号（0.5.0）
+//
+// ⚠ 与下面"上报给宿主的版本串"（Identify(idNo=4) / DAP_Info 那条）**是两回事**：
+//   那条是 **CMSIS-DAP 协议版本**，主版本经归一化**抬到 >= 2**（§17.5/§17.6 的那道门控，
+//   2026-10-01 放开，见 Todo.md.bak §18.10-C），**不要**与本版本号联动。
+//   本版本号只经 ORBMDK_GetVersionString() / ORBMDK_GetVersion() 暴露，AGDI 不使用。
+#define ORBMDK_VERSION_MAJOR  0
+#define ORBMDK_VERSION_MINOR  5
 #define ORBMDK_VERSION_PATCH  0
-#define ORBMDK_VERSION_STRING "1.0.0"
+#define ORBMDK_VERSION_STRING "0.5.0"
 
 // ----------------------------------------------------------------------------
 // 上报给宿主的版本串（Identify(idNo=4) / DAP_Info）
@@ -61,9 +66,10 @@
 //   - 主版本 < 2      -> 提升为 2，次版本/修订号原样保留（1.1.0 -> 2.1.0）
 //   - 主版本 ≥ 2      -> 原样上报
 // 注意这里是"提升"而不是"照抄"：门控只看主版本，不提升则 streaming 分支永远不会被
-// 触发。⚠ 因为 0x04 是**协议版本**，这一步等于对主机抬协议版本（故意行为，回退步骤见
-// 本文件头那段 ⚠）。兜底常量仍是 "1.0.0"（主版本 1）—— 两侧口径**故意不同**，原因见
-// src/ORBMDK_RDDI.cpp 里 kFallbackFirmwareVersion 上方。
+// 触发。⚠ 因为 0x04 是**协议版本**，这一步等于对主机抬协议版本（**故意的**；2026-10-01
+// 放开 SWO 流式门控，回退判据与步骤见 Todo.md.bak §18.10-C「判死条件与回退」）。兜底常量
+// 仍是 "1.0.0"（主版本 1）—— 那是"问不到设备"的兜底，与"设备报 1.x 也被抬高"不同侧，
+// 原因见 src/ORBMDK_RDDI.cpp 里 kFallbackFirmwareVersion 上方。
 static inline void ORBMDK_NormalizeProtocolVersion(const char* raw, char* out, size_t outLen)
 {
     if (!out || outLen == 0) {
