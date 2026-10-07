@@ -40,10 +40,25 @@ int main(int argc, char** argv)
     }
 
     RDDIHandle h = 0;
-    printf("RDDI_Open           -> %d (handle=%d)\n", pOpen(&h, NULL), h);
+    int rc = pOpen(&h, NULL);
+    printf("RDDI_Open           -> %d (handle=%d)\n", rc, h);
+    if (rc != 0) {
+        printf("RDDI_Open failed - nothing to test, aborting\n");
+        return 1;
+    }
 
     char cfg[] = "Port=SW;SWJ=Y;Clock=1000000;";
-    printf("ConfigureInterface  -> %d  (ifNo=1 = CMSIS-DAP v1 / HID)\n", pCfg(h, 1, cfg));
+    rc = pCfg(h, 1, cfg);
+    printf("ConfigureInterface  -> %d  (ifNo=1 = CMSIS-DAP v1 / HID)\n", rc);
+    if (rc != 0) {
+        // 配置失败即退出：通道此时可能已停在被选中的 HID 上，继续发命令只会
+        // 刷屏一堆 -5 读超时、并把通道打成熔断，反而淹没关键日志。
+        printf("ConfigureInterface failed (3 = RDDI_FAILED) - aborting\n"
+               "  If this device has no v1/HID DAP, select the ifNo=0 (bulk) adapter\n"
+               "  instead, e.g. bin\\swdprobe.exe (defaults to V2).\n");
+        pClose(h);
+        return 3;
+    }
 
     int nd = 0;
     printf("DetectNumberOfDAPs  -> %d (noOfDAPs=%d)\n", pNum(h, &nd), nd);

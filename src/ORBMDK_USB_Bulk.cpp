@@ -231,6 +231,18 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
     }
 
     if (pref != USB_BULK_TRANSPORT_HID) {
+        // 与 V1 分支对称："接口能打开" ≠ "接口在讲 CMSIS-DAP"。
+        // 放开 VID/PID 之后，枚举可能选中别的厂商的 0xFF 接口（也绑了 WinUSB、
+        // 也有 Bulk 对）。不在这里问一句，错误会一路拖到第一条命令读超时才爆，
+        // 现场表现就成了"探针不响应"，而不是"这台设备不是 DAP"。
+        char v2fw[64] = {};
+        if (DAP_GetInfo(DAP_INFO_FIRMWARE, v2fw, sizeof(v2fw)) <= 0 || v2fw[0] == '\0') {
+            BulkTrace("SelectInterface: ifNo=0 (bulk) 打开成功但对 DAP_Info 无有效应答 "
+                      "-> 该接口不是 CMSIS-DAP");
+            ORBMDK_DapChannelReset("V2 接口不是 CMSIS-DAP");
+            return -1;
+        }
+        BulkTrace("SelectInterface: ifNo=0 (bulk) DAP 自检通过 (fw='%s')", v2fw);
         return 0;
     }
 
@@ -509,6 +521,41 @@ static bool _parseVidPidFromPath(const char* path, uint16_t* vid, uint16_t* pid)
 }
 
 /**
+ * @brief 该接口的 CompatibleIds 是否表明它是 class 0xFF(vendor-specific) 接口
+ *
+ * 典型值（hslinkpro 0D28:0204 的 MI_00/MI_04）：
+ *     "USB\COMPAT_VID_0d28&Class_ff&SubClass_00&Prot_00"
+ *
+ * 用途：在第 2 趟（放开 VID/PID 之后）**打开之前**把无关的 WinUSB 接口筛掉。
+ * 系统里有几十个 WinUSB 接口，逐个 CreateFile 既慢、又会打扰其它正在用的设备。
+ *
+ * 拿不到该属性时返回 true（保守放行）——宁可多试一个，也不能漏掉真设备；
+ * 真正的把关在打开之后：接口类必须 0xFF 且必须有 Bulk IN/OUT 对。
+ */
+static bool _compatibleIdIsVendorClass(HDEVINFO deviceInfoSet,
+                                       SP_DEVINFO_DATA* devInfoData)
+{
+    char  buf[1024] = {};
+    DWORD type = 0, need = 0;
+    if (!SetupDiGetDeviceRegistryPropertyA(deviceInfoSet, devInfoData,
+            SPDRP_COMPATIBLEIDS, &type, (PBYTE)buf, sizeof(buf) - 1, &need)) {
+        return true;                       // 读不到 -> 不预筛
+    }
+
+    const DWORD n = (need > 0 && need <= sizeof(buf)) ? (need - 1) : (DWORD)strlen(buf);
+    for (DWORD i = 0; i < n; ++i) {
+        const char c = buf[i];
+        if (c == '\0') {                   // MULTI_SZ 的项分隔符 -> 便于整体搜索
+            buf[i] = '|';
+        } else if (c >= 'A' && c <= 'Z') {
+            buf[i] = (char)(c - 'A' + 'a');
+        }
+    }
+    buf[n] = '\0';
+    return strstr(buf, "class_ff") != nullptr;
+}
+
+/**
  * @brief 在指定接口 GUID 下查找并打开目标设备
  *
  * @param guid          设备接口 GUID（V2 必须用 CMSIS-DAP 专用 GUID）
@@ -546,8 +593,19 @@ static bool _findAndOpenDeviceInGuid(const GUID* guid, uint16_t vid, uint16_t pi
     // 而且不返回任何错误 —— 这正是之前 WinUSB / CMSIS-DAPv2 两个 GUID 都
     // "枚举到 0 个候选"的原因（当时这里还硬编码着 USB_GUID_DEVINTERFACE，
     // 只有第三轮碰巧一致才拿到候选）。独立测试程序传同一 GUID 则完全正常。
-    for (DWORD index = 0; SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL,
-                guid, index, &deviceInterfaceData); index++) {
+    // 两趟扫描：第 1 趟只认"首选"设备（ORBMDK.h 首选表），第 2 趟才放宽到
+    // 任何像 CMSIS-DAP v2 的 vendor 接口。用同一个 enumerator，换趟时 index 归零，
+    // 于是循环体缩进与原来的单趟写法完全一致。
+    int  pass  = 0;
+    DWORD index = 0;
+    while (pass < 2 && !deviceOpened) {
+        if (!SetupDiEnumDeviceInterfaces(deviceInfoSet, NULL,
+                guid, index, &deviceInterfaceData)) {
+            ++pass;                        // 本趟枚举完 -> 换下一趟（或退出）
+            index = 0;
+            continue;
+        }
+        ++index;
 
         // 获取设备详情大小
         SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData,
@@ -565,9 +623,14 @@ static bool _findAndOpenDeviceInGuid(const GUID* guid, uint16_t vid, uint16_t pi
 
         deviceDetailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
 
+        // 带出 devnode：第 2 趟要靠它读 CompatibleIds 预筛 class 0xFF
+        SP_DEVINFO_DATA devInfoData = {};
+        devInfoData.cbSize = sizeof(devInfoData);
+
         // 获取设备路径
         if (!SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &deviceInterfaceData,
-                                             deviceDetailData, detailSize, NULL, NULL)) {
+                                             deviceDetailData, detailSize,
+                                             NULL, &devInfoData)) {
             free(deviceDetailData);
             continue;
         }
@@ -582,12 +645,18 @@ static bool _findAndOpenDeviceInGuid(const GUID* guid, uint16_t vid, uint16_t pi
             free(deviceDetailData);
             continue;
         }
-        // vid/pid 非 0 = 调用方指定；为 0 = 按 ORBMDK.h 的支持列表匹配。
-        // 原先只认 1209:3443，CherryUSB 等 0D28:0204 设备连候选都进不来。
-        const bool matched = (vid != 0 && pid != 0)
-                                 ? (pathVid == vid && pathPid == pid)
-                                 : ORBMDK_IsSupportedDevice(pathVid, pathPid);
-        if (!matched) {
+        // ---- 准入条件（不再依赖 VID/PID 白名单）----
+        //   pass 0：首选表命中（调用方显式指定 vid/pid 时即该设备）
+        //   pass 1：其余接口，但必须"像 CMSIS-DAP v2"（CompatibleIds 含 class_ff）
+        //           —— 打开后还有真正的把关：接口类 0xFF + Bulk IN/OUT 对 + DAP 自检
+        const bool preferred = (vid != 0 && pid != 0)
+                                   ? (pathVid == vid && pathPid == pid)
+                                   : ORBMDK_IsPreferredDevice(pathVid, pathPid);
+        if (preferred != (pass == 0)) {
+            free(deviceDetailData);
+            continue;
+        }
+        if (pass == 1 && !_compatibleIdIsVendorClass(deviceInfoSet, &devInfoData)) {
             free(deviceDetailData);
             continue;
         }
@@ -791,11 +860,11 @@ static bool _findAndOpenDevice(uint16_t vid, uint16_t pid, const char* serial)
         BulkTrace("guid %s: %d candidate(s)", names[i], candidates - before);
     }
 
-    // 汇总行：candidates=0 说明三种 GUID 下都没有匹配 vid/pid（或支持列表）的
-    // 接口路径，问题在枚举（设备未插 / 驱动未装），而不是在打开或驱动绑定。
+    // 汇总行：candidates=0 说明三种 GUID 下都没有"首选命中或 class 0xFF"的接口
+    // 路径，问题在枚举（设备未插 / 未绑 WinUSB），而不是在打开或驱动绑定。
     BulkTrace("enumeration done: %d candidate(s) (vid=0x%04X pid=0x%04X%s), opened=%d",
               candidates, vid, pid,
-              (vid && pid) ? "" : " => 按支持列表匹配", (int)opened);
+              (vid && pid) ? "" : " => 首选表优先 + 能力匹配(class 0xFF)", (int)opened);
     return opened;
 }
 
@@ -1122,7 +1191,7 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
     // 仍是旧 DLL（已部署但 µVision 没重启），不要据此判断设备问题。
     BulkTrace("Init: entered (vid=0x%04X pid=0x%04X serial='%s'%s)",
               vid, pid, serial ? serial : "",
-              (vid && pid) ? "" : " [auto: 按支持列表匹配]");
+              (vid && pid) ? "" : " [auto: 首选表优先 + 能力匹配]");
 
     // 已经打开时先按"当前偏好"决定复用还是切换模式。
     //

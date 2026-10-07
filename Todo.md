@@ -79,3 +79,92 @@ memcpy(&resp[1], &reportIn[payloadStart], copyLen);   // resp[1] 拿到的是"�
 
 验证：`build.ps1` 通过；实机回归待做 —— orbtrace 走 V1 应能读到 IDCODE，
 且不再出现 `HID 响应不匹配`（合规设备的响应都回显命令ID）。
+
+### 续 3：V1 实机回归（hidprobe）—— 现场插的是 hslinkpro，自检如期拒绝
+
+2026-10-02 22:20，现场设备 = hslinkpro / CherryUSB `0D28:0204`（**orbtrace 未插**，PnP 无 `VID_1209` 设备）。
+
+```
+> bin\hidprobe.exe
+RDDI_Open           -> 0 (handle=0)
+ConfigureInterface  -> 3  (ifNo=1 = CMSIS-DAP v1 / HID)     ← 3 = RDDI_FAILED
+DetectNumberOfDAPs  -> 0 (noOfDAPs=0)
+DP CTRLSTAT         -> 0x00000000  [no ack]
+```
+
+`%TEMP%\ORBMDK_RDDI.log` 关键序列：
+
+```
+22:20:13.390 Init: V2 Bulk mode OK (product='CherryUSB CMSIS-DAP', serial='A758D621...')
+22:20:13.391 RDDI_Open: device DAP_Info(4)='2.1.1' (rc=6)
+22:20:13.391 SelectInterface: ifNo=1 -> hid (current=2, already=0)        ← 探针要求切 V1
+22:20:13.395 HID 报告布局：UsagePage=0xFF00 IN=1024 OUT=1024 负载=1023 报告ID=0x01 前缀=1 WriteFile
+22:20:13.395 Init: V1 HID mode OK (vid=0x0D28 pid=0x0204 报告负载=1023)
+22:20:14.395 SelectInterface: ifNo=1 (HID) 打开成功但对 DAP_Info 无有效应答 -> 该 HID 接口不是 CMSIS-DAP
+22:20:14.395 CMSIS_DAP_ConfigureInterface: interface 1 (CMSIS-DAP v1/HID) could not be opened (-1) - NOT falling back
+```
+
+结论：
+
+- **改动 #5 实机验证通过**：HID 口"能打开但 DAP_Info 无有效应答"被自检拦住，`ConfigureInterface`
+  如实返回 `RDDI_FAILED(3)`，不再把 HID 能打开当成 v1 可用（旧的 `connect failed, mode=0x61` 掩盖链已断）。
+- 改动 #6 本次未体现差别（`already=0`，本来就会跑自检）；orbtrace 侧不再回归，随本条一并关闭。
+- **V1 通路本身仍未在真 DAPLink（orbtrace）上回归** —— 本轮设备上 ifNo=1 本来就不存在，失败是正确行为。
+  用户 2026-10-02 确认 orbtrace 侧已基本完备、无需额外 V1 实机回归，**本条回归项就此关闭、不再排期**。
+- 同时确认 V2 一切如常（`V2 Bulk mode OK` + `DAP_Info(4)='2.1.1'`），hslinkpro 请始终选 `ifNo=0`。
+
+### 续 4：设备识别去白名单化 —— VID/PID 只当"优先级"，准入改走能力特征
+
+需求：用户要"兼容很多设备"，不想每换一台 CMSIS-DAP 都改 VID/PID 表。
+
+设计（**白名单从"准入"降级为"优先级"，识别按 CMSIS-DAP 规范的能力特征**）：
+
+| 层 | 准入条件（不再看 VID/PID） | 首选（表内命中）的优待 |
+|---|---|---|
+| V2 Bulk | 绑 WinUSB + 接口类 `0xFF` + Bulk IN/OUT 对 + **DAP_Info 有应答** | 排第 1 趟扫描 |
+| V1 HID | UsagePage `0xFF00` + OUT/IN 报告可用 + **DAP_Info 有应答** | 排第 1 趟扫描 |
+
+改动点：
+
+1. `include/ORBMDK.h`：`ORBMDK_IsSupportedDevice` -> **`ORBMDK_IsPreferredDevice`**，表头注释改写
+   （明确 `0D28:0204` 下有多个 0xFF 接口，VID/PID 不能区分"是不是 DAP"，必须过能力校验）。
+2. `ORBMDK_USB_Bulk.cpp` `_findAndOpenDeviceInGuid`：改成**两趟扫描**
+   （`while (pass < 2 && !deviceOpened)` + index 归零，循环体缩进不变）。
+   - pass 0 = 首选表命中（或调用方显式指定的 vid/pid）；
+   - pass 1 = 其余接口，但先用新增的 **`_compatibleIdIsVendorClass()`** 读
+     `SPDRP_COMPATIBLEIDS` 预筛 `Class_ff`，避免对系统里几十个无关 WinUSB 接口
+     `CreateFile`（读不到该属性则保守放行，宁可多试不可漏）；
+   - 真正的把关仍在打开之后：接口类 0xFF + Bulk 对。
+3. `ORBMDK_USB_Bulk.cpp` `SelectInterface`：给 **V2 补上与 V1(#5) 对称的 `DAP_Info` 自检**。
+   放开 VID/PID 后枚举可能选中别的厂商 0xFF 接口，不在这里问一句，错误会一路拖到
+   第一条命令读超时才爆（现场表现为"探针不响应"而非"这不是 DAP"）。
+4. `ORBMDK_HID.cpp`：`_hidDeviceAcceptable(..., bool preferredOnly)` 去掉 VID 门槛，
+   改为能力准入；`CMSIS_DAP_VIDS[]` 注释降级为"首选厂商 VID"。`EnumerateDevices` /
+   `ORBMDK_HID_OpenDevice` 各改两趟扫描。
+
+实机验证（hslinkpro `0D28:0204`，`bin\swdprobe.exe`）：
+
+```
+candidate[1] '\\?\usb#vid_0d28&pid_0204&mi_00#...'     ← pass 0 首选命中，直接采用
+enumeration done: 1 candidate(s) (=> 首选表优先 + 能力匹配(class 0xFF)), opened=1
+Init: V2 Bulk mode OK (product='CherryUSB CMSIS-DAP', serial='A758D621...')
+RDDI_Open: device DAP_Info(4)='2.1.1' (rc=6)
+SelectInterface: ifNo=0 (bulk) DAP 自检通过 (fw='2.1.1')      ← 新增自检 ✅
+```
+
+即：**首选设备的行为与改动前逐字一致**（仍 1 candidate、仍打开 MI_00），
+放开的分支（pass 1）在首选命中时根本不执行 —— 零回归风险。
+
+已知限制（未处理，待观察）：若 pass 1 打开了一个"class 0xFF + 有 Bulk 对但不是 DAP"
+的接口，V2 自检会如实报错，但**不会回退去试下一个候选**（枚举此时已结束）。
+要消除它得把 DAP_Info 探针挪进枚举循环 —— 会拖慢枚举，暂不做。
+
+现场暴露的点：
+
+1. `test\hidprobe.cpp` 不检查 `ConfigureInterface` 返回值就继续发 DAP 命令：失败后通道停在 HID，
+   随之 51 次读超时把通道打成**熔断**（`22:20:16.412 DAP 通道熔断`），100 多行 `-5` 淹没了关键日志。
+   **已修（2026-10-02）**：`RDDI_Open` 与 `ConfigureInterface` 返回值非 0 即打印原因并退出
+   （配置失败退出码 `3 = RDDI_FAILED`），不再继续发命令、不再误触发熔断；失败提示直接指向
+   "该设备若无 v1/HID 通路请选 ifNo=0"。编译：`test\build_test.ps1 -Source hidprobe.cpp`（通过）。
+   在 hslinkpro 上重跑：退出码 `3`，日志只余 6 行（无 `-5` 刷屏、无熔断），
+   自检细节可见 `HID 响应不匹配：cmd=0x00 收到 IN[0..7]=02 'parse e'`（与上表 #5 所述同一现象）。

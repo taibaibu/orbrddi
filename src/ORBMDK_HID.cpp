@@ -56,10 +56,12 @@
 static constexpr uint16_t ORBTRACE_VID = ORBMDK_ORBTRACE_VID;
 static constexpr uint16_t ORBTRACE_PID = ORBMDK_ORBTRACE_PID;
 
-// 兼容设备的 VID 白名单（用于"VID 在册但 PID 未知"的老式/克隆 CMSIS-DAP）。
-// 问题：原先 VID 命中就打开，任何 0x0D28 的键盘/鼠标都会被当成 DAP，
-// 表现为"连接成功、命令全部写失败"，所以现在还必须过能力校验（见
-// _hidDeviceAcceptable：Usage Page 0xFF00 且读/写报告都可用）。
+// 首选厂商 VID（用于"VID 在册但 PID 未知"的老式/克隆 CMSIS-DAP）。
+// ⚠ 这**不是准入条件**，只影响优先级：命中者跳过 UsagePage 校验，并在两趟
+// 扫描里排在第 1 趟。准入一律看能力（_hidDeviceAcceptable：UsagePage 0xFF00
+// 且 OUT/IN 报告都可用；再往上是 ConfigureInterface 的 DAP_Info 自检）。
+// 历史问题：原先 VID 命中就打开，任何 0x0D28 的键盘/鼠标都会被当成 DAP，
+// 表现为"连接成功、命令全部写失败"。
 static constexpr uint16_t CMSIS_DAP_VIDS[] = {
     0x0D28,  // ARM
     0x2E03,  // ORBTrace / 用户设备
@@ -145,7 +147,7 @@ void ORBMDK_HID_Shutdown(void)
     g_hidPlan = HidReportPlan{};
 }
 
-// 检查 VID 是否在支持列表中
+// 检查 VID 是否在首选厂商列表中（只影响优先级，不影响准入）
 static bool IsCMSISDAPDevice(uint16_t vid)
 {
     for (size_t i = 0; i < sizeof(CMSIS_DAP_VIDS) / sizeof(CMSIS_DAP_VIDS[0]); i++) {
@@ -257,15 +259,18 @@ static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
     return true;
 }
 
-// 判定已打开的 HID 句柄是不是我们的 DAP 设备，并给出报告布局
-//   1) VID+PID 在支持列表里 -> 接受
-//   2) 仅 VID 在兼容白名单   -> 还须厂商自定义 Usage Page(0xFF00) 且读写可用
+// 判定已打开的 HID 句柄是不是 DAP 设备，并给出报告布局
+//   首选（VID/PID 在首选表，或 VID 在传统 CMSIS-DAP 厂商表）-> 报告可解析即接受
+//   其它 -> 必须过**能力校验**：厂商自定义 UsagePage(0xFF00) + OUT/IN 报告都可用
+//
+// preferredOnly = 第 1 趟扫描：只认首选设备（无关设备数量大，不刷日志）。
 static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
-                                 HidReportPlan* plan)
+                                 HidReportPlan* plan, bool preferredOnly)
 {
-    if (!ORBMDK_IsSupportedDevice(attr.VendorID, attr.ProductID) &&
-        !IsCMSISDAPDevice(attr.VendorID)) {
-        return false;                     // 无关设备（大量），不刷日志
+    const bool preferred = ORBMDK_IsPreferredDevice(attr.VendorID, attr.ProductID) ||
+                           IsCMSISDAPDevice(attr.VendorID);
+    if (preferredOnly && !preferred) {
+        return false;                     // 第 1 趟只找首选设备，无关注释不刷日志
     }
 
     HidReportPlan probe = {};
@@ -275,18 +280,19 @@ static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
         return false;
     }
 
-    if (ORBMDK_IsSupportedDevice(attr.VendorID, attr.ProductID)) {
+    if (preferred) {
         *plan = probe;
         return true;
     }
 
-    // 兼容路径：PID 未知（老式/克隆 CMSIS-DAP）—— 只认厂商自定义 Usage Page
+    // 能力准入：**不再**要求 VID 在册。CMSIS-DAP 的 HID 接口必是厂商自定义
+    // Usage Page(0xFF00)，且 OUT/IN 报告都可用（_hidProbeReportPlan 已保证）。
     if (probe.usagePage != 0xFF00U) {
         LOG_HID_WARN("skip VID_%04X&PID_%04X: UsagePage=0x%04X 非厂商自定义(0xFF00)",
                      attr.VendorID, attr.ProductID, (unsigned)probe.usagePage);
         return false;
     }
-    LOG_HID_WARN("兼容设备 VID_%04X&PID_%04X（不在支持列表，按能力匹配："
+    LOG_HID_WARN("兼容设备 VID_%04X&PID_%04X（不在首选表，按能力匹配："
                  "UsagePage=0xFF00, IN=%u, 负载=%zu）",
                  attr.VendorID, attr.ProductID,
                  (unsigned)probe.inputLen, probe.payloadMax);
@@ -307,8 +313,17 @@ static bool EnumerateDevices(std::vector<std::string>& serials)
     SP_DEVICE_INTERFACE_DATA interfaceData = {};
     interfaceData.cbSize = sizeof(interfaceData);
 
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(
-            deviceInfo, nullptr, &hidGuid, i, &interfaceData); i++) {
+    // 两趟：第 1 趟只认首选设备；一趟没找到，第 2 趟才放宽到能力匹配的兼容设备。
+    // 换趟时 index 归零，于是循环体缩进与原来的单趟写法完全一致。
+    int  pass = 0;
+    DWORD i   = 0;
+    while (pass < 2 && serials.empty()) {
+        if (!SetupDiEnumDeviceInterfaces(deviceInfo, nullptr, &hidGuid, i, &interfaceData)) {
+            ++pass;                        // 本趟枚举完 -> 换下一趟（或退出）
+            i = 0;
+            continue;
+        }
+        ++i;
 
         DWORD detailSize = 0;
         SetupDiGetDeviceInterfaceDetail(
@@ -338,7 +353,7 @@ static bool EnumerateDevices(std::vector<std::string>& serials)
         if (HidD_GetAttributes(hDevice, &attributes)) {
             // 只收"支持列表精确匹配"或"过能力校验的兼容设备"，见 _hidDeviceAcceptable
             HidReportPlan plan = {};
-            if (_hidDeviceAcceptable(hDevice, attributes, &plan)) {
+            if (_hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0)) {
                 wchar_t serialBuffer[256] = {};
                 if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
                     char serial[256] = {};
@@ -405,8 +420,16 @@ int ORBMDK_HID_OpenDevice(const char* serial)
     HidReportPlan plan = {};
     uint16_t foundVid = 0, foundPid = 0;
 
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(
-            deviceInfo, nullptr, &hidGuid, i, &interfaceData); i++) {
+    // 与 EnumerateDevices 同样的两趟策略：先首选，后兼容（能力匹配）。
+    int  pass = 0;
+    DWORD i   = 0;
+    while (pass < 2 && !found) {
+        if (!SetupDiEnumDeviceInterfaces(deviceInfo, nullptr, &hidGuid, i, &interfaceData)) {
+            ++pass;                        // 本趟枚举完 -> 换下一趟（或退出）
+            i = 0;
+            continue;
+        }
+        ++i;
 
         DWORD detailSize = 0;
         SetupDiGetDeviceInterfaceDetail(
@@ -435,7 +458,7 @@ int ORBMDK_HID_OpenDevice(const char* serial)
 
         plan = HidReportPlan{};
         if (HidD_GetAttributes(hDevice, &attributes) &&
-            _hidDeviceAcceptable(hDevice, attributes, &plan)) {
+            _hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0)) {
 
             wchar_t serialBuffer[256] = {};
             if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
@@ -1031,6 +1054,7 @@ static int DAP_TransferConfigure(uint8_t idleCycles, uint16_t waitRetry, uint16_
 
 static int DAP_SWJ_Clock(uint32_t clock)
 {
+    LOG_HID_DEBUG("DAP_SWJ_Clock: enter, clock=%u", clock);
     uint8_t cmd[5] = {
         ID_DAP_SWJ_CLOCK,
         static_cast<uint8_t>(clock & 0xFF),

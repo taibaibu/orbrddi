@@ -92,12 +92,18 @@ static inline void ORBMDK_NormalizeFwVersion(const char* raw, char* out, size_t 
 #define ORBMDK_ORBTRACE_PID   0x3443U
 
 // ----------------------------------------------------------------------------
-// 支持的调试器身份 (VID/PID) —— V1(HID) 与 V2(Bulk) **共用这一份表**
+// "首选"调试器身份 (VID/PID) —— V1(HID) 与 V2(Bulk) **共用这一份表**
 //
-// 问题：两层各自认定设备身份，Bulk 层原先只认 1209:3443，CherryUSB 等
-// 0D28:0204 设备连 V2 通道都进不去（枚举 0 候选）。
+// ⚠ 这不是准入白名单，只表示"优先级"（同机多台时先选表内设备）。
+// 设备识别一律按能力特征：
+//   V2(Bulk)：绑 WinUSB + 接口类 0xFF + Bulk IN/OUT 对 + DAP_Info 有应答
+//   V1(HID) ：UsagePage 0xFF00 + OUT/IN 报告可用      + DAP_Info 有应答
+// 因此任何合规范的第三方 CMSIS-DAP（不论 VID/PID）都能直接用，无需改代码。
+//
 //   X(VID, PID)
-// 0x0D28:0x0204 = ARM 官方 CMSIS-DAP/DAPLink 身份，多数 CMSIS-DAP 实现沿用。
+// 0x0D28:0x0204 = ARM 官方 CMSIS-DAP/DAPLink 身份，多数实现沿用。注意该
+// VID/PID 的复合设备会暴露多个 0xFF 接口（MI_00 是 v2 DAP、MI_04 不是），
+// 所以"表内命中"后仍必须过能力校验 —— 只有能力校验能区分是不是 DAP。
 // ----------------------------------------------------------------------------
 #define ORBMDK_DEVICE_VIDPID_LIST(X)          \
     X(0x1209U, 0x3443U) /* ORBTrace        */ \
@@ -106,7 +112,9 @@ static inline void ORBMDK_NormalizeFwVersion(const char* raw, char* out, size_t 
 
 struct ORBMDK_VidPidPair { uint16_t vid; uint16_t pid; };
 
-static inline bool ORBMDK_IsSupportedDevice(uint16_t vid, uint16_t pid)
+/** 是否为首选（已知）设备 —— 只用于优先级，不构成准入条件（见上）。
+ *  识别本身按能力特征；VID/PID 不能区分"是不是 DAP"。 */
+static inline bool ORBMDK_IsPreferredDevice(uint16_t vid, uint16_t pid)
 {
 #define ORBMDK_VIDPID_ENTRY(v, p) { (v), (p) },
     static const ORBMDK_VidPidPair table[] = {
