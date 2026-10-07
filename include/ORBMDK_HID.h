@@ -20,6 +20,21 @@ int ORBMDK_HID_IsConnected(void);
 int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen, char* serial, size_t serialLen, char* version, size_t versionLen);
 int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen, uint8_t* resp, size_t* respLen, int timeoutMs);
 
+// ---------------------------------------------------------------------------
+// DAP 命令通道熔断（实现与完整说明见 src/ORBMDK_HID.cpp；固件侧缺陷见 bug.md B1）
+//
+// 缓解的是一个**本层修不了**的固件缺陷：orbtrace 的 DAP 命令通道一次握手失败后
+// 内部 busy 永不清零，此后所有命令都不再被消费，而 USB 层照常工作 —— 现场表现
+// 为"每条命令都等满 1s 超时"，几十条就把整场会话拖死，且日志里看不出根因。
+//
+// 本层能做的只有刹车：连续超时到阈值即熔断，后续命令**立即失败**并打一条默认
+// 可见的 ERROR，提示给探针重新上电（唯一有效的恢复手段）。
+// ---------------------------------------------------------------------------
+bool ORBMDK_DapChannelUsable(void);            // false = 已熔断，调用方应立即失败
+void ORBMDK_DapNoteResult(int rc);             // 上报一次命令结果（只在统一分发点调用）
+int  ORBMDK_DapFastFailCode(void);             // 熔断期间返回的码（与真超时一致）
+void ORBMDK_DapChannelReset(const char* why);  // 主动解除熔断（设备重新打开时）
+
 // DAP Command Helpers
 int DAP_GetInfo(uint8_t infoId, char* buffer, size_t bufferLen);
 int DAP_ConnectTarget(void);
@@ -89,6 +104,15 @@ void StreamingTrace_Shutdown(void);
 int StreamingTrace_Start(uint8_t mode);
 int StreamingTrace_Stop(void);
 int StreamingTrace_GetData(uint8_t* buffer, size_t* size, uint32_t timeoutMs);
+// 阻塞式消费环形缓冲：>0 取到字节数 / 0 超时 / -1 未运行。AGDI 的 WaitForEvent 依赖它。
+int StreamingTrace_Read(uint8_t* buffer, size_t* size, uint32_t timeoutMs);
+int StreamingTrace_Flush(void);
+void StreamingTrace_SetBaudrate(uint32_t baudrate);
+// SWO 端口：1 = UART/NRZ（默认），2 = Manchester。
+// 来源是 AGDI 配置串里的 Trace=，由 RDDI 层在 ConfigureDebugger 里解析后传入；
+// 必须在 StreamingTrace_Start 之前调用 —— Start 用它决定 DAP_SWO_Mode 的参数，
+// StreamingTrace_GetSinkInfo 也用它决定回报给 AGDI 的 sink 类型。
+void StreamingTrace_SetMode(uint8_t swoPort);
 int StreamingTrace_GetStatus(uint8_t* status, uint16_t* traceCount);
 int StreamingTrace_GetSinkInfo(int index, char* name, int nameLen, char* type, int typeLen);
 

@@ -25,20 +25,18 @@
  *                any corruption is reported immediately (targets the bug above).
  *   3. Boundary: word counts 1 / 13 / 14 / 15 / 28 / 64 -- covers the
  *                kMaxBlockWords = 14 chunk boundary.
- *   4. Speed   : runs the serial path and the block path in one process and
- *                prints the ratio.
+ *   4. Speed   : prints the per-case write/read timings of the block path.
+ *                There is no serial baseline any more -- the driver has no
+ *                switch to turn block transfer off.
  *
  * USAGE (target board connected and powered)
  * ------------------------------------------
  *     ORBMDK_BlockTransferTest.exe [ramAddress] [onlyWordCount]
  *     e.g.  ORBMDK_BlockTransferTest.exe 0x20000000
  *
- * The program sets ORBMDK_BLOCK_TRANSFER itself and reloads the DLL via
- * FreeLibrary/LoadLibrary so that the static cache inside BlockTransferEnabled()
- * is re-initialised. If the reload does not take effect (the two timings look
- * identical), run it twice manually instead:
- *     ORBMDK_BlockTransferTest.exe
- *     set ORBMDK_BLOCK_TRANSFER=1 && ORBMDK_BlockTransferTest.exe
+ * The driver probes the firmware for ID_DAP_TRANSFER_BLOCK on first use and
+ * permanently falls back to single transfers if it is not implemented, so
+ * this run measures whichever path the probe selects.
  *
  * WARNING: this writes about 256 bytes to the given RAM address
  *          (default 0x20000000). Make sure the target does not depend on
@@ -274,12 +272,11 @@ static double RunCase(const Api& a, RDDIHandle h, uint32_t addr, int n, bool ver
  * One full round: open -> configure -> connect -> run all cases.
  * Returns total microseconds, or -1 on failure.
  * ========================================================================== */
-static double RunRound(const char* tag, bool blockMode, uint32_t addr,
+static double RunRound(const char* tag, uint32_t addr,
                        const int* sizes, int nSizes)
 {
     printf("\n================================================================\n");
-    printf("  mode: %s   (ORBMDK_BLOCK_TRANSFER=%s)\n",
-           tag, blockMode ? "1" : "unset");
+    printf("  mode: %s   (driver auto-probe)\n", tag);
     printf("================================================================\n");
 
     Api a;
@@ -403,37 +400,22 @@ int main(int argc, char* argv[])
         printf("only testing n=%d\n", sizes[0]);
     }
 
-    /* ---- round 1: serial (baseline) ----
-     * ORBMDK_BLOCK_TRANSFER must be "0" (explicitly disabled). An empty value
-     * counts as "not set", which now means "enabled, decide by auto probe". */
-    _putenv_s("ORBMDK_BLOCK_TRANSFER", "0");
-    const double tSerial = RunRound("serial transfer (baseline)", false,
-                                    addr, sizes, nSizes);
-
-    /* ---- round 2: block transfer ----
-     * FreeLibrary/LoadLibrary reloads the DLL so the static cache inside
-     * BlockTransferEnabled() is re-initialised, allowing both modes to be
-     * measured in one process. */
-    _putenv_s("ORBMDK_BLOCK_TRANSFER", "1");
-    const double tBlock = RunRound("block transfer", true, addr, sizes, nSizes);
+    /* ---- run ----
+     * The driver has no switch to disable block transfer: it always probes the
+     * firmware once and falls back to single transfers only if the firmware
+     * does not implement ID_DAP_TRANSFER_BLOCK. This run therefore measures
+     * whichever path the probe selects. */
+    const double tTotal = RunRound("block transfer", addr, sizes, nSizes);
 
     /* ---- summary ---- */
     printf("\n================================================================\n");
     printf("  summary\n");
     printf("================================================================\n");
     printf("  cases passed %d, failed %d\n", g_Passed, g_Failed);
-    if (tSerial > 0 && tBlock > 0) {
-        printf("  serial total %.1f us\n", tSerial);
-        printf("  block  total %.1f us\n", tBlock);
-        printf("  speedup      %.2fx\n", tSerial / tBlock);
-        if (tSerial / tBlock < 1.5) {
-            printf("  NOTE: low speedup. Either the firmware does not implement\n");
-            printf("        ID_DAP_TRANSFER_BLOCK (it fell back automatically),\n");
-            printf("        or the in-process DLL reload did not take effect.\n");
-            printf("        Try running the two modes manually instead.\n");
-        }
+    if (tTotal > 0) {
+        printf("  total %.1f us\n", tTotal);
     } else {
-        printf("  NOTE: one of the modes did not complete, cannot compare speed\n");
+        printf("  NOTE: the run did not complete\n");
     }
     printf("================================================================\n");
 

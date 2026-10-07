@@ -11,7 +11,11 @@
 
 #pragma once
 
-// 导出 / 导入声明分离（不再依赖条件编译）
+// ORBMDK_NormalizeFwVersion 用到 sscanf_s / sprintf_s / strncpy_s / _TRUNCATE：
+// 本头不依赖包含者先引过 stdio/string，自带这两条。
+#include <stdio.h>
+#include <string.h>
+
 #define ORBMDK_EXPORT __declspec(dllexport)
 #define ORBMDK_IMPORT __declspec(dllimport)
 
@@ -28,6 +32,50 @@
 #define ORBMDK_VERSION_MINOR  0
 #define ORBMDK_VERSION_PATCH  0
 #define ORBMDK_VERSION_STRING "1.0.0"
+
+// ----------------------------------------------------------------------------
+// 上报给宿主的固件版本串（Identify(idNo=4) / DAP_Info）
+//
+// 取值来自**设备自报的 CMSIS-DAP `DAP_Info(0x04)`**：打开设备后问一次、缓存进
+// RDDI 上下文（见 src/ORBMDK_RDDI.cpp 的 RDDI_Open），每次 Identify(idNo=4) 都回
+// 这一份。**不要**改用 USB 设备描述符的 bcdDevice 当版本：那是 USB 栈/引导程序写的
+// 字段，与固件真实版本无关，已弃用。
+//
+// ★ 当前口径（2026-10-01 放开）：上报串的主版本**必须 ≥ 2**，次版本/修订号保留真实值。
+//   原因：AGDI 把该串按 "%lu.%lu.%lu" 解析后 `cmp eax, 2`（0x1003CB97），主版本 < 2 时
+//   它压根不会进入 streaming sink 注册分支，配置串里的 TraceTransport 也永远只写 `Read`。
+//   要让 µVision 的 Trace 页真正走流式（`TraceTransport=Stream;`），这一半门控必须打开。
+//   另一半门控是 `CMSIS_DAP_Capabilities` 里的 `INFO_CAPS_SWO_STREAMING_TRACE(0x40)`，
+//   两道**必须同侧**（Todo.md §18.10-C「两条总原则」第一条）。
+//
+// ----------------------------------------------------------------------------
+#define ORBMDK_FALLBACK_FWVER_STRING "1.0.0"
+
+// 把**设备 DAP_Info(0x04) 回的**版本串归一化成"上报串"（唯一口径）：
+//   - 空串 / 解析不出 -> ORBMDK_FALLBACK_FWVER_STRING
+//   - 主版本 < 2      -> 提升为 2，次版本/修订号原样保留（1.1.0 -> 2.1.0）
+//   - 主版本 ≥ 2      -> 原样上报
+// 注意这里是"提升"而不是"照抄"：多数 orbtrace 固件自报 1.x，而门控只看主版本，
+// 不提升则 streaming 分支永远不会被触发。
+static inline void ORBMDK_NormalizeFwVersion(const char* raw, char* out, size_t outLen)
+{
+    if (!out || outLen == 0) {
+        return;
+    }
+
+    unsigned major = 0, minor = 0, patch = 0;
+    const bool parsed = (raw && raw[0] != '\0' &&
+                         sscanf_s(raw, "%u.%u.%u", &major, &minor, &patch) >= 1);
+    if (!parsed) {
+        strncpy_s(out, outLen, ORBMDK_FALLBACK_FWVER_STRING, _TRUNCATE);
+        return;
+    }
+
+    if (major < 2) {
+        major = 2;   // AGDI「streaming sink」门控；与 caps 的 0x40 同侧，见上
+    }
+    sprintf_s(out, outLen, "%u.%u.%u", major, minor, patch);
+}
 
 // ----------------------------------------------------------------------------
 // ORBTrace USB 身份 (VID/PID)

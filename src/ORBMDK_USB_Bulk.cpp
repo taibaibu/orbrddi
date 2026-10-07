@@ -9,11 +9,13 @@
 #include "ORBMDK.h"
 #include "ORBMDK_USB_Bulk.h"
 #include "ORBMDK_HID.h"
+#include "ORBMDK_DAP.h"      // DAP_INFO_*（标准 CMSIS-DAP info 编号）
 #include "ORBMDK_DAPV2.h"
 #include "ORBMDK_Log.h"
 
 #include <chrono>
 #include <thread>
+#include <mutex>
 
 // Windows SDK 头文件 (WinUSB 传输)
 #include <windows.h>
@@ -52,8 +54,6 @@ struct WinUSBContext {
     UCHAR bulkOutPipe;            // Bulk OUT 端点
     UCHAR bulkInPipe;             // Bulk IN 端点
     // ⚠️ 必须是 USHORT：wMaxPacketSize 是 16 位，orbtrace 声明的就是 **512**。
-    // 历史 bug：这里（以及 WinUsb_QueryPipe 的取值）被存成/转成 UCHAR，
-    // 512 & 0xFF == 0，于是包长"变成 0"，后续一连串判断全被带偏。
     USHORT bulkOutMaxPkt;         // OUT 端点 wMaxPacketSize（来自配置描述符）
     USHORT bulkInMaxPkt;          // IN 端点 wMaxPacketSize
     UCHAR  deviceSpeed;           // 1=Low 2=Full 3=High（WinUsb DEVICE_SPEED）
@@ -82,6 +82,22 @@ struct USB_Bulk_Context {
 };
 
 static USB_Bulk_Context g_ctx = {};
+
+// ---------------------------------------------------------------------------
+// 传输串行化锁（★ 并发安全，勿删）
+//
+// 为什么必须有：SWO 流式 trace 的后台读取线程（ORBMDK_HID.cpp 的
+// TraceReadThreadFunc）会与 AGDI 主线程**并发**下发 DAP 命令，两者共用同一条
+// V2 Bulk 通道。V1 HID 路径由 ORBMDK_HID.cpp 的 g_hidMutex 保护，但 V2 Bulk
+// 路径此前**完全没有同步** —— 并发的 WinUSB_WritePipe/ReadPipe 会让两条命令的
+// 请求与响应交错，表现为读到上一条命令的响应（或直接超时）。
+//
+// 加锁位置：只在**公开入口**加锁，不能在 _bulkWrite/_bulkRead 里加 ——
+// _flushAndDrainPipes() 会在 ORBMDK_USB_Bulk_DAPCommand 内部嵌套调用 _bulkRead，
+// 底层再加锁会自死锁。一次 Write+Read 往返必须在**同一把锁**内完成（事务原子性），
+// 否则仍会出现"读到别人响应"的错配。
+// ---------------------------------------------------------------------------
+static std::mutex g_bulkMutex;
 
 // ============================================================================
 // WinUSB 辅助函数
@@ -255,6 +271,11 @@ static void _readDeviceSerial(WINUSB_INTERFACE_HANDLE h)
         BulkTrace("device descriptor unavailable (err=%lu)", (unsigned long)GetLastError());
         return;
     }
+
+    // 注：这里**不**拿 bcdDevice 当固件版本 —— USB 描述符的版本字段是 USB 栈写的，
+    // 与固件真实版本无关。固件版本一律问设备（CMSIS-DAP DAP_Info / idNo=4），
+    // 见 src/ORBMDK_RDDI.cpp 的 RDDI_Open。
+
     if (desc.iSerialNumber == 0) {
         BulkTrace("device has no serial number string");
         return;
@@ -1034,6 +1055,12 @@ static bool _initWinUSB(uint16_t vid, uint16_t pid, const char* serial)
         return false;
     }
 
+    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态（bug.md B1）。
+    // 放在两条探测之前 —— 它们走 _bulkWrite/_bulkRead 直连、不经熔断闸门，而
+    // "刚打开就认定设备已死"本来也不成立；真的是哑机，随后几条 DAP 命令会立刻
+    // 把它重新熔断。这保证"探针重新上电"这条恢复路径永远不被熔断挡住。
+    ORBMDK_DapChannelReset("WinUSB 设备已重新打开");
+
     // 打开后先清端点、排空设备 IN FIFO 里的历史响应，
     // 保证第一条命令读到的就是它自己的响应（见 _flushAndDrainPipes 说明）
     _flushAndDrainPipes();
@@ -1446,12 +1473,27 @@ static int _bulkTransferCommand(const uint8_t* cmd, size_t cmdLen,
 ORBMDK_INTERNAL int ORBMDK_USB_Bulk_DAPCommand(const uint8_t* cmd, size_t cmdLen,
                                           uint8_t* resp, size_t* respLen, int timeoutMs)
 {
+    // 熔断闸门（bug.md B1）。这里**只拦、不记账** —— 记账统一由
+    // ORBMDK_HID_DAPCommand 那个分发点做，否则同一次失败会被记两次。
+    // 加在这里是为了覆盖绕过分发点的直连调用（如 CMSIS_DAP_PC_Capture）。
+    if (!ORBMDK_DapChannelUsable()) {
+        if (respLen) {
+            *respLen = 0;
+        }
+        return ORBMDK_DapFastFailCode();
+    }
+
     if (!g_ctx.initialized) return -1;
 
     if (g_ctx.mode != USB_BULK_BULK_MODE) {
         // V1 HID 模式
         return ORBMDK_HID_DAPCommand(cmd, cmdLen, resp, respLen, timeoutMs);
     }
+
+    // ★ 串行化整条 Bulk 通道：含下面的 _flushAndDrainPipes() 重试，
+    //   必须整段持锁，否则别的线程会在 flush 与重试之间插进一条命令。
+    //   V1 分支在上面已提前 return，不会与本锁嵌套 g_hidMutex。
+    std::lock_guard<std::mutex> lock(g_bulkMutex);
 
     // 最多两次：响应的首字节应当**回显命令号**（CMSIS-DAP 约定）。
     // 对不上说明设备 FIFO 里还有上一次没取走的响应（超时/中断留下的），
@@ -1495,6 +1537,7 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Write(const uint8_t* data, size_t len, int t
     if (!g_ctx.initialized) return -1;
 
     if (g_ctx.mode == USB_BULK_BULK_MODE) {
+        std::lock_guard<std::mutex> lock(g_bulkMutex);  // 与 DAPCommand 共用一把锁
         return _bulkWrite(data, len, timeoutMs);
     }
 
@@ -1507,6 +1550,7 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Read(uint8_t* data, size_t maxLen, int timeo
     if (!g_ctx.initialized) return -1;
 
     if (g_ctx.mode == USB_BULK_BULK_MODE) {
+        std::lock_guard<std::mutex> lock(g_bulkMutex);  // 与 DAPCommand 共用一把锁
         return _bulkRead(data, maxLen, timeoutMs);
     }
 
@@ -1551,9 +1595,20 @@ ORBMDK_INTERNAL int CMSIS_DAP_V2_GetInfo(uint8_t info_id, uint8_t* buffer, size_
         buffer[0] = '\0';
         return 1;
 
-    case DAPV2_INFO_FIRMWARE_VERSION:
-        strncpy_s((char*)buffer, buffer_len, "1.0.0", buffer_len - 1);
+    case DAPV2_INFO_FIRMWARE_VERSION: {
+        // 版本必须**问设备**（CMSIS-DAP `ID_DAP_INFO` + 标准 idNo = 4），
+        // **不读** USB 描述符的 bcdDevice —— 那是 USB 栈写的字段，不等于固件版本。
+        // 转调统一分发点 DAP_GetInfo：它按当前传输模式发命令并解析响应。
+        // ⚠ 这里用**标准编号 DAP_INFO_FIRMWARE(=4)**，而不是本 switch 的
+        // DAPV2_INFO_FIRMWARE_VERSION(==0x03)：ORBMDK_DAPV2.h 里那套 DAPV2_INFO_*
+        // 编号与 CMSIS-DAP 的 DAP_INFO_* 不对齐（见该头 148-161 行）。
+        buffer[0] = '\0';
+        (void)DAP_GetInfo(DAP_INFO_FIRMWARE, (char*)buffer, buffer_len);
+        if (buffer[0] == '\0') {
+            return -1;
+        }
         return (int)strlen((char*)buffer);
+    }
 
     case DAPV2_INFO_VENDOR_STRING:
         strncpy_s((char*)buffer, buffer_len, "ORBTrace", buffer_len - 1);

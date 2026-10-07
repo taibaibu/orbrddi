@@ -227,7 +227,12 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIRLengths(const RDDIHandle handle, int *count, u
 // SWO 接口 —— 签名严格对齐 ARM rddi_dap_swo.h
 RDDI_FUNC int CMSIS_DAP_SWO_Control(const RDDIHandle handle, int control);
 RDDI_FUNC int CMSIS_DAP_SWO_Status(const RDDIHandle handle, int *count, int *status);
-RDDI_FUNC int CMSIS_DAP_SWO_Baudrate(const RDDIHandle handle, int baudrate);
+// ★ 第二参数是 **int 指针**，不是值（实测，见 Todo.md §18.15）：
+//   AGDI 的四处调用点一律 `lea eax,[局部变量]; push eax; call [0x102375F4]`，
+//   由内部包装 0x1003D030 原样把该指针转交本函数 —— 也就是"候选波特率"的地址。
+//   早期按值实现（int baudrate）会把一个**栈地址**当成波特率下发，
+//   这是 µVision 界面报 "SWO CLOCK not support" 的直接原因。
+RDDI_FUNC int CMSIS_DAP_SWO_Baudrate(const RDDIHandle handle, int *baudrate);
 RDDI_FUNC int CMSIS_DAP_SWO_Data(const RDDIHandle handle, int *num_written, void *buffer, int *status);
 // 签名与 ARM rddi_dap_cmsis.h 对齐（含 ifNo 参数）
 RDDI_FUNC int CMSIS_DAP_GetGUID(const RDDIHandle handle, int ifNo, char *guid, int len);
@@ -257,19 +262,39 @@ RDDI_FUNC int CMSIS_DAP_PC_GetData(const RDDIHandle handle, int *count, uint8_t 
 RDDI_FUNC int CMSIS_DAP_PC_GetValues(const RDDIHandle handle, int *count, uint32_t *values);
 
 // StreamingTrace 函数
-RDDI_FUNC int StreamingTrace_Attach(const RDDIHandle handle, const char *sinkName);
-RDDI_FUNC int StreamingTrace_Detach(const RDDIHandle handle);
-RDDI_FUNC int StreamingTrace_Connect(const RDDIHandle handle, const char *sinkName, int mode);
+//
+// ⚠️ 参数个数/顺序已按 CMSIS_AGDI.dll 的**实际调用点**逐一对齐（Todo.md §18.10-C 阶段 0/P4，
+//    反汇编取证）：
+//      Connect(handle)                                          0x1003CE95  1 参
+//      GetSinkCount(handle, int*)                               0x1003CEB3  2 参
+//      GetSinkDetails(handle, index, RddiSinkDetails*)          0x1003CED8  3 参
+//      Attach / Start / Detach / Flush / Stop (handle, sinkIndex)           2 参
+//      WaitForEvent(handle, sinkIndex, int*, timeoutMs)         0x1003D661  4 参
+//      SubmitEventBuffer(handle, sinkIndex, Entry*, type, int*) 0x1003CF93  5 参
+//    这些函数是 __cdecl：**多写参数不会崩，但会读到调用方栈上的垃圾值**。旧实现把
+//    Connect 声明成 3 参（sinkName + mode），于是 mode 取到随机值、返回非零，
+//    AGDI 立刻用 0x2028 中止整个初始化 —— 这是本项的头号阻塞点。
+RDDI_FUNC int StreamingTrace_Attach(const RDDIHandle handle, int sinkIndex);
+RDDI_FUNC int StreamingTrace_Detach(const RDDIHandle handle, int sinkIndex);
+RDDI_FUNC int StreamingTrace_Connect(const RDDIHandle handle);
 RDDI_FUNC int StreamingTrace_Disconnect(const RDDIHandle handle);
-RDDI_FUNC int StreamingTrace_Start(const RDDIHandle handle);
-RDDI_FUNC int StreamingTrace_Stop(const RDDIHandle handle);
-RDDI_FUNC int StreamingTrace_Flush(const RDDIHandle handle);
-RDDI_FUNC int StreamingTrace_WaitForEvent(const RDDIHandle handle, int timeoutMs, int *eventType);
-RDDI_FUNC int StreamingTrace_SubmitEventBuffer(const RDDIHandle handle, uint8_t *buffer, int bufferSize);
+RDDI_FUNC int StreamingTrace_Start(const RDDIHandle handle, int sinkIndex);
+RDDI_FUNC int StreamingTrace_Stop(const RDDIHandle handle, int sinkIndex);
+RDDI_FUNC int StreamingTrace_Flush(const RDDIHandle handle, int sinkIndex);
+// 返回值：0 = 有事件（*evToken 回填 AGDI 提交时拿到的 token）；
+//         0x204 = 本轮无事件（AGDI 的正常分支，见 0x1003D66A cmp eax,0x204）；
+//         其他非零 = 出错（AGDI 会转成 0x2028 中止）。
+RDDI_FUNC int StreamingTrace_WaitForEvent(const RDDIHandle handle, int sinkIndex,
+                                          int *evToken, int timeoutMs);
+RDDI_FUNC int StreamingTrace_SubmitEventBuffer(const RDDIHandle handle, int sinkIndex,
+                                               void *entry, int entryType, int *token);
 RDDI_FUNC int StreamingTrace_GetSinkCount(const RDDIHandle handle, int *count);
-// Keil 扩展：官方实现为 3 参且不写调用方缓冲区
-RDDI_FUNC int StreamingTrace_GetSinkDetails(const RDDIHandle handle, const int reserved1,
-                                            const int reserved2);
+// AGDI 调用为 3 参 (handle, index, details)，且 details 指向的记录由 **AGDI 预填**
+// 两个 {缓冲区指针, 容量(0x80)} 对 —— 本层必须把 name/type 字符串写进去（旧注释说
+// "官方不写调用方缓冲区"指的是官方 DLL 的包装函数，不是 AGDI 的契约）。
+// 记录结构见 src/ORBMDK_RDDI.cpp 的 RddiSinkDetails。
+RDDI_FUNC int StreamingTrace_GetSinkDetails(const RDDIHandle handle, int index, void *details);
+// 下面两个 AGDI 从不调用（AGDI 内 0 处 call/jmp 引用），仅为导出完整性保留。
 RDDI_FUNC int StreamingTrace_GetConfigItem(const RDDIHandle handle, int item, int *value);
 RDDI_FUNC int StreamingTrace_SetConfigItem(const RDDIHandle handle, int item, int value);
 

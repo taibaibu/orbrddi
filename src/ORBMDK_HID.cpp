@@ -12,6 +12,9 @@
 #include <setupapi.h>
 #include <vector>
 #include <string>
+#include <thread>
+#include <condition_variable>
+#include <chrono>
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -197,7 +200,10 @@ static bool ReadDeviceInfo(HANDLE hDevice)
         strcpy_s(g_serialNumber, "Unknown");
     }
 
-    strcpy_s(g_firmwareVersion, "1.0.0");
+    // 固件版本**不在这里取**：HidD_GetAttributes 的 VersionNumber（= 设备描述符的
+    // bcdDevice）是 USB 栈写的，与固件真实版本无关，已弃用。
+    // 版本一律**问设备**（CMSIS-DAP DAP_Info / idNo=4），见 ORBMDK_HID_GetDeviceInfo。
+    g_firmwareVersion[0] = '\0';
     return true;
 }
 
@@ -292,6 +298,11 @@ int ORBMDK_HID_OpenDevice(const char* serial)
 
     g_hDevice = hDevice;
     g_isConnected = true;
+
+    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态（bug.md B1）。
+    // "探针已重新上电"这条恢复路径不能被熔断挡住；真的是哑机的话，随后的
+    // DAP_Info 会立刻把它重新熔断（代价只有一两条命令）。
+    ORBMDK_DapChannelReset("HID 设备已重新打开");
     return 0;
 }
 
@@ -312,21 +323,260 @@ int ORBMDK_HID_IsConnected(void)
 }
 
 int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen,
-                               char* serial, size_t serialLen,
-                               char* version, size_t versionLen)
+                              char* serial, size_t serialLen,
+                              char* version, size_t versionLen)
 {
-    std::lock_guard<std::mutex> lock(g_hidMutex);
-    if (!g_isConnected) return -1;
+    {
+        std::lock_guard<std::mutex> lock(g_hidMutex);
+        if (!g_isConnected) return -1;
 
-    if (product) strncpy_s(product, productLen, g_productName, productLen - 1);
-    if (serial) strncpy_s(serial, serialLen, g_serialNumber, serialLen - 1);
-    if (version) strncpy_s(version, versionLen, g_firmwareVersion, versionLen - 1);
+        if (product) strncpy_s(product, productLen, g_productName, productLen - 1);
+        if (serial) strncpy_s(serial, serialLen, g_serialNumber, serialLen - 1);
+        if (version) version[0] = '\0';
+
+        if (!version || versionLen == 0) {
+            return 0;                        // 没要版本，收工
+        }
+        if (g_firmwareVersion[0] != '\0') {  // 有缓存就直接回（避免多余的 USB 往返）
+            strncpy_s(version, versionLen, g_firmwareVersion, versionLen - 1);
+            return 0;
+        }
+    }
+
+    // 版本必须**问设备**（CMSIS-DAP DAP_Info / idNo=4）—— 描述符里的版本字段
+    // （HidD_GetAttributes 的 VersionNumber）与固件版本无关，已弃用。
+    //
+    // ⚠ 这次调用**必须**在 g_hidMutex 释放之后：V1 路径的 DAP_Info 内部自己会加
+    // 这把锁（std::mutex 非递归），放在上面那个 lock_guard 作用域里会自死锁。
+    const int got = DAP_GetInfo(DAP_INFO_FIRMWARE, version, versionLen);
+    if (got <= 0) {
+        version[0] = '\0';
+        LOG_HID_WARN("GetDeviceInfo: DAP_Info(0x04) failed (rc=%d)", got);
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lock(g_hidMutex);
+    strncpy_s(g_firmwareVersion, sizeof(g_firmwareVersion), version, _TRUNCATE);
     return 0;
 }
 
 #include "ORBMDK_USB_Bulk.h"   // V2 Bulk 传输（本函数是两层共用的分发点）
 
+// ============================================================================
+// DAP 命令通道熔断（缓解；固件侧缺陷见 bug.md B1）
+//
+// 背景（本层改不了，要改的是固件 RTL）：
+//   orbtrace 固件的 DAP 命令通道**没有任何超时兜底** —— 一次握手失败后内部 busy
+//   标志永不清零（cmsis_dap.py:1712 `streamOut.ready = ~busy`），此后不再消费任何
+//   命令；而 USB 层照常工作，设备照常枚举、能打开、能读描述符。现场表现为"每条
+//   DAP 命令都等满 1s 超时才返回"，几十条连着来就把整场会话拖死，日志里还看不出
+//   根因。主机侧没有任何"复位探针"的手段，唯一有效的恢复是给探针断电重插。
+//
+// 本层能做的只是**刹车**：把"连续超时"当作"设备已无响应"的证据，达到阈值后自行
+// 熔断 —— 后续命令立即失败（不再逐条去等 1s），并打一条默认级别可见的 ERROR 提示
+// 现场"给探针重新上电"。
+//
+// ★ 状态必须放**命名共享内存**，不能是普通 static：
+//   AGDI 在一次会话里会反复卸载并重新加载本 DLL（见 ORBMDK_RDDI.cpp 的
+//   _nextOpenSeq 说明），static 会被清零 —— 熔断刚建立就失效，等于没做。
+//
+// 熔断 / 恢复判据
+//   熔断：连续 kDapTripAfter 次**超时**（任何一次成功即清零；其它失败既不计数也不
+//         清零）。留一次容错，防 USB 抖动误杀。
+//   恢复：① 任意一次命令成功；② 设备被重新打开（HID 打开 / WinUSB 初始化）；
+//         ③ 熔断窗口到期后放行一条**探测命令**，成功即解除 —— 探针重新上电后
+//         最迟一个窗口内自动恢复，不必重开 Keil。
+//   窗口：kDapHalfOpenMs 起，探测继续失败就翻倍，封顶 kDapHalfOpenMaxMs（设备真死
+//         时探测频率指数下降，不刷日志、也不反复吃 1s 超时）。
+//
+// 只统计"超时"，不统计协议层失败（比如固件回 0xFF 表示不支持该命令）：后者恰恰
+// 说明设备活得好好的 —— 算进去会在"块传输不支持 → 回退逐字传输"这类正常回退路径
+// 上误熔断。
+// ============================================================================
+namespace {
+
+struct DapChannelHealth {
+    volatile LONG tripped;      // 1 = 已熔断
+    volatile LONG consecutive;  // 连续超时次数（成功即清零）
+    volatile LONG probeFails;   // 熔断后探测连续失败次数（决定退避窗口）
+    volatile LONG windowStart;  // 熔断时刻 / 上次放行探测的时刻（GetTickCount）
+    volatile LONG lastNotice;   // 上次打"命令被拦下"日志的时刻（限流）
+    volatile LONG suppressed;   // 熔断期间被拦下的命令总数（诊断）
+    volatile LONG trips;        // 累计熔断次数（诊断）
+    volatile LONG recoveries;   // 累计自愈次数（诊断）
+};
+
+constexpr LONG  kDapTripAfter     = 2;       // 连续 2 次超时即熔断
+constexpr DWORD kDapHalfOpenMs    = 3000;    // 首次半开探测窗口
+constexpr DWORD kDapHalfOpenMaxMs = 30000;   // 退避窗口封顶
+constexpr DWORD kDapNoticeMinMs   = 10000;   // "命令被拦下"日志的最小间隔
+
+// Local\ 作用域 = 当前登录会话；进程内跨 DLL 重载存活（与 _nextOpenSeq 同法）
+DapChannelHealth* _dapHealthOf(void)
+{
+    static volatile DapChannelHealth* slot = nullptr;
+    if (!slot) {
+        HANDLE map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                        0, (DWORD)sizeof(DapChannelHealth),
+                                        "Local\\ORBMDK_DapHealth");
+        if (map) {
+            void* view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0,
+                                      sizeof(DapChannelHealth));
+            if (view) {
+                slot = (volatile DapChannelHealth*)view;
+            }
+        }
+    }
+    return (DapChannelHealth*)slot;
+}
+
+DWORD _dapHalfOpenWindow(LONG probeFails)
+{
+    DWORD w = kDapHalfOpenMs;
+    for (LONG i = 0; i < probeFails; ++i) {
+        if (w >= kDapHalfOpenMaxMs) {
+            break;
+        }
+        w *= 2;
+    }
+    return (w > kDapHalfOpenMaxMs) ? kDapHalfOpenMaxMs : w;
+}
+
+// 这个负返回值是否意味着"DAP 通道没响应（超时）"。
+// ⚠ -2 的含义随传输层而变：V2 是 _bulkWrite/_bulkRead 超时，V1 却是 cmdLen 越界
+//   （编程错误）—— 后者绝不能拿来熔断。
+bool _dapIsTimeout(int rc)
+{
+    if (rc >= 0) {
+        return false;
+    }
+    if (ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE) {
+        return rc == -2;
+    }
+    return rc == -3 || rc == -5;   // V1：HID 写超时 / 读超时
+}
+
+}  // anonymous namespace
+
+bool ORBMDK_DapChannelUsable(void)
+{
+    DapChannelHealth* h = _dapHealthOf();
+    if (!h || !h->tripped) {
+        return true;
+    }
+
+    const DWORD now = GetTickCount();
+    if ((DWORD)(now - (DWORD)h->windowStart) < _dapHalfOpenWindow(h->probeFails)) {
+        const LONG n = InterlockedIncrement(&h->suppressed);
+        // 熔断期间命令可能是成千上万条，逐条打日志会把日志文件冲垮 —— 限流
+        if ((DWORD)(now - (DWORD)h->lastNotice) >= kDapNoticeMinMs) {
+            InterlockedExchange(&h->lastNotice, (LONG)now);
+            LOG_HID_WARN("DAP 通道处于熔断状态，命令被立即拒绝（累计 %ld 条）。"
+                         "请给探针断电重插 —— 见 bug.md B1", n);
+        }
+        return false;
+    }
+
+    // 窗口到期：放行这一条当探测用，并把窗口重新计时（避免多线程一次放行一大片）
+    InterlockedExchange(&h->windowStart, (LONG)now);
+    LOG_HID_INFO("DAP 通道熔断窗口到期，放行一条探测命令（第 %ld 次探测）",
+                 (long)h->probeFails + 1);
+    return true;
+}
+
+void ORBMDK_DapNoteResult(int rc)
+{
+    DapChannelHealth* h = _dapHealthOf();
+    if (!h) {
+        return;
+    }
+
+    if (rc == 0) {
+        if (InterlockedExchange(&h->tripped, 0)) {
+            InterlockedIncrement(&h->recoveries);
+            LOG_HID_ERROR("DAP 通道已恢复：命令重新得到响应（熔断期间共拦下 %ld 条）。"
+                          "可以继续调试 —— 若再次卡死，多半仍是 bug.md B1",
+                          (long)h->suppressed);
+        }
+        InterlockedExchange(&h->consecutive, 0);
+        InterlockedExchange(&h->probeFails, 0);
+        return;
+    }
+
+    if (!_dapIsTimeout(rc)) {
+        // 协议层失败：设备在响应，只是这条命令不被接受 —— 既不算超时，也不清计数
+        return;
+    }
+
+    if (!h->tripped) {
+        const LONG n = InterlockedIncrement(&h->consecutive);
+        if (n >= kDapTripAfter) {
+            InterlockedExchange(&h->tripped, 1);
+            InterlockedExchange(&h->probeFails, 0);
+            InterlockedExchange(&h->suppressed, 0);
+            InterlockedExchange(&h->lastNotice, 0);
+            InterlockedExchange(&h->windowStart, (LONG)GetTickCount());
+            InterlockedIncrement(&h->trips);
+            LOG_HID_ERROR("================ DAP 通道熔断 ================");
+            LOG_HID_ERROR("连续 %ld 次超时（rc=%d），探针已不再响应任何 DAP 命令。", n, rc);
+            //LOG_HID_ERROR("这是 orbtrace 固件的已知缺陷（bug.md B1）：一次握手失败后");
+            //LOG_HID_ERROR("命令通道永久停止接收，而 USB 层仍然正常，主机侧无法复位它。");
+            //LOG_HID_ERROR("本层从现在起不再等待 1s 超时，DAP 命令立即失败。");
+            //LOG_HID_ERROR(">>> 唯一有效的恢复手段：给探针断电重插后重试本次调试。");
+            LOG_HID_ERROR("重插后无需重开 Keil：最迟 %u ms 后自动恢复（窗口到期放行探测）。",
+                          (unsigned)kDapHalfOpenMs);
+            //LOG_HID_ERROR("==============================================");
+        }
+        return;
+    }
+
+    // 已在熔断态 —— 说明刚才是半开窗口放行的探测、又失败了：退避加倍后继续等
+    InterlockedIncrement(&h->probeFails);
+    InterlockedExchange(&h->windowStart, (LONG)GetTickCount());
+}
+
+int ORBMDK_DapFastFailCode(void)
+{
+    // 与"真超时"返回同一个码，上层无需为熔断新增判断分支
+    return (ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE) ? -2 : -5;
+}
+
+void ORBMDK_DapChannelReset(const char* why)
+{
+    DapChannelHealth* h = _dapHealthOf();
+    if (!h) {
+        return;
+    }
+
+    const bool wasTripped = (InterlockedExchange(&h->tripped, 0) != 0);
+    InterlockedExchange(&h->consecutive, 0);
+    InterlockedExchange(&h->probeFails, 0);
+    if (wasTripped) {
+        LOG_HID_WARN("DAP 通道熔断状态已解除（%s）", why ? why : "设备重新打开");
+    }
+}
+
+// 前向声明：熔断闸门必须包在真正的分发逻辑外面（原函数体在下面，已更名为 _DapCommandRaw）
+static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
+                          uint8_t* resp, size_t* respLen, int timeoutMs);
+
 int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
+                          uint8_t* resp, size_t* respLen, int timeoutMs)
+{
+    // 熔断闸门（bug.md B1）：设备已判定无响应时直接失败，不再把 1s 超时重复几十遍
+    if (!ORBMDK_DapChannelUsable()) {
+        if (respLen) {
+            *respLen = 0;
+        }
+        return ORBMDK_DapFastFailCode();
+    }
+
+    const int rc = _DapCommandRaw(cmd, cmdLen, resp, respLen, timeoutMs);
+    ORBMDK_DapNoteResult(rc);
+    return rc;
+}
+
+static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
                           uint8_t* resp, size_t* respLen, int timeoutMs)
 {
     // ----------------------------------------------------------------------
@@ -756,10 +1006,14 @@ int DAP_SWJ_Pins(uint8_t pinSelect, uint8_t pinOut, int* pinIn, int wait)
 
 int DAP_ResetTarget(void)
 {
+    LOG_HID_INFO("DAP_ResetTarget: 下发 ID_DAP_RESET_TARGET(0x0A)");
     uint8_t cmd[1] = {ID_DAP_RESET_TARGET};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 5000);
+    const int rc = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 5000);
+    LOG_HID_INFO("DAP_ResetTarget: rc=%d, respLen=%u, resp=[%02X %02X %02X %02X]",
+                 rc, (unsigned)respLen, resp[0], resp[1], resp[2], resp[3]);
+    return rc;
 }
 
 int DAP_TransferAbort(int dapId)
@@ -1073,8 +1327,10 @@ int DAP_TargetOp(int operation, int* result)
             *result = 0;
             break;
         case 3:  // Reset
+            LOG_HID_INFO("DAP_TargetOp: operation=Reset, 调用 DAP_ResetTarget");
             ret = DAP_ResetTarget();
             *result = (ret == 0) ? 0 : -1;
+            LOG_HID_INFO("DAP_TargetOp: DAP_ResetTarget rc=%d, result=%d", ret, *result);
             break;
         default:
             return -1;
@@ -1086,101 +1342,242 @@ int DAP_TargetOp(int operation, int* result)
 // Streaming Trace Operations
 // ============================================================================
 
-static std::mutex g_traceMutex;
-static bool g_traceInitialized = false;
-static bool g_traceRunning = false;
-static std::vector<uint8_t> g_traceBuffer;
-static const size_t kTraceBufferSize = 64 * 1024;  // 64KB trace buffer
+static std::mutex               g_traceMutex;
+static std::condition_variable  g_traceCv;
+static bool                     g_traceInitialized = false;
+static bool                     g_traceRunning     = false;
+static bool                     g_traceStopThread  = false;
+static std::thread              g_traceThread;
+static std::vector<uint8_t>     g_traceRing;                  // 环形缓冲
+static size_t                   g_traceHead = 0;              // 写指针
+static size_t                   g_traceTail = 0;              // 读指针
+static size_t                   g_traceBytes = 0;             // 已缓存字节数
+static uint32_t                 g_traceBaudrate = 2000000;    // 由 ConfigureDebugger 的 TraceBaudrate= 更新
+static uint8_t                  g_traceSwoPort  = 1;          // SWO 端口：1 = UART/NRZ，2 = Manchester
+                                                              // 由 ConfigureDebugger 的 Trace= 解析后经 StreamingTrace_SetMode 设定
+static uint32_t                 g_traceDroppedBytes = 0;      // 缓冲满丢弃统计
+static const size_t             kTraceBufferSize = 512 * 1024;
+static const size_t             kTraceReadChunk  = 512;
+
+// 调用方必须持有 g_traceMutex
+static void TraceRingReset()
+{
+    g_traceHead = g_traceTail = g_traceBytes = 0;
+    g_traceDroppedBytes = 0;
+}
+
+// 调用方必须持有 g_traceMutex
+static void TraceRingPush(const uint8_t* data, size_t len)
+{
+    if (g_traceRing.empty()) return;
+    const size_t cap = g_traceRing.size();
+    for (size_t i = 0; i < len; ++i) {
+        if (g_traceBytes == cap) {
+            // 满：丢最旧的一个字节，宁可丢数据也不把 AGDI 的等待卡死
+            g_traceTail = (g_traceTail + 1) % cap;
+            --g_traceBytes;
+            ++g_traceDroppedBytes;
+        }
+        g_traceRing[g_traceHead] = data[i];
+        g_traceHead = (g_traceHead + 1) % cap;
+        ++g_traceBytes;
+    }
+}
+
+// 调用方必须持有 g_traceMutex；返回实际取出的字节数
+static size_t TraceRingPop(uint8_t* out, size_t maxLen)
+{
+    if (g_traceRing.empty()) return 0;
+    const size_t cap = g_traceRing.size();
+    size_t n = (maxLen < g_traceBytes) ? maxLen : g_traceBytes;
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = g_traceRing[g_traceTail];
+        g_traceTail = (g_traceTail + 1) % cap;
+    }
+    g_traceBytes -= n;
+    return n;
+}
+
+// 后台读取线程（兜底方案 B）：轮询 ID_DAP_SWO_DATA 把数据搬进环形缓冲。
+// 与 AGDI 的调试命令走同一条 HID/V2 通道，通道内部已串行化，因此是"抢总线"而非"撕数据"。
+static void TraceReadThreadFunc()
+{
+    uint8_t local[kTraceReadChunk];
+    LOG_HID_INFO("TraceReadThreadFunc: SWO 读取线程启动");
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(g_traceMutex);
+            if (g_traceStopThread) break;
+        }
+
+        size_t len = sizeof(local);
+        uint8_t status = 0;
+        uint16_t traceCount = 0;
+        int rc = DAP_SWO_Data(local, &len, &status, &traceCount);
+        if (rc == 0 && len > 0) {
+            std::lock_guard<std::mutex> lock(g_traceMutex);
+            TraceRingPush(local, len);
+            g_traceCv.notify_all();
+            continue;
+        }
+
+        // 无数据：小睡，避免空转刷 USB
+        std::unique_lock<std::mutex> lock(g_traceMutex);
+        g_traceCv.wait_for(lock, std::chrono::milliseconds(2),
+                           [] { return g_traceStopThread; });
+    }
+    LOG_HID_INFO("TraceReadThreadFunc: SWO 读取线程退出（丢弃 %u 字节）", g_traceDroppedBytes);
+}
 
 int StreamingTrace_Init(void)
 {
     std::lock_guard<std::mutex> lock(g_traceMutex);
     if (g_traceInitialized) return 0;
 
-    g_traceBuffer.reserve(kTraceBufferSize);
+    g_traceRing.assign(kTraceBufferSize, 0);
+    TraceRingReset();
     g_traceInitialized = true;
-    g_traceRunning = false;
+    g_traceRunning     = false;
+    g_traceStopThread  = false;
     return 0;
 }
 
 void StreamingTrace_Shutdown(void)
 {
+    StreamingTrace_Stop();
     std::lock_guard<std::mutex> lock(g_traceMutex);
-    g_traceRunning = false;
-    g_traceBuffer.clear();
+    TraceRingReset();
+    g_traceRing.clear();
     g_traceInitialized = false;
 }
 
+// AGDI 的 Start(handle, sinkIndex) 传的是 sink 下标（0 = cmsis_dap_swo_trace），不是 mode；
+// RDDI 层负责把 sink 下标翻成这里的 mode（0 = none, 1 = SWO, 2 = ETM）。
 int StreamingTrace_Start(uint8_t mode)
 {
-    std::lock_guard<std::mutex> lock(g_traceMutex);
-    if (!g_traceInitialized) {
-        StreamingTrace_Init();
+    {
+        std::lock_guard<std::mutex> lock(g_traceMutex);
+        if (!g_traceInitialized) {
+            g_traceRing.assign(kTraceBufferSize, 0);
+            TraceRingReset();
+            g_traceInitialized = true;
+        }
+        if (g_traceRunning) return 0;
     }
 
-    // 配置 SWO 传输
-    // mode: 0 = none, 1 = SWO, 2 = ETM
-    if (mode == 1) {
-        // 启用 SWO 传输
-        DAP_SWO_Transport(1);  // 0=none, 1=SWO
-        DAP_SWO_Control(1, NULL);  // Start
-        g_traceRunning = true;
-        return 0;
+    if (mode != 1) {
+        // ETM / 未知模式：明确失败，不假成功
+        LOG_HID_INFO("StreamingTrace_Start: mode=%u 不支持（本层只有 SWO=1）", (unsigned)mode);
+        return -1;
     }
 
-    return -1;
+    // 完整上电序列：Transport → Mode → Baudrate → Control(Start)
+    // （旧实现漏了 Mode，且 Baudrate 从未下发 —— §18.10-C 阶段 2/3）
+    if (DAP_SWO_Transport(1) != 0) {                 // 1 = SWO
+        LOG_HID_ERROR("StreamingTrace_Start: DAP_SWO_Transport(1) 失败");
+        return -1;
+    }
+    if (DAP_SWO_Mode(g_traceSwoPort) != 0) {         // 1 = UART/NRZ，2 = Manchester（按用户选择）
+        LOG_HID_ERROR("StreamingTrace_Start: DAP_SWO_Mode(%u) 失败", (unsigned)g_traceSwoPort);
+        return -1;
+    }
+    if (DAP_SWO_Baudrate(g_traceBaudrate) != 0) {
+        LOG_HID_ERROR("StreamingTrace_Start: DAP_SWO_Baudrate(%u) 失败", g_traceBaudrate);
+        return -1;
+    }
+    uint8_t swoStatus = 0;
+    if (DAP_SWO_Control(1, &swoStatus) != 0) {       // 1 = Start
+        LOG_HID_ERROR("StreamingTrace_Start: DAP_SWO_Control(Start) 失败");
+        return -1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_traceMutex);
+        g_traceRunning    = true;
+        g_traceStopThread = false;
+        g_traceThread     = std::thread(TraceReadThreadFunc);
+    }
+    LOG_HID_INFO("StreamingTrace_Start: SWO 流式启动（baud=%u, SWO status=0x%02X）",
+                 g_traceBaudrate, swoStatus);
+    return 0;
 }
 
 int StreamingTrace_Stop(void)
 {
-    std::lock_guard<std::mutex> lock(g_traceMutex);
-    if (!g_traceRunning) return 0;
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(g_traceMutex);
+        if (!g_traceRunning && !g_traceThread.joinable()) return 0;
+        g_traceRunning    = false;
+        g_traceStopThread = true;
+        g_traceCv.notify_all();
+        worker = std::move(g_traceThread);
+    }
+    if (worker.joinable()) worker.join();
 
-    // 停止 SWO
-    DAP_SWO_Control(0, NULL);  // Stop
-    g_traceRunning = false;
+    uint8_t swoStatus = 0;
+    DAP_SWO_Control(0, &swoStatus);                  // 0 = Stop
     return 0;
 }
 
+// 阻塞式取数据（AGDI 的 WaitForEvent 语义靠它）：
+//   返回值 >0 = 取到的字节数；0 = 超时（无数据）；-1 = 未在运行或参数错
+// 关键：到了 timeoutMs 必须**立刻**返回，而不是继续轮询刷总线。
+// 数据本身由 TraceReadThreadFunc 后台搬进环形缓冲，这里只做消费。
+int StreamingTrace_Read(uint8_t* buffer, size_t* size, uint32_t timeoutMs)
+{
+    if (!buffer || !size || *size == 0) return -1;
+    const size_t want = *size;
+
+    std::unique_lock<std::mutex> lock(g_traceMutex);
+    if (!g_traceRunning) { *size = 0; return -1; }
+
+    if (g_traceBytes == 0 && timeoutMs > 0) {
+        g_traceCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                           [] { return g_traceBytes > 0 || !g_traceRunning; });
+    }
+
+    size_t n = TraceRingPop(buffer, want);
+    *size = n;
+    return (int)n;
+}
+
+// 旧接口保留：语义与 StreamingTrace_Read 完全一致（旧实现是"最多 512 字节一轮的忙等"）
 int StreamingTrace_GetData(uint8_t* buffer, size_t* size, uint32_t timeoutMs)
 {
+    return StreamingTrace_Read(buffer, size, timeoutMs);
+}
+
+// 清空环形缓冲（AGDI 的 Flush(handle, sinkIndex) 落到这里）
+int StreamingTrace_Flush(void)
+{
     std::lock_guard<std::mutex> lock(g_traceMutex);
-    if (!g_traceRunning || !buffer || !size || *size == 0) {
-        return -1;
-    }
-
-    // 读取 SWO 数据
-    size_t requestedSize = *size;
-    size_t totalRead = 0;
-
-    while (totalRead < requestedSize && g_traceRunning) {
-        size_t readSize = requestedSize - totalRead;
-        if (readSize > 512) readSize = 512;
-
-        uint8_t resp[512 + 5] = {};
-        size_t respLen = sizeof(resp);
-
-        uint8_t cmd[3] = {
-            ID_DAP_SWO_DATA,
-            static_cast<uint8_t>(readSize & 0xFF),
-            static_cast<uint8_t>((readSize >> 8) & 0xFF),
-        };
-
-        int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 100);
-        if (result != 0 || respLen < 5) break;
-
-        size_t dataLen = respLen - 5;
-        memcpy(buffer + totalRead, &resp[5], dataLen);
-        totalRead += dataLen;
-
-        if (dataLen == 0) {
-            // 没有数据，稍微等待
-            Sleep(1);
-        }
-    }
-
-    *size = totalRead;
+    TraceRingReset();
     return 0;
+}
+
+// 由 RDDI 层在 ConfigureDebugger 解析 TraceBaudrate= 后调用（真正下发在 Start）
+void StreamingTrace_SetBaudrate(uint32_t baudrate)
+{
+    if (baudrate == 0) return;
+    std::lock_guard<std::mutex> lock(g_traceMutex);
+    g_traceBaudrate = baudrate;
+}
+
+// 设定 SWO 端口：1 = UART/NRZ，2 = Manchester。
+// 两个时机上的约束（写在这里以免后来者随手挪动）：
+//   1) 必须早于 StreamingTrace_Start —— Start 会按它下发 DAP_SWO_Mode；
+//   2) 影响 StreamingTrace_GetSinkInfo 回报的类型串 —— AGDI 拿到"SWO-Manchester"
+//      之后才会把 `Trace=SWO-Manchester` 写进配置串，前后必须自洽。
+void StreamingTrace_SetMode(uint8_t swoPort)
+{
+    if (swoPort != 1 && swoPort != 2) {
+        LOG_HID_INFO("StreamingTrace_SetMode: 忽略非法端口 %u（只接受 1=UART / 2=Manchester）",
+                     (unsigned)swoPort);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_traceMutex);
+    g_traceSwoPort = swoPort;
 }
 
 int StreamingTrace_GetStatus(uint8_t* status, uint16_t* traceCount)
@@ -1209,24 +1606,22 @@ int StreamingTrace_GetStatus(uint8_t* status, uint16_t* traceCount)
 
 int StreamingTrace_GetSinkInfo(int index, char* name, int nameLen, char* type, int typeLen)
 {
-    if (index < 0 || index >= 2) return -1;
+    // 名称/类型必须与 AGDI 及官方 CMSIS_DAP.dll 里的字面量一致（反汇编确认）：
+    //   - "cmsis_dap_swo_trace" 同时出现在 AGDI 与官方 DLL 中（sink 名）
+    //   - AGDI 的流式配置串是 Trace=SWO-UART;TraceTransport=Stream;（类型为 SWO-UART）
+    // 旧实现返回 "SWO"/"UART"/"ETM"，既不是 sink 名也不是类型名，AGDI 匹配不上。
+    // 本层只有 1 个 sink：ETM 已证不可达（§18.10-B / §18.9），故只接受 index == 0。
+    if (index != 0) return -1;
 
-    if (name && nameLen > 0) {
-        if (index == 0) {
-            strncpy_s(name, nameLen, "SWO", nameLen - 1);
-        } else {
-            strncpy_s(name, nameLen, "ETM", nameLen - 1);
-        }
-    }
-
+    if (name && nameLen > 0) strncpy_s(name, nameLen, "cmsis_dap_swo_trace", nameLen - 1);
+    // 类型串必须和用户实际选中的端口一致。AGDI 会把这里回报的类型拼进
+    // `Trace=<类型>;TraceTransport=Stream;` 再交给 ConfigureDebugger；
+    // 若此处恒报 "SWO-UART"，那么"用户选了 Manchester"会被这条串改写成 UART，
+    // 界面选择与本层实际下发的配置就互相矛盾了。
     if (type && typeLen > 0) {
-        if (index == 0) {
-            strncpy_s(type, typeLen, "UART", typeLen - 1);
-        } else {
-            strncpy_s(type, typeLen, "ARM_ETM", typeLen - 1);
-        }
+        const char* typeStr = (g_traceSwoPort == 2) ? "SWO-Manchester" : "SWO-UART";
+        strncpy_s(type, typeLen, typeStr, typeLen - 1);
     }
-
     return 0;
 }
 

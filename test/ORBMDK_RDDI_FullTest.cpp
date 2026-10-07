@@ -66,7 +66,10 @@ typedef int(*PFN_CMSIS_DAP_ResetTarget)(RDDIHandle);
 //   函数会把寄存器里的垃圾当成第 3 个指针参数并写入 → 0xc0000005。
 typedef int(*PFN_CMSIS_DAP_SWO_Control)(RDDIHandle, int);
 typedef int(*PFN_CMSIS_DAP_SWO_Status)(RDDIHandle, int*, int*);
-typedef int(*PFN_CMSIS_DAP_SWO_Baudrate)(RDDIHandle, int);
+// Baudrate 的第二参数同样是**指针**：AGDI 把候选波特率放在栈上、传地址进来
+// （µVision 的 SWO 时钟探测循环，见 Todo.md §18.15）。按值声明会让本 DLL
+// 解引用一个非法地址 → 0xc0000005。
+typedef int(*PFN_CMSIS_DAP_SWO_Baudrate)(RDDIHandle, int*);
 typedef int(*PFN_CMSIS_DAP_SWO_Data)(RDDIHandle, int*, void*, int*);
 
 // ============================================================================
@@ -433,7 +436,8 @@ int main(int argc, char* argv[]) {
     }
     
     if (pfn_CMSIS_DAP_SWO_Baudrate) {
-        TEST("CMSIS_DAP_SWO_Baudrate(115200)", pfn_CMSIS_DAP_SWO_Baudrate(handle, 115200));
+        int swo_baud = 115200;   // 传地址，不是值
+        TEST("CMSIS_DAP_SWO_Baudrate(115200)", pfn_CMSIS_DAP_SWO_Baudrate(handle, &swo_baud));
     }
     
     // 3 参：(handle, int *count, int *status)

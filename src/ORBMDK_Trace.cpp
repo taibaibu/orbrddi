@@ -34,6 +34,11 @@ struct ORBMDK_Trace_Context {
         struct ORBMDK_ETM_Decoder* etm;
     } decoder;
 
+    // SWO 时钟 / 波特率：由 ORBMDK_Trace_SWO_SetBaud 记录，供日志与上层查询。
+    uint32_t swoClock;      // SWO 时钟频率（Hz），0 = 未设置
+    uint32_t swoBaud;       // 目标波特率，0 = 未设置
+    uint32_t swoDivisor;    // 时钟分频比 = clock / baud，0 表示未设置或除不尽
+
     // 统计
     struct ORBMDK_Trace_Stats stats;
 
@@ -442,9 +447,29 @@ void ORBMDK_Trace_SetAltAddrEncode(ORBMDK_Trace_Handle handle, bool usingAlt)
     (void)usingAlt;
 }
 
+// SWO 波特率：本层是纯解码层，拿到的已经是探针送来的**字节流** ——
+// 波特率在探针侧就已经生效，解码本身并不需要它。所以这里做的是"记住"而不是"下发"：
+// 把时钟、波特率与分频比存进句柄，供日志与上层查询。
+// 真正把波特率下发到探针的是 HID 层的 DAP_SWO_Baudrate()，由 ConfigureDebugger
+// 的 TraceBaudrate= 驱动（见 ORBMDK_RDDI.cpp 的 CMSIS_DAP_ConfigureDebugger）。
+//
+// 为什么不再留成空函数：空函数会让人以为"波特率根本没被配置"，进而改错层
+// （Todo.md §18.10-C 阶段 3 专门点了这一条）。
 void ORBMDK_Trace_SWO_SetBaud(ORBMDK_Trace_Handle handle, uint32_t clock, uint32_t baud)
 {
-    (void)handle;
-    (void)clock;
-    (void)baud;
+    if (!handle) return;
+
+    struct ORBMDK_Trace_Context* ctx = (struct ORBMDK_Trace_Context*)handle;
+
+    ctx->swoClock = clock;
+    ctx->swoBaud  = baud;
+
+    // 分频比仅在两者都有效且能整除时计算，否则记 0（表示未设置 / 除不尽）。
+    // 保留这一对数是因为：出现"trace 全是乱码"时，SWO 侧首先要核对的就是
+    // 时钟与波特率的关系，既然上游给了这两个值，本层没有理由把它们丢掉。
+    if (clock != 0 && baud != 0 && (clock % baud) == 0) {
+        ctx->swoDivisor = clock / baud;
+    } else {
+        ctx->swoDivisor = 0;
+    }
 }

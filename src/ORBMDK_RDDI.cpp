@@ -70,20 +70,34 @@ static constexpr uint8_t kDefaultMatchRetry = 10;
 static constexpr int kJtagRecoverMaxFails = 3;
 
 // ---------------------------------------------------------------------------
-// 驱动自持的"固件版本"串（Identify(idNo=4) 的返回值）—— **不要**改成设备的 DAP_Info 串
+// 上报给宿主的固件版本串（Identify(idNo=4)）—— **不是**这里定义的一个固定常量
 //
-// 机理（§15 反汇编）：AGDI 把该串按 "%lu.%lu.%lu" 解析并取**主版本号**，
-// 主版本 >= 2 就切到它的"多 DAP 设备"分支；那条分支在本环境下走不通。
+// 取值来自**设备自报的 CMSIS-DAP `DAP_Info(0x04)`**（走已连上的那条传输，
+// 由 ORBMDK::DAP_GetInfo 内部按当前模式分发到 HID 或 Bulk），在 RDDI_Open 里
+// 问一次并缓存进 ctx（见那里的说明）。
 //
-// 2026-09-30 对照实验（同一台设备、同一份 DLL、唯一变量是这个串，见 §17.5）：
-//   * 串 = 设备自报 "2.1.0"（主版本 2）：RDDI 层一切正常（V2 通、DPIDR=0x2BA01477、
-//     Connect 成功），但 **AGDI 跳过全部设备枚举**（日志里没有
-//     GetNumberOfDevices / GetDeviceIDList / ConfigureDebugger），连上即断开 →
-//     界面报 RDDI-DAP Error。V2 与 HID 两条通路都一样失败。
-//   * 串 = "1.0.0"（主版本 1）：完整枚举 + 正常调试下载，V2 全程可用。
-// 所以这一栏必须由本层自持；设备自报的串只写日志，不向宿主暴露。
+// **不要**改用 USB 设备描述符的 bcdDevice：那是 USB 栈/引导程序写的字段，
+// 与固件真实版本无关 —— 这就是它"不准"的原因，已弃用。
+//
+// 机理（§17.6 反汇编；§17.5 单变量对照实验）：
+// AGDI 把该串按 "%lu.%lu.%lu" 解析并取**主版本号**，`cmp eax, 2` 决定是否切到它
+// 自己的"多 DAP 设备"分支；那次观测里该分支走不通 —— **跳过全部设备枚举**
+// （日志里没有 GetNumberOfDevices / GetDeviceIDList / ConfigureDebugger），
+// Connect 成功之后立刻 Disconnect/Close，界面报 RDDI-DAP Error。
+// 当时的实测（A/B 单变量，唯一变化就是这个串）：串 = 设备自报原样 "2.1.0"（主版本 2）
+// → 失败；串 = "1.0.0"（主版本 1）→ 完整枚举 + 正常调试下载。V2 与 HID 一致。
+// **注意**：那次观测发生在流式 sink 那 13 个接口实现之前，失败可能正源于接口缺失
+// （AGDI 来注册 sink 时无接口可调），不能直接推广到当前代码。
+//
+// 当前口径（2026-10-01 放开，见 Todo.md §18.10-C）：**设备的真实版本照问、照写日志**
+// （RDDI_Open 里的 LOG_INFO 原样打印设备回串），但上报给主机的串经
+// ORBMDK_NormalizeFwVersion 把主版本提升到 >= 2，用于打开 AGDI 的流式分支。
+// 若实机回归出现上面那种"连上即断 / RDDI-DAP Error"，即为回退判据，
+// 回退步骤见 include/ORBMDK.h 里那段 ⚠️ 说明。
+//
+// 下面这个常量只在**问不到设备**时使用（兜底），取值与放开后的口径一致（主版本 >= 2）。
 // ---------------------------------------------------------------------------
-static constexpr const char* kDriverFirmwareVersion = "1.0.0";
+static constexpr const char* kFallbackFirmwareVersion = ORBMDK_FALLBACK_FWVER_STRING;
 
 // ----------------------------------------------------------------------------
 // 单 DAP 枚举常量
@@ -115,31 +129,18 @@ static constexpr int kMaxBlockWords = 14;
 // 实际字数由 BlockWordsLimit() 按当前出包长度动态决定，不固定用它。
 static constexpr int kMaxBlockWordsHardLimit = 250;
 
-// 块传输总开关，**默认开启**，实际是否使用由运行时自动探测决定。
+// 块传输，**仅 SWD 启用**（JTAG 恒不走该命令，见 EnsureBlockTransferProbed），
+// 实际是否使用由运行时自动探测决定，没有可绕过的开关。
 //
 // 背景：DAP_RegWriteRepeat / DAP_RegReadRepeat 原先逐字调用 DAP_Transfer，
 // 每字一次 USB 往返。改用 ID_DAP_TRANSFER_BLOCK 后单次往返可带
 // kMaxBlockWords(=14) 个字，约 14×（见本文第九节）。
 //
-// 但并非所有 CMSIS-DAP 固件都实现了 ID_DAP_TRANSFER_BLOCK —— 例如
-// orbtrace 固件就没有。因此本层做**能力自动探测 + 不兼容回退**：
+// 但并非所有 CMSIS-DAP 固件都实现了 ID_DAP_TRANSFER_BLOCK。因此本层做
+// **能力自动探测 + 不兼容回退**：
 //   - 每个上下文首次用到块传输时，先用一次只读探测（读 DP IDCODE）确认；
 //   - 不支持则永久回退到逐字 DAP_Transfer，功能不受影响，只是慢；
 //   - 传输过程中块传输若意外失败，也会立即回退（双保险）。
-//
-// 排障时可用环境变量强制关闭（跳过探测，直接走逐字传输）：
-//     set ORBMDK_BLOCK_TRANSFER=0
-static bool BlockTransferEnabled()
-{
-    static const bool enabled = []() -> bool {
-        const char* env = getenv("ORBMDK_BLOCK_TRANSFER");
-        if (env && *env) {
-            return (*env != '0');   // 显式设置时才看它
-        }
-        return true;                // 默认开启，由自动探测决定实际路径
-    }();
-    return enabled;
-}
 
 // ---------------------------------------------------------------------------
 // 单次块传输能携带的字数（运行时决定，烧录吞吐的主杠杆）
@@ -176,9 +177,9 @@ struct RDDIContext {
     bool initialized = false;
     int handle = -1;  // Handle 索引
 
-    // 块传输可用性。默认乐观开启，首次用到时由 EnsureBlockTransferProbed()
-    // 探测一次并落定；探测或后续传输失败都会置 false，之后永久回退到
-    // 逐字 DAP_Transfer（见 BlockTransferEnabled 的说明）。
+    // 块传输可用性（**仅 SWD 使用**，JTAG 恒为 false）。默认乐观开启，
+    // 首次用到时由 EnsureBlockTransferProbed() 探测一次并落定；探测或后续
+    // 传输失败都会置 false，之后永久回退到逐字 DAP_Transfer。
     bool blockTransferSupported = true;
     bool blockTransferProbed    = false;
 
@@ -235,6 +236,45 @@ struct RDDIContext {
     int traceBufferSize = 65536;
     int swoBaudrate = 115200;
     std::vector<uint8_t> traceBuffer;
+
+    // ---- SWO 端口与传输方式（来自 AGDI 的配置串）----
+    // AGDI 把用户在 µVision 的 Trace 页里选的东西拼成一条配置串交给本层，形如
+    //   Trace=SWO-UART;TraceBaudrate=2000000;TraceTransport=Read;
+    // 本层必须记住这两项，因为"用户选的端口/传输方式"决定实际下发什么：
+    //   swoPortMode      : 0 = 未选 / Trace=Off（按 UART 处理），1 = SWO-UART，2 = SWO-Manchester
+    //   swoTransportMode : 0 = 未选 / None，1 = Read（AGDI 轮询 CMSIS_DAP_SWO_Data），
+    //                      2 = Stream（走 streaming sink 取数）
+    // 用途：
+    //   - Read 路径：CMSIS_DAP_SWO_Control(Start) 之前要按它下发 SWO Transport / Mode / Baudrate；
+    //   - Stream 路径：StreamingTrace_Start 选 SWO Mode、StreamingTrace_GetSinkDetails 回 sink 类型。
+    // 解析位置见 CMSIS_DAP_ConfigureDebugger。
+    int swoPortMode      = 0;
+    int swoTransportMode = 0;
+
+    // SWO 波特率被探针拒绝的次数。AGDI 探测 SWO 时钟时会遍历分频（1..0x2000），
+    // 每次都调一次 CMSIS_DAP_SWO_Baudrate；逐条记日志会把日志淹没，
+    // 故只在头几次失败时留痕（见该函数的实现）。
+    int swoBaudFailCount = 0;
+
+    // ---- SWO 流式 trace 会话（Todo.md §18.10-C 阶段 2）----
+    // AGDI 的注册与取数协议（反汇编 CMSIS_AGDI.dll 逐调用点取证）：
+    //   Connect(handle)                                  → GetSinkCount(handle,&n)
+    //   → GetSinkDetails(handle,i,Rec) 循环 i=0..n-1     → Attach(handle,idx)
+    //   → Start(handle,idx) → 循环 { SubmitEventBuffer(...) ; WaitForEvent(handle,idx,&token,50) }
+    //   → Flush/Stop/Detach
+    // 数据是"AGDI 提供缓冲、本层往里填、再用 token 通知 AGDI"，所以这里必须记住
+    // AGDI 提交过来的条目与它期望的 token。
+    // 本层只报 1 个 sink（0 号 = cmsis_dap_swo_trace），sinkIndex 只接受 0。
+    int  traceSinkIndex = -1;                       // AGDI 选中的 sink（本层恒为 0）
+    static const int kTraceMaxEntries = 64;         // 一次会话最多记住的提交条目数
+    int   traceEntryToken[kTraceMaxEntries] = {0};  // 发给 AGDI 的 token（0 保留为"无事件"）
+    void *traceEntryPtr[kTraceMaxEntries] = {nullptr};
+    bool  traceEntryFilled[kTraceMaxEntries] = {false};
+    int   traceEntryCount = 0;
+    int   traceNextToken  = 1;
+    int   traceEntryCapacityLogged = 0;             // 首次提交时打一次条目容量，便于核对
+    int   traceAttachRefCount = 0;                  // Attach/Detach 引用计数（>0 = 会话在用）
+    std::mutex traceMutex;                          // 保护上面的条目表（WaitForEvent 跨线程）
 
     // PC Sampling state
     bool pcSamplingEnabled = false;
@@ -427,6 +467,18 @@ static bool ProbeBlockTransfer(int dapId)
 }
 
 // 首次用到块传输时调用；之后再调用无开销。
+//
+// **JTAG 放弃块传输**（ID_DAP_TRANSFER_BLOCK 由固件驱动 TAP）：JTAG 的 IR/DR
+// 时序全部由本层引擎生成（JtagSetIr + JtagDrScan），并缓存了 IR 假说（jtagCurIr）
+// 与 posted-write 流水线（jtagWritePending）；固件驱动的块传输与它是两条各自
+// 维护状态的通路，共用同一条链时交接边界难以保证一致。故 JTAG 会话直接落定
+// "不支持块传输"，永久走逐字引擎 DapTransferFor —— 功能等价，只是慢。
+//
+// SWD 走"先探测、失败即永久回退"：探测失败只影响性能，功能不受影响，之后
+// 永久走逐字 DAP_Transfer。
+//
+// 传输层是 HID 还是 Bulk 与本函数无关：两者都经 ORBMDK_HID_DAPCommand 派发，
+// 字数上限由 BlockWordsLimit() 按当前出包长度给出。
 static void EnsureBlockTransferProbed(RDDIContext* ctx, int dapId)
 {
     if (ctx->blockTransferProbed) {
@@ -434,17 +486,11 @@ static void EnsureBlockTransferProbed(RDDIContext* ctx, int dapId)
     }
     ctx->blockTransferProbed = true;
 
-    // JTAG 模式统一走本层引擎的逐次传输：块传输命令会绕到固件自己的 IR/DR 引擎，
-    // 那条路径在本目标上没验证过，而逐次传输已经过扫链/DPIDR/ABORT 验证。
     if (!ctx->isSWD) {
+        // JTAG：不使用块传输（见上），无需探测固件能力。
         ctx->blockTransferSupported = false;
-        LOG_INFO("Block transfer: JTAG 模式使用逐次传输（不启用固件块传输命令）");
-        return;
-    }
-
-    if (!BlockTransferEnabled()) {
-        ctx->blockTransferSupported = false;
-        LOG_INFO("Block transfer disabled by ORBMDK_BLOCK_TRANSFER -> single transfers");
+        LOG_INFO("EnsureBlockTransferProbed: JTAG 会话 -> 不使用 ID_DAP_TRANSFER_BLOCK，"
+                 "走逐字传输");
         return;
     }
 
@@ -539,26 +585,24 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
     ctx->initialized = true;
     ctx->handle = handle;
     ctx->isConnected = true;
-    ctx->blockTransferSupported = BlockTransferEnabled();  // 默认关闭，见其说明
+    ctx->blockTransferSupported = true;   // 乐观开启，首次用到时按 SWD/JTAG 落定
 
-    // 从 HID 层取设备标识（USB 产品名 / 序列号 / 固件版本）。
-    // 历史问题：这三个字段此前从未被赋值，导致 CMSIS_DAP_Identify 只能回退到
+    // 从 HID 层取设备标识（USB 产品名 / 序列号）。
+    // 历史问题：这两个字段此前从未被赋值，导致 CMSIS_DAP_Identify 只能回退到
     // 硬编码串、CMSIS_DAP_GetDeviceIDList 返回空字符串、CMSIS_DAP_GetGUID 得到
     // "ORBTrace-"。数据其实早已由 HidD_GetProductString / HidD_GetSerialNumberString
     // 取到，只是没有向上传递。
+    // 注：固件版本**不从这里取** —— 它必须问设备（DAP_Info(0x04)），见函数末尾。
     {
         char product[128] = {};
         char serial[128] = {};
-        char version[64] = {};
         if (ORBMDK::ORBMDK_HID_GetDeviceInfo(product, sizeof(product),
                                              serial, sizeof(serial),
-                                             version, sizeof(version)) == 0) {
-            ctx->productName     = product;
-            ctx->serialNumber    = serial;
-            ctx->firmwareVersion = version;
-            LOG_DEBUG("RDDI_Open: device product='%s' serial='%s' fw='%s'",
-                      ctx->productName.c_str(), ctx->serialNumber.c_str(),
-                      ctx->firmwareVersion.c_str());
+                                             nullptr, 0) == 0) {
+            ctx->productName  = product;
+            ctx->serialNumber = serial;
+            LOG_DEBUG("RDDI_Open: device product='%s' serial='%s'",
+                      ctx->productName.c_str(), ctx->serialNumber.c_str());
         } else if (ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE) {
             // V2 模式下本来就没打开 HID 接口，这里取不到属正常，
             // 产品名/序列号改从 Bulk 接口与设备描述符取（见下）
@@ -593,17 +637,30 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
                 ctx->serialNumber = bulkSerial;
             }
 
-            // 设备自报的固件串**不进 ctx、不向宿主暴露**：
-            // 它是 "2.1.0"（主版本 2），会让 AGDI 切到"多 DAP"分支（见
-            // kDriverFirmwareVersion 的说明）。真正返回给 Identify(idNo=4) 的
-            // 是驱动自持的那一份，在函数末尾统一赋值。
         }
     }
 
-    // 固件版本串一律由本层自持（两种传输、每次打开都一致）—— 它是 AGDI
-    // "是否走多 DAP 分支"的开关，绝不能让设备自报的 "2.1.0"（主版本 2）漏出去。
-    // 对照实验见 COMPAT_ANALYSIS §17.5。
-    ctx->firmwareVersion = kDriverFirmwareVersion;
+    // ---- 上报给宿主的固件版本串 ----
+    // 唯一来源 = **设备自报的 DAP_Info(0x04)**（走已连上的那条传输；DAP_GetInfo
+    // 内部按当前模式分发到 HID 或 Bulk）。**不读** USB 描述符的 bcdDevice：
+    // 那是 USB 栈/引导写的字段，不等于固件版本（见 kFallbackFirmwareVersion 上方）。
+    //
+    // 必须在这里问一次并缓存：AGDI 会多次调 Identify(idNo=4) 并拿返回值做能力
+    // 判定，每次现问设备会给出不一致的串，而且设备可能已经断开。
+    //
+    // 归一化不能省：AGDI 对主版本做 `cmp eax, 2`（§17.6），只有主版本 >= 2 才会进入
+    // 它的 streaming sink 注册分支。当前口径是"提升到 >= 2"（2026-10-01 放开，§18.10-C），
+    // 与 caps 的 0x40 同侧；问不到设备时由归一化落到兜底 "2.0.0"。
+    {
+        char deviceVersion[64] = {};
+        const int rc = ORBMDK::DAP_GetInfo(DAP_INFO_FIRMWARE, deviceVersion,
+                                           sizeof(deviceVersion));
+        char reported[64] = {};
+        ORBMDK_NormalizeFwVersion(deviceVersion, reported, sizeof(reported));
+        ctx->firmwareVersion = reported;
+        LOG_INFO("RDDI_Open: device DAP_Info(4)='%s' (rc=%d) -> Identify(4) reports '%s'",
+                 deviceVersion, rc, ctx->firmwareVersion.c_str());
+    }
 
     // 插入 map（堆分配，地址稳定）
     gContexts.emplace(handle, std::move(ctx));
@@ -1162,12 +1219,6 @@ static bool JtagInitSequence(RDDIContext* ctx, int* outMode, uint32_t* outIdcode
     }
     LOG_INFO("JtagInitSequence: 探针已进入 JTAG 模式");
 
-    // JTAG 时钟限幅：orbtrace 官方发布说明写明 "JTAG target access ... tends to run
-    // out of steam around 10-12Mbps"（SWD 可到 25Mbps）。Keil 传下来的 cfg 是
-    // Clock=10000000，正好压在 JTAG 的临界值上；这里主动限到 4 MHz 留裕量。
-    ORBMDK::DAP_SetSWJClock(4000000);
-    LOG_INFO("JtagInitSequence: SWJ 时钟限到 4 MHz（JTAG 通路裕量）");
-
     // SWD -> JTAG 切换序列（ADIv5 / OpenOCD 的 swd_seq_swd_to_jtag）：
     // ① TMS/SWDIO 保持 1 连续 ≥50 拍（线复位）② 在 TMS/SWDIO 上发 16 位 0xE73C。
     // SWJ-DP 有"模式记忆"，刚用 SWD 通信过它就停在 SWD 模式，此时直接扫链必然为空。
@@ -1615,11 +1666,16 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
 // HID 中断端点 Full Speed 轮询间隔 1 ms，于是 1 KB 数据要 256 次往返 ——
 // 这是烧录慢的**唯一主因**（见第九节）。
 //
-// 改为块传输（ID_DAP_TRANSFER_BLOCK）后，单次往返从 1 个字提升到
-// kMaxBlockWords(=14) 个字，约 14×。AGDI 侧已把 CSW 配成地址自增
-// （SWD_WriteBlock / SWD_VerifyBlock），语义与块传输一致。
+// 改为块传输（ID_DAP_TRANSFER_BLOCK）后，单次往返的字数提升到
+// BlockWordsLimit()：HID 下 kMaxBlockWords(=14)，V2 Bulk 下按自标定出包长度可达
+// 250 字。AGDI 侧已把 CSW 配成地址自增（SWD_WriteBlock / SWD_VerifyBlock），
+// 语义与块传输一致。
 //
-// 固件若不支持该命令，首次失败即永久回退到逐字传输，功能不受影响。
+// 块传输**只在 SWD 下启用**（HID 与 V2 Bulk 两条传输层共用
+// ORBMDK_HID_DAPCommand 派发）；JTAG 恒走本层逐字引擎 DapTransferFor
+// （见 EnsureBlockTransferProbed 的说明）。
+//
+// 固件若不支持该命令，首次探测失败即永久回退到逐字传输，功能不受影响。
 // ---------------------------------------------------------------------------
 RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const int numRepeats,
                                  const int regId, const int *dataArray)
@@ -1671,9 +1727,11 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
                 return RDDI_DAP_ERROR;
             }
         }
-        // JTAG 的写是流水线的：最后那笔要一次后续访问才真正落到目标上
-        JtagDapFlush(ctx);
         done += chunk;
+
+        // JTAG 的写是流水线的：每个 chunk 收尾补一次访问，把挂起的那笔写真正落到
+        // 目标上（SWD 下 JtagDapFlush 立即返回，无开销）
+        JtagDapFlush(ctx);
     }
 
     return RDDI_SUCCESS;
@@ -1890,13 +1948,14 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
             break;
 
         case 4:  // Firmware version (RDDI_CMSIS_DAP_ID_FW_VER)
-            // 一律回驱动自持的那一份（RDDI_Open 里已赋值）。**不能**回退去问设备：
-            // 设备串是 "2.1.0"，主版本 2 会让 AGDI 走"多 DAP"分支（见
-            // kDriverFirmwareVersion 的说明）。这里保留兜底只是为了防御性。
+            // 一律回 RDDI_Open 缓存的那一份（设备 DAP_Info(4) 的真实版本 +
+            // 主版本归一化）。**不要**改成每次现问设备：AGDI 拿返回值做能力判定，
+            // 两次调用给出不同的串会出事（COMPAT_ANALYSIS 条目 50）。
+            // 这里的 else 只是防御性兜底。
             if (!ctx->firmwareVersion.empty()) {
                 strncpy_s(str, len, ctx->firmwareVersion.c_str(), len - 1);
             } else {
-                strncpy_s(str, len, kDriverFirmwareVersion, len - 1);
+                strncpy_s(str, len, kFallbackFirmwareVersion, len - 1);
             }
             break;
 
@@ -1974,7 +2033,22 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
         if (keyStr == "Port") {
             // 这里决定后面走 SWD 还是 JTAG 建链（§18.9）：CMSIS_DAP_Connect /
             // DetectTargetDapIdList / LinkRecover 都会读 ctx->isSWD 分岔。
-            ctx->isSWD = (valueStr == "SW");
+            const bool newIsSwd = (valueStr == "SW");
+
+            // 模式切换让上一次的结论与 JTAG 链状态全部失效：
+            //   - 块传输只在 SWD 下启用，切模式后必须让探测结论失效
+            //     （EnsureBlockTransferProbed 会按新模式重新落定：SWD 探测、
+            //      JTAG 直接置不支持）；
+            //   - IR 缓存 / 写流水线是 JTAG 专属状态，换链后必须作废。
+            if (newIsSwd != ctx->isSWD) {
+                ctx->blockTransferProbed    = false;
+                ctx->blockTransferSupported = true;   // 乐观开启，按新模式重新落定
+                ctx->jtagCurIr        = 0;
+                ctx->jtagWritePending = false;
+                LOG_INFO("CMSIS_DAP_ConfigureInterface: 调试模式切换 -> 块传输能力将重新判定");
+            }
+
+            ctx->isSWD = newIsSwd;
             LOG_INFO("CMSIS_DAP_ConfigureInterface: Port='%s' -> %s 模式",
                      valueStr.c_str(), ctx->isSWD ? "SWD" : "JTAG");
         } else if (keyStr == "Clock") {
@@ -2056,14 +2130,19 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
     // `Trace Enable` 勾选因此不产生任何效果。
     //
     // Read 传输只需上面两位之一，**不**要求 Identify(idNo=4) 主版本 >= 2，
-    // 也**不**要求 INFO_CAPS_SWO_STREAMING_TRACE(0x40) —— 故这里**不**置 0x40，
-    // 避免 AGDI 在 0x1002287A 选到本层尚未实现的 Streaming 路径（Todo.md §18.5）。
+    // 也**不**要求 INFO_CAPS_SWO_STREAMING_TRACE(0x40)。
     //
-    // 注意：这两位只有在 SWO 数据通路（CMSIS_DAP_SWO_Control / Baudrate / Data /
-    // Status）确实可跑时才成立，否则等于宣称未验证能力。
+    // Streaming 位（Bit6 = 0x40）**已置**（2026-10-01 放开，见 Todo.md §18.10-C）。
+    // 它与 Identify(idNo=4) 的主版本号是同一道门控的两半，两道必须同侧：
+    //   0x1003CB97  cmp eax, 2 / jb   —— 主版本 >= 2 才走 streaming sink 注册
+    //   0x10022A6B  test caps, 0x40   —— caps 无 0x40 时 Trace 传输退回 Read
+    // 版本那一半已由 ORBMDK_NormalizeFwVersion 统一提升到 >= 2，故这里必须一起打开；
+    // 只开一半（版本 1 + 有 0x40）等于向 AGDI 宣称了流式能力，却永远等不到它来注册 sink。
+    // 回退时两处一起改回，具体步骤见 include/ORBMDK.h 里那段 ⚠️ 回退说明。
     *cap_info = INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS
               | INFO_CAPS_SWO_UART
-              | INFO_CAPS_SWO_MANCHESTER;
+              | INFO_CAPS_SWO_MANCHESTER
+              | INFO_CAPS_SWO_STREAMING_TRACE;
 
     return RDDI_SUCCESS;
 }
@@ -2279,7 +2358,10 @@ RDDI_FUNC int CMSIS_DAP_Commands(const RDDIHandle handle, int num,
     }
 
     // Handle reset target command
+    LOG_INFO("CMSIS_DAP_Commands: 收到 ID_DAP_RESET_TARGET(0x0A)，执行目标复位");
     int status = ORBMDK::DAP_ResetTarget();
+    LOG_INFO("CMSIS_DAP_Commands: DAP_ResetTarget -> status=%d (%s)",
+             status, status == 0 ? "OK" : "FAIL");
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
 
@@ -2338,7 +2420,10 @@ RDDI_FUNC int CMSIS_DAP_ResetTarget(const RDDIHandle handle)
         return RDDI_INVHANDLE;
     }
 
+    LOG_INFO("CMSIS_DAP_ResetTarget: 执行目标复位（DAP_ResetTarget）");
     int status = ORBMDK::DAP_ResetTarget();
+    LOG_INFO("CMSIS_DAP_ResetTarget: DAP_ResetTarget -> status=%d (%s)",
+             status, status == 0 ? "OK" : "FAIL");
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
 
@@ -2809,6 +2894,34 @@ RDDI_FUNC int CMSIS_DAP_SWO_Control(const RDDIHandle handle, int control)
         return RDDI_INVHANDLE;
     }
 
+    // ---- Read 路径：Start 之前必须把 SWO 的三个基本配置补齐 ----
+    // 走 Read 时，AGDI 只会调 SWO_Control / SWO_Baudrate / SWO_Data 这几个函数，
+    // 它**不会**自己下发 SWO 的 Transport 与 Mode。也就是说"从哪个引脚收数据、
+    // 用 UART 还是 Manchester 编码"这件事，AGDI 只在 ConfigureDebugger 的配置串里
+    // 告诉过本层一次（Trace=…），如果本层不在这里补发，探针就只能用它自己的默认值跑，
+    // 表现就是：界面里选了 Manchester，实际收到的还是按 UART 解出来的乱码。
+    //
+    // 失败只记 WARN、不阻断 Start：老固件可能不支持其中某条命令，
+    // 那种情况下维持"和以前一样"比直接拒绝启动更可取。
+    if (control != 0) {
+        const uint8_t port = (ctx->swoPortMode == 2) ? 2 : 1;   // 2 = Manchester, 1 = UART
+
+        if (ORBMDK::DAP_SWO_Transport(1) != 0) {   // 1 = 使用 SWO 引脚（UART / Manchester 都走这一条）
+            LOG_WARN("CMSIS_DAP_SWO_Control: DAP_SWO_Transport(1) 失败（固件可能不支持，忽略）");
+        }
+        if (ORBMDK::DAP_SWO_Mode(port) != 0) {
+            LOG_WARN("CMSIS_DAP_SWO_Control: DAP_SWO_Mode(%u) 失败（固件可能不支持，忽略）", port);
+        }
+        if (ctx->swoBaudrate > 0 &&
+            ORBMDK::DAP_SWO_Baudrate(static_cast<uint32_t>(ctx->swoBaudrate)) != 0) {
+            LOG_WARN("CMSIS_DAP_SWO_Control: DAP_SWO_Baudrate(%d) 失败（固件可能不支持，忽略）",
+                     ctx->swoBaudrate);
+        }
+
+        LOG_INFO("CMSIS_DAP_SWO_Control: Start 前置下发 port=%u(%s), baud=%d",
+                 port, port == 2 ? "Manchester" : "UART", ctx->swoBaudrate);
+    }
+
     uint8_t status = 0;
     int ret = ORBMDK::DAP_SWO_Control(static_cast<uint8_t>(control), &status);
     return ret == 0 ? RDDI_SUCCESS : RDDI_FAILED;
@@ -2834,7 +2947,7 @@ RDDI_FUNC int CMSIS_DAP_SWO_Status(const RDDIHandle handle, int *count, int *sta
     }
 
     // 发送 SWO_Status 命令 (0x1B)
-    // 响应（含报告ID）：[报告ID][命令ID][Status]
+    // 响应（含报告ID）：[报告ID][命令ID][Status]（探针带计数时后面还有 [Count_L][Count_H]）
     uint8_t cmd[1] = { ID_DAP_SWO_STATUS };
     uint8_t resp[8] = {0};
     size_t respLen = sizeof(resp);
@@ -2845,27 +2958,64 @@ RDDI_FUNC int CMSIS_DAP_SWO_Status(const RDDIHandle handle, int *count, int *sta
     }
 
     *status = resp[2];
-    // 本实现按需从探针拉取 SWO 数据，不做本地缓存，故待读字节数为 0。
+
+    // 待读字节数：本层不做本地缓存（Read 路径的数据是按需从探针拉的），
+    // 所以这个数只能取自探针响应里的计数字段。此前一律用 swoBuffer.size()，
+    // 而 swoBuffer 在 Read 路径下从不被填，等于永远报 0 —— AGDI 会据此认为
+    // "没东西可读"，表现出来就是 Trace 窗口一直空着。固件不回计数字段时
+    // 仍退回原来的 0，行为与以前完全一致。
+    int pending = static_cast<int>(ctx->swoBuffer.size());
+    if (respLen >= 5) {
+        pending = static_cast<int>(resp[3] | (static_cast<int>(resp[4]) << 8));
+    }
     if (count) {
-        *count = static_cast<int>(ctx->swoBuffer.size());
+        *count = pending;
     }
     return RDDI_SUCCESS;
 }
 
-// ARM rddi_dap_swo.h: CMSIS_DAP_SWO_Baudrate(handle, int baudrate)
-RDDI_FUNC int CMSIS_DAP_SWO_Baudrate(const RDDIHandle handle, int baudrate)
+// CMSIS_DAP_SWO_Baudrate(handle, int *baudrate)
+//
+// 这条路径是 µVision 的 **SWO 时钟自动探测**：AGDI 把 SWO 时钟频率（全局
+// [0x1021268C]）逐次除以候选分频 (div+1)，结果写到栈上，再把**地址**交给本函数
+// 下发；返回 0 表示"该分频可用"，非 0 表示"换下一个再试"。div 从 0 试到 0x1FFF，
+// 全部失败 → 界面报 "SWO CLOCK not support"。
+//
+// ⚠️ 两条硬约束（均来自 AGDI 反汇编，改动前务必重读 Todo.md §18.15）：
+//   1) 第二参数是**指针**。按值接收会把栈地址（约 1.7 MB 量级的数）当成波特率
+//      下发，探针给出的结果必然对不上，界面随即报 "SWO CLOCK not support"；
+//   2) **不要回写 *baudrate**。包装函数 0x1003D030 先 `mov ebx,[edi]` 存下原值，
+//      调用后再 `cmp [edi], ebx`；一旦发现值被改写就返回 0x2022（非 0），
+//      调用方据此判为"该分频不可用" —— 回写反而会让整轮探测失败。
+RDDI_FUNC int CMSIS_DAP_SWO_Baudrate(const RDDIHandle handle, int *baudrate)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
 
-    if (baudrate <= 0) {
+    if (!baudrate || *baudrate <= 0) {
         return RDDI_BADARG;
     }
 
-    int status = ORBMDK::DAP_SWO_Baudrate(static_cast<uint32_t>(baudrate));
-    return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+    const uint32_t baud = static_cast<uint32_t>(*baudrate);
+    const int status = ORBMDK::DAP_SWO_Baudrate(baud);
+
+    if (status == 0) {
+        // 探测最多连调 8192 次，正常只有一次成功，值得单独记一条 INFO。
+        ctx->swoBaudrate = static_cast<int>(baud);
+        LOG_INFO("CMSIS_DAP_SWO_Baudrate: 探针接受 %u Hz，SWO 时钟探测结束", baud);
+        return RDDI_SUCCESS;
+    }
+
+    // 失败往往成百上千次，前几条就足够说明"探针是否接受这个命令"。
+    if (ctx->swoBaudFailCount < 4) {
+        LOG_WARN("CMSIS_DAP_SWO_Baudrate: 探针拒绝 %u Hz（第 %d 次失败；"
+                 "连续大量失败即界面报 SWO CLOCK not support 的原因）",
+                 baud, ctx->swoBaudFailCount + 1);
+    }
+    ++ctx->swoBaudFailCount;
+    return RDDI_DAP_ERROR;
 }
 
 // ARM rddi_dap_swo.h: CMSIS_DAP_SWO_Data(handle, int *num_written, void *buffer, int *status)
@@ -3042,6 +3192,7 @@ RDDI_FUNC int CMSIS_DAP_ResetDAP(const RDDIHandle handle)
     ORBMDK::DAP_ConfigureTransfer(0, kDefaultWaitRetry, kDefaultMatchRetry);
 
     // 4. 重置目标
+    LOG_INFO("CMSIS_DAP_ResetDAP: 执行目标复位（DAP_ResetTarget）");
     status = ORBMDK::DAP_ResetTarget();
     if (status != 0) {
         LOG_ERROR("CMSIS_DAP_ResetDAP: DAP_ResetTarget failed, status=%d", status);
@@ -3194,6 +3345,33 @@ RDDI_FUNC int DAP_GetSupportedHostStatusIDs(const RDDIHandle handle, int *count,
     return RDDI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// 配置串取值：AGDI 交来的是 `Key=Value;Key=Value;…` 形式的一条串。
+// 取某个键的值（读到 ';' 或串尾为止），找不到就返回 false。
+// 传进来的键必须带 '='（例如 "Trace="），这样 "Trace=" 不会误命中 "TraceBaudrate="。
+// ---------------------------------------------------------------------------
+static bool GetConfigValue(const char* config, const char* keyEq, char* out, size_t outLen)
+{
+    if (!config || !keyEq || !out || outLen == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    const char* p = strstr(config, keyEq);
+    if (!p) {
+        return false;
+    }
+    p += strlen(keyEq);
+
+    size_t n = 0;
+    while (p[n] != '\0' && p[n] != ';' && (n + 1) < outLen) {
+        out[n] = p[n];
+        ++n;
+    }
+    out[n] = '\0';
+    return true;
+}
+
 RDDI_FUNC int CMSIS_DAP_ConfigureDebugger(const RDDIHandle handle, const char *config)
 {
     LOG_DEBUG("CMSIS_DAP_ConfigureDebugger: enter, handle=%d, config=%p", handle, (const void *)config);
@@ -3205,6 +3383,58 @@ RDDI_FUNC int CMSIS_DAP_ConfigureDebugger(const RDDIHandle handle, const char *c
     if (config) {
         // 解析调试器配置字符串
         ctx->lastErrorStr = config;
+        LOG_INFO("CMSIS_DAP_ConfigureDebugger: config=\"%s\"", config);
+
+        // --- Trace= ：用户在 Trace 页里选的端口 ---
+        // AGDI 依 caps 的 0x04 / 0x08 决定界面上能选哪些端口（反汇编见 Todo.md §18.8），
+        // 选中之后写进这条串。本层若不解析，"选了 Manchester" 会被悄悄当作 UART 跑，
+        // 表现为 trace 窗口时有时无或全是乱码。
+        char port[64] = {};
+        if (GetConfigValue(config, "Trace=", port, sizeof(port))) {
+            if (_stricmp(port, "SWO-UART") == 0) {
+                ctx->swoPortMode = 1;
+            } else if (_stricmp(port, "SWO-Manchester") == 0) {
+                ctx->swoPortMode = 2;
+            } else if (_stricmp(port, "Off") == 0 || _stricmp(port, "None") == 0 || port[0] == '\0') {
+                ctx->swoPortMode = 0;   // Trace=Off：用户没开 trace
+            } else {
+                // 未知端口名：按 UART 处理并留一条日志，避免"选了却不生效"这种哑失败
+                ctx->swoPortMode = 1;
+                LOG_WARN("CMSIS_DAP_ConfigureDebugger: 未知的 Trace=%s，按 SWO-UART 处理", port);
+            }
+
+            // 同步给流式通路：它会用这个端口决定 DAP_SWO_Mode 的参数，
+            // 以及在 GetSinkDetails 里回报 sink 类型（SWO-UART / SWO-Manchester）。
+            if (ctx->swoPortMode != 0) {
+                ORBMDK::StreamingTrace_SetMode(static_cast<uint8_t>(ctx->swoPortMode));
+            }
+        }
+
+        // --- TraceTransport= ：Read（AGDI 轮询取数）还是 Stream（流式 sink 取数） ---
+        char transport[64] = {};
+        if (GetConfigValue(config, "TraceTransport=", transport, sizeof(transport))) {
+            if (_stricmp(transport, "Stream") == 0) {
+                ctx->swoTransportMode = 2;
+            } else if (_stricmp(transport, "Read") == 0) {
+                ctx->swoTransportMode = 1;
+            } else {
+                ctx->swoTransportMode = 0;  // None / 其它写法：当作没开
+            }
+        }
+
+        // --- TraceBaudrate= ：SWO 波特率 ---
+        char baudStr[32] = {};
+        if (GetConfigValue(config, "TraceBaudrate=", baudStr, sizeof(baudStr))) {
+            const unsigned long baud = strtoul(baudStr, nullptr, 10);
+            if (baud > 0) {
+                ctx->swoBaudrate = static_cast<int>(baud);
+                ORBMDK::StreamingTrace_SetBaudrate(static_cast<uint32_t>(baud));
+            }
+        }
+
+        LOG_INFO("CMSIS_DAP_ConfigureDebugger: Trace port=%d (0=Off/1=UART/2=Manchester), "
+                 "transport=%d (0=None/1=Read/2=Stream), baud=%d",
+                 ctx->swoPortMode, ctx->swoTransportMode, ctx->swoBaudrate);
     }
     return RDDI_SUCCESS;
 }
@@ -3424,10 +3654,13 @@ RDDI_FUNC int DAP_SetCommTimeout(const RDDIHandle handle, int timeoutMs)
 //   多条命令以 ';' 分隔，响应同样以 ';' 分隔
 //   状态取值：on / off / unknown / err
 //
-// ORBTrace 通过 CMSIS-DAP DAP_SWJ_Pins 控制 nRESET（bit5，1 = 释放，0 = 拉低）。
+// ORBTrace 通过 CMSIS-DAP DAP_SWJ_Pins 控制 nRESET。
+//   CMSIS-DAP 的引脚位编号（与 include/ORBMDK_DAP.h 的 ORBMDK_DAP_Pin 一致）：
+//     bit5 = nTRST，bit7 = nRESET；1 = 释放(高)，0 = 拉低(断言)。
+//   ★ 旧值 0x20 是 bit5(nTRST)：复位时下发的其实不是 nRESET（见 Todo.md）。
 // sys_power 只能监测、无法驱动。
 // ---------------------------------------------------------------------------
-#define ORBMDK_SWJ_PIN_nRESET  0x20u
+#define ORBMDK_SWJ_PIN_nRESET  0x80u
 
 static std::string TargetCommand(const std::string &item)
 {
@@ -3459,8 +3692,11 @@ static std::string TargetCommand(const std::string &item)
         }
 
         if (!driveOk) {
+            LOG_WARN("DAP_Target: '%s' 下发失败（DAP_SWJ_Pins 返回错误），nRESET 未动作",
+                     item.c_str());
             return signal + ".err";
         }
+        LOG_DEBUG("DAP_Target: '%s' ok, pins=0x%02X", item.c_str(), pinIn);
         // 驱动后也回读：nRESET 为低表示已断言
         bool asserted = (op == "on") || ((pinIn & ORBMDK_SWJ_PIN_nRESET) == 0);
         return signal + (asserted ? ".on" : ".off");
@@ -3490,11 +3726,20 @@ RDDI_FUNC int DAP_Target(const RDDIHandle handle, const char *request_str,
         return RDDI_INVHANDLE;
     }
 
-    if (!request_str || !resp_str || resp_len <= 0) {
+    // ★ 反汇编 CMSIS_AGDI.dll 的硬件复位路径（0x10022F78 / 0x10023051 / 0x1002315D）：
+    //   AGDI 以 DAP_Target(h, "sys_reset.on", NULL, 0) 调用 —— **响应缓冲可以是 NULL/0**，
+    //   它只看返回值：非 0 即上报 AGDI 错误码 0x2028，而该码在 AGDI 错误串分派表
+    //   （0x10021BC0 + 表 0x10021DE4/0x10021F28）里正是 "RDDI-DAP Error"。
+    //   官方 CMSIS_DAP.dll 后端（0x10019F00）同样只在 resp_len != 0 时才动缓冲、
+    //   其余一律照常执行并返回 0。所以 NULL/0 必须解释成"不需要响应"。
+    if (!request_str) {
         return RDDI_BADARG;
     }
 
-    resp_str[0] = '\0';
+    const bool wantResp = (resp_str != NULL && resp_len > 0);
+    if (wantResp) {
+        resp_str[0] = '\0';
+    }
 
     std::vector<std::string> responses;
     std::string req(request_str);
@@ -3518,62 +3763,99 @@ RDDI_FUNC int DAP_Target(const RDDIHandle handle, const char *request_str,
         joined += responses[i];
     }
 
-    if (joined.size() + 1 > static_cast<size_t>(resp_len)) {
-        return RDDI_TARGET_COMMAND_RESPONSE_TOO_SMALL;
+    if (wantResp) {
+        if (joined.size() + 1 > static_cast<size_t>(resp_len)) {
+            return RDDI_TARGET_COMMAND_RESPONSE_TOO_SMALL;
+        }
+        memcpy(resp_str, joined.c_str(), joined.size() + 1);
     }
-    memcpy(resp_str, joined.c_str(), joined.size() + 1);
 
     return RDDI_SUCCESS;
 }
 
 // ============================================================================
 // StreamingTrace 函数实现
+//
+// 参数个数/顺序全部按反汇编 CMSIS_AGDI.dll 的**逐个调用点**对齐（见 ORBMDK_RDDI.h）：
+//   Connect(handle)                                            [0x1003CE95]
+//   GetSinkCount(handle,&n)                                    [0x1003CEB3]
+//   GetSinkDetails(handle,i,Rec)  i = 0..n-1                   [0x1003CED8]
+//   Attach(handle,idx) / Start(handle,idx)                     [0x1003D5B4 / 0x1003D5C4]
+//   SubmitEventBuffer(handle,idx,Entry,type,&token)            [0x1003CF93]
+//   WaitForEvent(handle,idx,&token,50)  0=有事件 0x204=无事件   [0x1003D661]
+//   Detach(handle,idx) / Flush(handle,idx) / Stop(handle,idx)  [0x1003D5D8 / 0x1003D00D / 0x1003D01A]
+// 导出槽位表（槽位地址 → 函数）：0x10362fdc Connect / fe0 Disconnect / fe4 GetSinkCount /
+//   fe8 GetSinkDetails / fec GetConfigItem / ff0 SetConfigItem / ff4 Attach / ff8 Detach /
+//   ffc SubmitEventBuffer / 0x10363000 WaitForEvent / 004 Start / 008 Flush / 00c Stop。
+//
+// 数据通路（"AGDI 给缓冲、本层填、再回 token 通知"）：
+//   AGDI 依 GetSinkDetails 声明的 bufCount/bufSize 自行分配 bufCount 个条目，
+//   每个条目 = { int kind(+0x00); void* buffer(+0x04); int size(+0x08); int length(+0x0C) }。
+//   AGDI 逐个 SubmitEventBuffer 交给我们并拿到 token；我们在 WaitForEvent 里挑一条
+//   把 SWO 数据读进 entry->buffer、写 entry->length，再把对应 token 回填给 AGDI。
+//   ★ entry->size 就是缓冲容量，绝不可写超；bufSize/bufCount 由本层在 GetSinkDetails 里声明。
 // ============================================================================
 
-RDDI_FUNC int StreamingTrace_Attach(const RDDIHandle handle, const char *sinkName)
+// AGDI 预填记录（0x20 字节；记录区基址 0x10363020，步长 0x20）。前 16 字节由 AGDI 写好，
+// 后 8 字节（+0x10 / +0x14）AGDI **只读不写**（反汇编 0x1003D466/D4E9/D56E 均为读），
+// 必须由本层填写，否则 AGDI 会分配 0 条 / 0 字节的事件缓冲、trace 窗口永远为空。
+struct RddiSinkDetails {
+    char *nameBuf;    // +0x00 AGDI 预填（0x10363120 + i*0x80）
+    int   nameCap;    // +0x04 = 0x80
+    char *typeBuf;    // +0x08 AGDI 预填（0x10363520 + i*0x80）
+    int   typeCap;    // +0x0C = 0x80
+    int   bufSize;    // +0x10 ★ 本层填：单条事件缓冲容量（字节）
+    int   bufCount;   // +0x14 ★ 本层填：事件缓冲条数
+    int   reserved0;
+    int   reserved1;
+};
+
+// AGDI 分配的事件条目（16 字节；见 0x1003D506 填 +0x04、0x1003D572 填 +0x08）。
+struct RddiSinkEntry {
+    int   kind;    // +0x00 提交前置 3；AGDI 消费后清零
+    void *buffer;  // +0x04 AGDI 分配的数据缓冲
+    int   size;    // +0x08 缓冲容量
+    int   length;  // +0x0C ★ 本层填：本次填入的有效字节数
+};
+
+static const char kTraceSinkName[]           = "cmsis_dap_swo_trace";  // AGDI 按名字面量匹配
+static const char kTraceSinkTypeUart[]       = "SWO-UART";             // 端口 = UART（caps 0x04）
+static const char kTraceSinkTypeManchester[] = "SWO-Manchester";       // 端口 = Manchester（caps 0x08）
+static const int  kTraceSinkBufSize  = 4096;                   // 单条事件缓冲
+static const int  kTraceSinkBufCount = 4;                      // 事件缓冲条数
+static const int  kStreamingNoEvent  = 0x204;                  // AGDI：本轮无事件
+
+// 当前端口对应的 sink 类型串。AGDI 拿到它之后会拼成
+// `Trace=<type>;TraceTransport=Stream;` 再回传给 ConfigureDebugger，
+// 因此这里必须与用户实际选中的端口一致 —— 恒报 "SWO-UART" 会把
+// "用户选了 Manchester" 这件事在配置串里悄悄改写掉，前后自相矛盾。
+static const char* TraceSinkTypeOf(const RDDIContext* ctx)
+{
+    return (ctx && ctx->swoPortMode == 2) ? kTraceSinkTypeManchester : kTraceSinkTypeUart;
+}
+
+// 往 AGDI 预填的缓冲里做有界拷贝；指针/容量不合理时**跳过**（绝不解引用野指针）。
+static void WriteBoundedString(char *dst, int cap, const char *src)
+{
+    if (!dst || cap <= 0 || cap > 0x10000) {
+        return;
+    }
+    const size_t n = strlen(src);
+    const size_t m = (n < static_cast<size_t>(cap - 1)) ? n : static_cast<size_t>(cap - 1);
+    memcpy(dst, src, m);
+    dst[m] = '\0';
+}
+
+RDDI_FUNC int StreamingTrace_Connect(const RDDIHandle handle)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
-    // 初始化 trace 子系统
     ORBMDK::StreamingTrace_Init();
-    ctx->traceAttached = true;
-
-    (void)sinkName;
+    ctx->traceConnected = true;
+    LOG_INFO("StreamingTrace_Connect: sink connected (handle=%d)", handle);
     return RDDI_SUCCESS;
-}
-
-RDDI_FUNC int StreamingTrace_Detach(const RDDIHandle handle)
-{
-    RDDIContext* ctx = GetContext(handle);
-    if (!ctx) {
-        return RDDI_INVHANDLE;
-    }
-
-    if (ctx->traceAttached) {
-        ORBMDK::StreamingTrace_Shutdown();
-        ctx->traceAttached = false;
-    }
-    return RDDI_SUCCESS;
-}
-
-RDDI_FUNC int StreamingTrace_Connect(const RDDIHandle handle, const char *sinkName, int mode)
-{
-    RDDIContext* ctx = GetContext(handle);
-    if (!ctx) {
-        return RDDI_INVHANDLE;
-    }
-
-    // mode: 0=none, 1=SWO, 2=ETM
-    if (mode == 1 || mode == 2) {
-        ctx->traceMode = mode;
-        ctx->traceConnected = true;
-        return RDDI_SUCCESS;
-    }
-
-    return RDDI_BADARG;
 }
 
 RDDI_FUNC int StreamingTrace_Disconnect(const RDDIHandle handle)
@@ -3582,96 +3864,257 @@ RDDI_FUNC int StreamingTrace_Disconnect(const RDDIHandle handle)
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
     ctx->traceConnected = false;
-    ctx->traceRunning = false;
+    ctx->traceRunning   = false;
     return RDDI_SUCCESS;
 }
 
-RDDI_FUNC int StreamingTrace_Start(const RDDIHandle handle)
+RDDI_FUNC int StreamingTrace_Attach(const RDDIHandle handle, int sinkIndex)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
-    if (!ctx->traceConnected) {
+    if (sinkIndex != 0) {
         return RDDI_BADARG;
     }
 
-    int status = ORBMDK::StreamingTrace_Start(static_cast<uint8_t>(ctx->traceMode));
+    std::lock_guard<std::mutex> lock(ctx->traceMutex);
+    if (ctx->traceAttachRefCount++ == 0) {
+        // 首次 attach：清条目表、建会话
+        ctx->traceSinkIndex  = sinkIndex;
+        ctx->traceEntryCount = 0;
+        ctx->traceNextToken  = 1;
+        for (int i = 0; i < RDDIContext::kTraceMaxEntries; ++i) {
+            ctx->traceEntryToken[i]  = 0;
+            ctx->traceEntryPtr[i]    = nullptr;
+            ctx->traceEntryFilled[i] = false;
+        }
+        ctx->traceEntryCapacityLogged = 0;
+        ORBMDK::StreamingTrace_Init();
+        ctx->traceAttached = true;
+    }
+    LOG_INFO("StreamingTrace_Attach: sink=%d refCount=%d", sinkIndex, ctx->traceAttachRefCount);
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int StreamingTrace_Detach(const RDDIHandle handle, int sinkIndex)
+{
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+    if (sinkIndex != 0) {
+        return RDDI_BADARG;
+    }
+
+    std::lock_guard<std::mutex> lock(ctx->traceMutex);
+    if (ctx->traceAttachRefCount > 0 && --ctx->traceAttachRefCount == 0) {
+        ORBMDK::StreamingTrace_Shutdown();
+        ctx->traceAttached   = false;
+        ctx->traceRunning    = false;
+        ctx->traceSinkIndex  = -1;
+        ctx->traceEntryCount = 0;
+        for (int i = 0; i < RDDIContext::kTraceMaxEntries; ++i) {
+            ctx->traceEntryToken[i]  = 0;
+            ctx->traceEntryPtr[i]    = nullptr;
+            ctx->traceEntryFilled[i] = false;
+        }
+    }
+    LOG_INFO("StreamingTrace_Detach: sink=%d refCount=%d", sinkIndex, ctx->traceAttachRefCount);
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int StreamingTrace_Start(const RDDIHandle handle, int sinkIndex)
+{
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+    if (sinkIndex != 0) {
+        return RDDI_BADARG;
+    }
+
+    // sink 0 对应 SWO（端口是 UART 还是 Manchester 由用户的 Trace= 选择决定）。
+    // 上电序列 Transport → Mode → Baudrate → Control 在 HID 层完成，
+    // 其中 Mode 取自 StreamingTrace_SetMode 设好的端口，故这里先同步一次：
+    // ConfigureDebugger 通常已经设过，但 AGDI 也有先 Start 后配置的调用顺序，
+    // 端口必须在使用之前就位（默认 1 = UART，与旧行为一致）。
+    ORBMDK::StreamingTrace_SetMode(static_cast<uint8_t>(ctx->swoPortMode == 2 ? 2 : 1));
+
+    const int status = ORBMDK::StreamingTrace_Start(1 /* SWO */);
     if (status == 0) {
+        ctx->traceMode    = 1;
         ctx->traceRunning = true;
+        LOG_INFO("StreamingTrace_Start: sink=%d started (port=%s)", sinkIndex,
+                 ctx->swoPortMode == 2 ? "SWO-Manchester" : "SWO-UART");
+        return RDDI_SUCCESS;
     }
-    return status == 0 ? RDDI_SUCCESS : RDDI_FAILED;
+    LOG_WARN("StreamingTrace_Start: sink=%d failed (status=%d)", sinkIndex, status);
+    return RDDI_FAILED;
 }
 
-RDDI_FUNC int StreamingTrace_Stop(const RDDIHandle handle)
+RDDI_FUNC int StreamingTrace_Stop(const RDDIHandle handle, int sinkIndex)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
-    int status = ORBMDK::StreamingTrace_Stop();
+    if (sinkIndex != 0) {
+        return RDDI_BADARG;
+    }
+    const int status = ORBMDK::StreamingTrace_Stop();
     ctx->traceRunning = false;
-    return status == 0 ? RDDI_SUCCESS : RDDI_FAILED;
+    return (status == 0) ? RDDI_SUCCESS : RDDI_FAILED;
 }
 
-RDDI_FUNC int StreamingTrace_Flush(const RDDIHandle handle)
+RDDI_FUNC int StreamingTrace_Flush(const RDDIHandle handle, int sinkIndex)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
-    // 清空内部缓冲区
-    ctx->traceBuffer.clear();
-    return RDDI_SUCCESS;
+    if (sinkIndex != 0) {
+        return RDDI_BADARG;
+    }
+    const int status = ORBMDK::StreamingTrace_Flush();
+    return (status == 0) ? RDDI_SUCCESS : RDDI_FAILED;
 }
 
-RDDI_FUNC int StreamingTrace_WaitForEvent(const RDDIHandle handle, int timeoutMs, int *eventType)
+// 返回：0 = 有事件（*evToken 回填 token）；0x204 = 本轮无事件；其他非零 = 出错。
+RDDI_FUNC int StreamingTrace_WaitForEvent(const RDDIHandle handle, int sinkIndex,
+                                          int *evToken, int timeoutMs)
 {
-    if (eventType) {
-        *eventType = 0;  // 失败时也要写输出参数
+    if (evToken) {
+        *evToken = 0;
     }
-
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
-    if (!eventType) {
+    if (sinkIndex != 0 || !evToken) {
         return RDDI_BADARG;
     }
 
-    uint8_t status = 0;
-    uint16_t traceCount = 0;
+    const DWORD deadline = GetTickCount() + static_cast<DWORD>((timeoutMs > 0) ? timeoutMs : 0);
 
-    DWORD startTime = GetTickCount();
-    while (GetTickCount() - startTime < (DWORD)timeoutMs) {
-        int ret = ORBMDK::StreamingTrace_GetStatus(&status, &traceCount);
-        if (ret == 0 && traceCount > 0) {
-            *eventType = 1;  // Data available
+    for (;;) {
+        // 取一条 AGDI 已提交、尚未回填的条目
+        void *entryPtr = nullptr;
+        int   slot     = -1;
+        int   tok      = 0;
+        {
+            std::lock_guard<std::mutex> lock(ctx->traceMutex);
+            for (int i = 0; i < RDDIContext::kTraceMaxEntries; ++i) {
+                if (ctx->traceEntryFilled[i] && ctx->traceEntryPtr[i]) {
+                    entryPtr = ctx->traceEntryPtr[i];
+                    tok      = ctx->traceEntryToken[i];
+                    slot     = i;
+                    break;
+                }
+            }
+        }
+
+        if (slot < 0) {
+            // 还没有任何已提交条目：无事件可报，回 0x204 让 AGDI 继续循环。
+            return kStreamingNoEvent;
+        }
+
+        RddiSinkEntry* e = static_cast<RddiSinkEntry*>(entryPtr);
+        const int cap = e->size;
+        if (!e->buffer || cap <= 0) {
+            LOG_WARN("StreamingTrace_WaitForEvent: 条目 %p 容量非法 (buf=%p cap=%d)，丢弃",
+                     entryPtr, e->buffer, cap);
+            std::lock_guard<std::mutex> lock(ctx->traceMutex);
+            ctx->traceEntryFilled[slot] = false;
+            ctx->traceEntryPtr[slot]    = nullptr;
+            ctx->traceEntryToken[slot]  = 0;
+            continue;
+        }
+
+        const DWORD now = GetTickCount();
+        if (timeoutMs <= 0 || now >= deadline) {
+            return kStreamingNoEvent;
+        }
+
+        size_t got = static_cast<size_t>(cap);
+        const int rc = ORBMDK::StreamingTrace_Read(reinterpret_cast<uint8_t*>(e->buffer),
+                                                   &got, deadline - now);
+        if (rc > 0 && got > 0) {
+            e->length = static_cast<int>(got);
+            std::lock_guard<std::mutex> lock(ctx->traceMutex);
+            ctx->traceEntryFilled[slot] = false;  // AGDI 消费后会重提交
+            ctx->traceEntryPtr[slot]    = nullptr;
+            ctx->traceEntryToken[slot]  = 0;
+            *evToken = tok;
             return RDDI_SUCCESS;
         }
-        Sleep(1);
+        // rc == 0（超时）或 rc < 0（未运行）：都按"无事件"处理，让 AGDI 继续循环。
+        return kStreamingNoEvent;
     }
-
-    *eventType = 0;
-    return RDDI_TIMEOUT;
 }
 
-RDDI_FUNC int StreamingTrace_SubmitEventBuffer(const RDDIHandle handle, uint8_t *buffer, int bufferSize)
+RDDI_FUNC int StreamingTrace_SubmitEventBuffer(const RDDIHandle handle, int sinkIndex,
+                                               void *entry, int entryType, int *token)
 {
+    if (token) {
+        *token = 0;
+    }
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
+    if (sinkIndex != 0 || !entry) {
+        return RDDI_BADARG;
+    }
 
-    // 用于事件驱动的缓冲区提交（ETM trace）
-    (void)buffer;
-    (void)bufferSize;
+    std::lock_guard<std::mutex> lock(ctx->traceMutex);
+
+    // 同一个 entry 会被 AGDI 反复提交（消费后重提交），按指针对齐复用槽位。
+    int slot     = -1;
+    int freeSlot = -1;
+    for (int i = 0; i < RDDIContext::kTraceMaxEntries; ++i) {
+        if (ctx->traceEntryPtr[i] == entry) {
+            slot = i;
+            break;
+        }
+        if (freeSlot < 0 && ctx->traceEntryToken[i] == 0 && ctx->traceEntryPtr[i] == nullptr) {
+            freeSlot = i;
+        }
+    }
+    if (slot < 0) {
+        slot = freeSlot;
+    }
+    if (slot < 0) {
+        LOG_ERROR("StreamingTrace_SubmitEventBuffer: 条目表已满(%d)，拒绝 entry=%p",
+                  RDDIContext::kTraceMaxEntries, entry);
+        return RDDI_FAILED;
+    }
+
+    // token 不能为 0（0 被 AGDI 当作"无事件"）
+    int t = ctx->traceNextToken++;
+    if (ctx->traceNextToken <= 0) {
+        ctx->traceNextToken = 1;
+        if (t == 0) {
+            t = ctx->traceNextToken++;
+        }
+    }
+
+    ctx->traceEntryPtr[slot]    = entry;
+    ctx->traceEntryToken[slot]  = t;
+    ctx->traceEntryFilled[slot] = true;
+    if (slot + 1 > ctx->traceEntryCount) {
+        ctx->traceEntryCount = slot + 1;
+    }
+    if (!ctx->traceEntryCapacityLogged) {
+        ctx->traceEntryCapacityLogged = 1;
+        const RddiSinkEntry* e = static_cast<const RddiSinkEntry*>(entry);
+        LOG_INFO("StreamingTrace_SubmitEventBuffer: 首个条目 entry=%p kind=%d size=%d type=%d",
+                 entry, e->kind, e->size, entryType);
+    }
+    if (token) {
+        *token = t;
+    }
     return RDDI_SUCCESS;
 }
 
@@ -3680,42 +4123,53 @@ RDDI_FUNC int StreamingTrace_GetSinkCount(const RDDIHandle handle, int *count)
     if (count) {
         *count = 0;  // 失败时也要写输出参数
     }
-
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
-
     if (!count) {
         return RDDI_BADARG;
     }
 
-    // 返回可用的 trace sink 数量
-    *count = 2;  // SWO + ETM
+    // 本层只报 1 个 sink（0 号 = cmsis_dap_swo_trace）。ETM 无对应数据源
+    // （§18.10-B/§18.9）：谎报 sink 数只会让 GetSinkDetails/Attach 越界。
+    *count = 1;
     return RDDI_SUCCESS;
 }
 
 // ---------------------------------------------------------------------------
 // Keil 扩展：StreamingTrace_GetSinkDetails
 //
-// 官方 CMSIS_DAP.dll 反汇编（RVA 0xBF00）只读 [ebp+8]/[ebp+0Ch]/[ebp+10h]，
-// 即 3 个参数，并把后两个原样转发，函数体内不写调用方缓冲区。
-//
-// 旧版本声明为 6 个参数（char *name / char *type 两个输出缓冲区），按官方 3 参
-// 调用时第 3、4 个参数取到的是标量，会被当成字符串缓冲区写入 -> 崩溃。
-// 这里按官方参数个数对齐，并且不再向未经证实的指针写入。
+// AGDI 调用为 3 参 (handle, index, details)，details 指向 0x10363020 + index*0x20
+// 的记录，其中前 16 字节由 AGDI **预填**为两个 {缓冲指针, 容量 0x80} 对
+// （记录循环见 0x1003CECA..0x1003CEEF，预填见 AGDI 的 0x10363120/0x10363520 区）。
+// 本层必须把 name/type 字符串写进去，并填写 +0x10/+0x14 的 bufSize/bufCount。
+// 旧版本按 6 参声明、按 2 参实现，两个方向都错：按官方 3 参调用时会把标量当指针
+// 写入 -> 崩溃；声明成 2 参又拿不到 details。现按官方 3 参对齐。
 // ---------------------------------------------------------------------------
-RDDI_FUNC int StreamingTrace_GetSinkDetails(const RDDIHandle handle, const int reserved1,
-                                            const int reserved2)
+RDDI_FUNC int StreamingTrace_GetSinkDetails(const RDDIHandle handle, int index, void *details)
 {
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
+    if (index != 0 || !details) {
+        return RDDI_BADARG;
+    }
 
-    (void)reserved1;
-    (void)reserved2;
-    return RDDI_DAP_LEVEL1_NOT_IMPL;
+    RddiSinkDetails* d = static_cast<RddiSinkDetails*>(details);
+
+    // 前 16 字节是 AGDI 预填的两个 {指针, 容量} 对，本层只负责写内容。
+    WriteBoundedString(d->nameBuf, d->nameCap, kTraceSinkName);
+    WriteBoundedString(d->typeBuf, d->typeCap, TraceSinkTypeOf(ctx));
+
+    // ★ +0x10/+0x14 必须由本层填写：AGDI 的取数循环只读不写。
+    d->bufSize  = kTraceSinkBufSize;
+    d->bufCount = kTraceSinkBufCount;
+
+    LOG_INFO("StreamingTrace_GetSinkDetails[%d]: name=\"%s\" type=\"%s\" bufSize=%d bufCount=%d",
+             index, kTraceSinkName, TraceSinkTypeOf(ctx), d->bufSize, d->bufCount);
+    return RDDI_SUCCESS;
 }
 
 RDDI_FUNC int StreamingTrace_GetConfigItem(const RDDIHandle handle, int item, int *value)
@@ -3733,12 +4187,15 @@ RDDI_FUNC int StreamingTrace_GetConfigItem(const RDDIHandle handle, int item, in
         return RDDI_BADARG;
     }
 
+    // 必须与 SetConfigItem 写入的是同一组变量：这里是查询（读），
+    // SetConfigItem 是设置（写）。旧实现 case 0/1 返回硬编码常量，
+    // 于是"设 3M 再读回 115200"，读写不对称。
     switch (item) {
         case 0:  // 波特率
-            *value = 115200;
+            *value = ctx->swoBaudrate;
             break;
         case 1:  // 缓冲大小
-            *value = 65536;
+            *value = ctx->traceBufferSize;
             break;
         case 2:  // 模式
             *value = ctx->traceMode;
@@ -3759,8 +4216,8 @@ RDDI_FUNC int StreamingTrace_SetConfigItem(const RDDIHandle handle, int item, in
 
     switch (item) {
         case 0:  // 波特率
-            ORBMDK::DAP_SWO_Baudrate(static_cast<uint32_t>(value));
             ctx->swoBaudrate = value;
+            ORBMDK::StreamingTrace_SetBaudrate(static_cast<uint32_t>(value));
             break;
         case 1:  // 缓冲大小
             ctx->traceBufferSize = value;

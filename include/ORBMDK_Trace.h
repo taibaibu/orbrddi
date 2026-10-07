@@ -274,10 +274,16 @@ void ORBMDK_Trace_SetAltAddrEncode(ORBMDK_Trace_Handle handle, bool usingAlt);
 // ============================================================================
 
 /**
- * @brief 配置 SWO 波特率
+ * @brief 记录 SWO 时钟 / 波特率
  * @param handle 解码器句柄
- * @param clock SWO 时钟频率
+ * @param clock SWO 时钟频率（Hz）
  * @param baud 目标波特率
+ *
+ * 说明：本层是纯解码层，输入数据已是探针送来的字节流，波特率在探针侧生效，
+ * 解码本身不需要它。因此这里只负责把 clock / baud 以及两者能整除时的分频比
+ * 记进句柄（供日志与排查"乱码"时核对），并**不**向探针下发任何东西。
+ * 真正的下发行程是：AGDI 的 TraceBaudrate= → CMSIS_DAP_ConfigureDebugger →
+ * StreamingTrace_SetBaudrate / DAP_SWO_Baudrate（见 ORBMDK_RDDI.cpp / ORBMDK_HID.cpp）。
  */
 void ORBMDK_Trace_SWO_SetBaud(ORBMDK_Trace_Handle handle, uint32_t clock, uint32_t baud);
 
