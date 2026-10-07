@@ -223,10 +223,41 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
     BulkTrace("SelectInterface: ifNo=%d -> %s (current=%d, already=%d)",
               ifNo, _transportName(pref), (int)cur, (int)already);
 
-    if (already) {
+    if (!already) {
+        const int rc = ORBMDK_USB_Bulk_Init(0, 0, nullptr);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+
+    if (pref != USB_BULK_TRANSPORT_HID) {
         return 0;
     }
-    return ORBMDK_USB_Bulk_Init(0, 0, nullptr);
+
+    // ------------------------------------------------------------------
+    // "接口能打开" ≠ "接口在讲 CMSIS-DAP"。
+    //
+    // 0x0D28/0x0204 这类厂商复合设备上，HID 接口不保证实现 CMSIS-DAP v1。
+    // 实测某固件的 HID 接口（UsagePage=0xFF00、报告负载 1023）对**任何** OUT
+    // 报告都回同一段 "parse error" 文本 —— 命令 0x11 与 0x03 读回的 8 字节
+    // 完全相同，即它是个调试/文本通道，不是 DAP。
+    //
+    // 不在这里拦住，错误会被拖到 DAP_Connect 才爆成
+    // "CMSIS_DAP_Connect: connect failed, mode=0x61"（0x61='a' 正是那段文本的
+    // 第 3 个字节），日志指向"探针失效"而不是"选错了接口"。
+    // ------------------------------------------------------------------
+    char fw[64] = {};
+    if (DAP_GetInfo(DAP_INFO_FIRMWARE, fw, sizeof(fw)) <= 0 || fw[0] == '\0') {
+        BulkTrace("SelectInterface: ifNo=1 (HID) 打开成功但对 DAP_Info 无有效应答 "
+                  "-> 该 HID 接口不是 CMSIS-DAP，请在适配器列表里选 ifNo=0 (%s)",
+                  _transportName(USB_BULK_TRANSPORT_BULK));
+        // 自检期间的读超时会累加到 DAP 熔断计数上，顺手清掉，
+        // 免得用户改选 v2 之后被上一轮的失败拖累。
+        ORBMDK_DapChannelReset("HID 接口不是 CMSIS-DAP");
+        return -1;
+    }
+    BulkTrace("SelectInterface: ifNo=1 (HID) DAP 自检通过 (fw='%s')", fw);
+    return 0;
 }
 
 /**
@@ -547,8 +578,16 @@ static bool _findAndOpenDeviceInGuid(const GUID* guid, uint16_t vid, uint16_t pi
         // 路径原本没有任何日志，现场完全看不出"到底卡在哪一步"。
         // 路径形如 \\?\usb#vid_1209&pid_3443&mi_01#...
         uint16_t pathVid = 0, pathPid = 0;
-        if (!_parseVidPidFromPath(deviceDetailData->DevicePath, &pathVid, &pathPid) ||
-            pathVid != vid || pathPid != pid) {
+        if (!_parseVidPidFromPath(deviceDetailData->DevicePath, &pathVid, &pathPid)) {
+            free(deviceDetailData);
+            continue;
+        }
+        // vid/pid 非 0 = 调用方指定；为 0 = 按 ORBMDK.h 的支持列表匹配。
+        // 原先只认 1209:3443，CherryUSB 等 0D28:0204 设备连候选都进不来。
+        const bool matched = (vid != 0 && pid != 0)
+                                 ? (pathVid == vid && pathPid == pid)
+                                 : ORBMDK_IsSupportedDevice(pathVid, pathPid);
+        if (!matched) {
             free(deviceDetailData);
             continue;
         }
@@ -752,10 +791,11 @@ static bool _findAndOpenDevice(uint16_t vid, uint16_t pid, const char* serial)
         BulkTrace("guid %s: %d candidate(s)", names[i], candidates - before);
     }
 
-    // 汇总行：candidates=0 说明三种 GUID 下都没有 vid/pid 匹配的接口路径，
-    // 问题在枚举（设备未插 / 驱动未装），而不是在打开或驱动绑定。
-    BulkTrace("enumeration done: %d candidate(s) for vid_%04X&pid_%04X, opened=%d",
-              candidates, vid, pid, (int)opened);
+    // 汇总行：candidates=0 说明三种 GUID 下都没有匹配 vid/pid（或支持列表）的
+    // 接口路径，问题在枚举（设备未插 / 驱动未装），而不是在打开或驱动绑定。
+    BulkTrace("enumeration done: %d candidate(s) (vid=0x%04X pid=0x%04X%s), opened=%d",
+              candidates, vid, pid,
+              (vid && pid) ? "" : " => 按支持列表匹配", (int)opened);
     return opened;
 }
 
@@ -1080,9 +1120,9 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
 {
     // 这一行只在**当前构建**里存在。日志里若完全没有它，说明 Keil 加载的
     // 仍是旧 DLL（已部署但 µVision 没重启），不要据此判断设备问题。
-    BulkTrace("Init: entered (vid=0x%04X pid=0x%04X serial='%s')",
-              vid ? vid : ORBTRACE_VID, pid ? pid : ORBTRACE_PID,
-              serial ? serial : "");
+    BulkTrace("Init: entered (vid=0x%04X pid=0x%04X serial='%s'%s)",
+              vid, pid, serial ? serial : "",
+              (vid && pid) ? "" : " [auto: 按支持列表匹配]");
 
     // 已经打开时先按"当前偏好"决定复用还是切换模式。
     //
@@ -1129,7 +1169,7 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
 
     // 尝试初始化 V2 Bulk 模式（除非显式要求只用 HID）
     if (pref != USB_BULK_TRANSPORT_HID &&
-        _initWinUSB(vid ? vid : ORBTRACE_VID, pid ? pid : ORBTRACE_PID, serial)) {
+        _initWinUSB(vid, pid, serial)) {
         g_ctx.mode = USB_BULK_BULK_MODE;
         g_ctx.deviceInfo.protocol_version = 2;
         g_ctx.deviceInfo.max_packet_size = 512;  // USB Full Speed Bulk
@@ -1171,12 +1211,22 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
     g_ctx.initialized = true;
     g_ctx.mode = USB_BULK_HID_MODE;
     g_ctx.hidAvailable = true;
-    g_ctx.deviceInfo.vid = vid ? vid : ORBTRACE_VID;
-    g_ctx.deviceInfo.pid = pid ? pid : ORBTRACE_PID;
+    // 如实上报实际打开的设备身份（原先恒报 1209:3443，故障时无法从日志判断）
+    if (vid && pid) {
+        g_ctx.deviceInfo.vid = vid;
+        g_ctx.deviceInfo.pid = pid;
+    } else {
+        ORBMDK_HID_GetIdentity(&g_ctx.deviceInfo.vid, &g_ctx.deviceInfo.pid);
+    }
     g_ctx.deviceInfo.protocol_version = 1;
-    g_ctx.deviceInfo.max_packet_size = 64;
 
-    BulkTrace("Init: V1 HID mode OK");
+    // 包长取设备 HID 报告负载，但 DAP v1 规范上限 64
+    const size_t hidPayload = ORBMDK_HID_GetPayloadMax();
+    g_ctx.deviceInfo.max_packet_size = (hidPayload == 0 || hidPayload >= 64)
+                                           ? 64U : (uint32_t)hidPayload;
+
+    BulkTrace("Init: V1 HID mode OK (vid=0x%04X pid=0x%04X 报告负载=%zu)",
+              g_ctx.deviceInfo.vid, g_ctx.deviceInfo.pid, hidPayload);
     return 0;
 }
 

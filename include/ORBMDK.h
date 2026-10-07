@@ -90,3 +90,31 @@ static inline void ORBMDK_NormalizeFwVersion(const char* raw, char* out, size_t 
 // ----------------------------------------------------------------------------
 #define ORBMDK_ORBTRACE_VID   0x1209U
 #define ORBMDK_ORBTRACE_PID   0x3443U
+
+// ----------------------------------------------------------------------------
+// 支持的调试器身份 (VID/PID) —— V1(HID) 与 V2(Bulk) **共用这一份表**
+//
+// 问题：两层各自认定设备身份，Bulk 层原先只认 1209:3443，CherryUSB 等
+// 0D28:0204 设备连 V2 通道都进不去（枚举 0 候选）。
+//   X(VID, PID)
+// 0x0D28:0x0204 = ARM 官方 CMSIS-DAP/DAPLink 身份，多数 CMSIS-DAP 实现沿用。
+// ----------------------------------------------------------------------------
+#define ORBMDK_DEVICE_VIDPID_LIST(X)          \
+    X(0x1209U, 0x3443U) /* ORBTrace        */ \
+    X(0x1209U, 0x3442U) /* ORBTrace mini   */ \
+    X(0x0D28U, 0x0204U) /* ARM DAPLink/CMSIS-DAP */
+
+struct ORBMDK_VidPidPair { uint16_t vid; uint16_t pid; };
+
+static inline bool ORBMDK_IsSupportedDevice(uint16_t vid, uint16_t pid)
+{
+#define ORBMDK_VIDPID_ENTRY(v, p) { (v), (p) },
+    static const ORBMDK_VidPidPair table[] = {
+        ORBMDK_DEVICE_VIDPID_LIST(ORBMDK_VIDPID_ENTRY)
+    };
+#undef ORBMDK_VIDPID_ENTRY
+    for (const ORBMDK_VidPidPair& d : table) {
+        if (d.vid == vid && d.pid == pid) return true;
+    }
+    return false;
+}

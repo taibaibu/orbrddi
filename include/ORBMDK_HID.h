@@ -21,6 +21,31 @@ int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen, char* serial, siz
 int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen, uint8_t* resp, size_t* respLen, int timeoutMs);
 
 // ---------------------------------------------------------------------------
+// HID 命令返回值（V1 路径）
+//
+// 问题：写失败曾被一律并入超时码 -3，于是"报告长度不匹配被驱动当场拒收
+// (err=87)"被熔断机制误判成"探针不再响应"，两条命令就误熔断。
+// 熔断只看 WRITE_TIMEOUT / READ_TIMEOUT，立即失败不参与。
+// ---------------------------------------------------------------------------
+enum {
+    HID_RC_OK             =  0,
+    HID_RC_NOT_CONNECTED  = -1,   // 未打开设备 / 模式不符
+    HID_RC_BAD_LENGTH     = -2,   // 命令长度超出报告负载（编程错误）
+    HID_RC_WRITE_TIMEOUT  = -3,   // 写超时（参与熔断）
+    HID_RC_READ_FAILED    = -4,   // 读立即失败
+    HID_RC_READ_TIMEOUT   = -5,   // 读超时（参与熔断）
+    HID_RC_WRITE_FAILED   = -6,   // 写立即失败（含报告长度不匹配 err=87）
+    HID_RC_EMPTY_RESPONSE = -7,   // 读到 0 字节
+    HID_RC_BAD_RESPONSE   = -8,   // 读到 3 个报告都不是本命令的响应（布局/配对异常）
+};
+
+// 当前 HID 设备的单条命令最大负载字节数（来自 HidP_GetCaps；0 = 未打开）
+size_t ORBMDK_HID_GetPayloadMax(void);
+
+// 当前 HID 设备的 VID/PID（0 = 未打开），用于如实上报设备身份
+void ORBMDK_HID_GetIdentity(uint16_t* vid, uint16_t* pid);
+
+// ---------------------------------------------------------------------------
 // DAP 命令通道熔断（实现与完整说明见 src/ORBMDK_HID.cpp；固件侧缺陷见 bug.md B1）
 //
 // 缓解的是一个**本层修不了**的固件缺陷：orbtrace 的 DAP 命令通道一次握手失败后

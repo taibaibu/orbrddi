@@ -9,6 +9,7 @@
 #include "ORBMDK_Log.h"
 
 #include <hidsdi.h>
+#include <hidpi.h>
 #include <setupapi.h>
 #include <vector>
 #include <string>
@@ -55,7 +56,10 @@
 static constexpr uint16_t ORBTRACE_VID = ORBMDK_ORBTRACE_VID;
 static constexpr uint16_t ORBTRACE_PID = ORBMDK_ORBTRACE_PID;
 
-// 标准 CMSIS-DAP 兼容设备列表 (常见调试器)
+// 兼容设备的 VID 白名单（用于"VID 在册但 PID 未知"的老式/克隆 CMSIS-DAP）。
+// 问题：原先 VID 命中就打开，任何 0x0D28 的键盘/鼠标都会被当成 DAP，
+// 表现为"连接成功、命令全部写失败"，所以现在还必须过能力校验（见
+// _hidDeviceAcceptable：Usage Page 0xFF00 且读/写报告都可用）。
 static constexpr uint16_t CMSIS_DAP_VIDS[] = {
     0x0D28,  // ARM
     0x2E03,  // ORBTrace / 用户设备
@@ -70,6 +74,27 @@ static constexpr uint8_t CMD_REPORT_ID = 0x00U;
 static constexpr size_t HID_MAX_PACKET_SIZE = 65;  // 64 + 1 Report ID
 static constexpr size_t DAP_BUFFER_SIZE = 512;
 
+// ---------------------------------------------------------------------------
+// 设备 HID 报告布局（打开时用 HidP_GetCaps 解析一次）
+//
+// 问题：原先固定按 65 字节（0x00 报告ID + 64 字节）发，报告长度不是 64 的设备
+// 会被 hidclass 以 ERROR_INVALID_PARAMETER(87) 当场拒收 —— 现场表现是
+// "连接成功但每条命令都写失败"（CherryUSB DAP）。报告长度必须以设备为准。
+// ---------------------------------------------------------------------------
+struct HidReportPlan {
+    bool     valid;
+    uint16_t usagePage;       // HID Usage Page（0xFF00 = 厂商自定义）
+    uint16_t inputLen;        // 每次 ReadFile 的字节数（含报告ID，若有）
+    uint16_t writeLen;        // 每次写的字节数（含报告ID，若有）
+    size_t   payloadMax;      // 单条 DAP 命令最多可带的字节数
+    size_t   payloadOff;      // 命令在报告中的偏移（有报告ID前缀 = 1）
+    uint8_t  reportId;        // 写报告 ID（无前缀时不用）
+    bool     writeIsFeature;  // 无 Output 报告 -> 改走 HidD_SetFeature
+    bool     readHasPrefix;   // 设备 IN 报告是否带报告ID前缀
+};
+
+static HidReportPlan g_hidPlan = {};
+
 // ============================================================================
 // Globals
 // ============================================================================
@@ -77,6 +102,8 @@ static constexpr size_t DAP_BUFFER_SIZE = 512;
 static HANDLE g_hDevice = INVALID_HANDLE_VALUE;
 static std::mutex g_hidMutex;
 static bool g_isConnected = false;
+static uint16_t g_hidVid = 0;
+static uint16_t g_hidPid = 0;
 static char g_productName[256] = {0};
 static char g_serialNumber[256] = {0};
 static char g_firmwareVersion[64] = {0};
@@ -103,6 +130,7 @@ int ORBMDK_HID_Init(void)
     std::lock_guard<std::mutex> lock(g_hidMutex);
     g_hDevice = INVALID_HANDLE_VALUE;
     g_isConnected = false;
+    g_hidPlan = HidReportPlan{};
     return 0;
 }
 
@@ -114,6 +142,7 @@ void ORBMDK_HID_Shutdown(void)
         g_hDevice = INVALID_HANDLE_VALUE;
     }
     g_isConnected = false;
+    g_hidPlan = HidReportPlan{};
 }
 
 // 检查 VID 是否在支持列表中
@@ -123,6 +152,146 @@ static bool IsCMSISDAPDevice(uint16_t vid)
         if (vid == CMSIS_DAP_VIDS[i]) return true;
     }
     return false;
+}
+
+// 取某个方向的"报告ID + 负载字节数"；false = 该方向没有报告
+static bool _hidReportLayout(PHIDP_PREPARSED_DATA pp, HIDP_REPORT_TYPE type,
+                             USHORT numValueCaps, USHORT numButtonCaps,
+                             uint8_t* reportId, uint16_t* payloadLen)
+{
+    *reportId = 0;
+    *payloadLen = 0;
+
+    if (numValueCaps) {
+        std::vector<HIDP_VALUE_CAPS> caps(numValueCaps);
+        USHORT n = numValueCaps;
+        if (HidP_GetValueCaps(type, caps.data(), &n, pp) == HIDP_STATUS_SUCCESS && n > 0) {
+            *reportId = caps[0].ReportID;
+            *payloadLen = (uint16_t)((caps[0].BitSize / 8) * caps[0].ReportCount);
+        }
+    }
+    if (*payloadLen == 0 && numButtonCaps) {
+        std::vector<HIDP_BUTTON_CAPS> caps(numButtonCaps);
+        USHORT n = numButtonCaps;
+        if (HidP_GetButtonCaps(type, caps.data(), &n, pp) == HIDP_STATUS_SUCCESS && n > 0) {
+            *reportId = caps[0].ReportID;
+            *payloadLen = (uint16_t)((caps[0].ReportCount + 7) / 8);
+        }
+    }
+    return *payloadLen != 0;
+}
+
+// 解析设备报告布局：报告长度/报告ID/有没有 Output 报告
+static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
+{
+    memset(plan, 0, sizeof(*plan));
+    plan->inputLen   = (uint16_t)HID_MAX_PACKET_SIZE;
+    plan->writeLen   = (uint16_t)HID_MAX_PACKET_SIZE;
+    plan->payloadMax = HID_MAX_PACKET_SIZE - 1;
+    plan->payloadOff = 1;
+
+    PHIDP_PREPARSED_DATA pp = nullptr;
+    if (!HidD_GetPreparsedData(hDevice, &pp) || !pp) {
+        LOG_HID_WARN("HidD_GetPreparsedData failed, error=%lu", GetLastError());
+        return false;
+    }
+
+    HIDP_CAPS caps = {};
+    if (HidP_GetCaps(pp, &caps) != HIDP_STATUS_SUCCESS) {
+        LOG_HID_WARN("HidP_GetCaps failed");
+        HidD_FreePreparsedData(pp);
+        return false;
+    }
+
+    plan->usagePage = caps.UsagePage;
+    if (caps.InputReportByteLength > 0) {
+        plan->inputLen = caps.InputReportByteLength;
+    }
+
+    uint8_t  rid = 0;
+    uint16_t payload = 0;
+    uint16_t declared = 0;
+
+    if (_hidReportLayout(pp, HidP_Output, caps.NumberOutputValueCaps,
+                         caps.NumberOutputButtonCaps, &rid, &payload)) {
+        plan->writeIsFeature = false;
+        declared = caps.OutputReportByteLength;
+    } else if (_hidReportLayout(pp, HidP_Feature, caps.NumberFeatureValueCaps,
+                                caps.NumberFeatureButtonCaps, &rid, &payload)) {
+        // 没有 Output 报告的老式 DAPLink：命令走 HidD_SetFeature（控制传输）
+        plan->writeIsFeature = true;
+        declared = caps.FeatureReportByteLength;
+    } else {
+        LOG_HID_WARN("设备没有 Output/Feature 报告，无法下发命令");
+        HidD_FreePreparsedData(pp);
+        return false;
+    }
+
+    // 报告ID前缀：ID 非 0 必有；ID 为 0 时按"声明长度 == 负载+1"判定（0x00 也占一字节）
+    plan->reportId   = rid;
+    plan->payloadMax = payload;
+    plan->payloadOff = (rid != 0 || declared == payload + 1) ? 1 : 0;
+    plan->writeLen   = (uint16_t)(payload + plan->payloadOff);
+
+    // IN 方向是否带报告ID前缀（决定响应要不要补占位字节）
+    uint8_t  inRid = 0;
+    uint16_t inPayload = 0;
+    const bool inOk = _hidReportLayout(pp, HidP_Input, caps.NumberInputValueCaps,
+                                       caps.NumberInputButtonCaps, &inRid, &inPayload);
+    plan->readHasPrefix = inOk && (inRid != 0 || caps.InputReportByteLength == inPayload + 1);
+
+    HidD_FreePreparsedData(pp);
+
+    if (plan->writeLen != declared) {
+        LOG_HID_WARN("HID 报告长度与声明不符：负载 %u + 前缀 %zu = %u，声明 %u",
+                     (unsigned)payload, plan->payloadOff, (unsigned)plan->writeLen,
+                     (unsigned)declared);
+    }
+
+    plan->valid = true;
+    LOG_HID_INFO("HID 报告布局：UsagePage=0x%04X IN=%u OUT=%u 负载=%zu "
+                 "报告ID=0x%02X 前缀=%zu %s",
+                 (unsigned)plan->usagePage, (unsigned)plan->inputLen,
+                 (unsigned)plan->writeLen, plan->payloadMax, (unsigned)plan->reportId,
+                 plan->payloadOff, plan->writeIsFeature ? "SetFeature" : "WriteFile");
+    return true;
+}
+
+// 判定已打开的 HID 句柄是不是我们的 DAP 设备，并给出报告布局
+//   1) VID+PID 在支持列表里 -> 接受
+//   2) 仅 VID 在兼容白名单   -> 还须厂商自定义 Usage Page(0xFF00) 且读写可用
+static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
+                                 HidReportPlan* plan)
+{
+    if (!ORBMDK_IsSupportedDevice(attr.VendorID, attr.ProductID) &&
+        !IsCMSISDAPDevice(attr.VendorID)) {
+        return false;                     // 无关设备（大量），不刷日志
+    }
+
+    HidReportPlan probe = {};
+    if (!_hidProbeReportPlan(hDevice, &probe)) {
+        LOG_HID_WARN("skip VID_%04X&PID_%04X: 无法解析 HID 报告描述符",
+                     attr.VendorID, attr.ProductID);
+        return false;
+    }
+
+    if (ORBMDK_IsSupportedDevice(attr.VendorID, attr.ProductID)) {
+        *plan = probe;
+        return true;
+    }
+
+    // 兼容路径：PID 未知（老式/克隆 CMSIS-DAP）—— 只认厂商自定义 Usage Page
+    if (probe.usagePage != 0xFF00U) {
+        LOG_HID_WARN("skip VID_%04X&PID_%04X: UsagePage=0x%04X 非厂商自定义(0xFF00)",
+                     attr.VendorID, attr.ProductID, (unsigned)probe.usagePage);
+        return false;
+    }
+    LOG_HID_WARN("兼容设备 VID_%04X&PID_%04X（不在支持列表，按能力匹配："
+                 "UsagePage=0xFF00, IN=%u, 负载=%zu）",
+                 attr.VendorID, attr.ProductID,
+                 (unsigned)probe.inputLen, probe.payloadMax);
+    *plan = probe;
+    return true;
 }
 
 static bool EnumerateDevices(std::vector<std::string>& serials)
@@ -167,8 +336,9 @@ static bool EnumerateDevices(std::vector<std::string>& serials)
         attributes.Size = sizeof(attributes);
 
         if (HidD_GetAttributes(hDevice, &attributes)) {
-            // 支持任何 CMSIS-DAP 兼容设备
-            if (IsCMSISDAPDevice(attributes.VendorID)) {
+            // 只收"支持列表精确匹配"或"过能力校验的兼容设备"，见 _hidDeviceAcceptable
+            HidReportPlan plan = {};
+            if (_hidDeviceAcceptable(hDevice, attributes, &plan)) {
                 wchar_t serialBuffer[256] = {};
                 if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
                     char serial[256] = {};
@@ -232,6 +402,8 @@ int ORBMDK_HID_OpenDevice(const char* serial)
 
     bool found = false;
     HANDLE hDevice = INVALID_HANDLE_VALUE;
+    HidReportPlan plan = {};
+    uint16_t foundVid = 0, foundPid = 0;
 
     for (DWORD i = 0; SetupDiEnumDeviceInterfaces(
             deviceInfo, nullptr, &hidGuid, i, &interfaceData); i++) {
@@ -261,8 +433,9 @@ int ORBMDK_HID_OpenDevice(const char* serial)
         HIDD_ATTRIBUTES attributes = {};
         attributes.Size = sizeof(attributes);
 
+        plan = HidReportPlan{};
         if (HidD_GetAttributes(hDevice, &attributes) &&
-            IsCMSISDAPDevice(attributes.VendorID)) {
+            _hidDeviceAcceptable(hDevice, attributes, &plan)) {
 
             wchar_t serialBuffer[256] = {};
             if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
@@ -272,10 +445,14 @@ int ORBMDK_HID_OpenDevice(const char* serial)
 
                 if (strcmp(serial, deviceSerial) == 0) {
                     found = true;
+                    foundVid = attributes.VendorID;
+                    foundPid = attributes.ProductID;
                     break;
                 }
             } else if (!serial || serial[0] == '\0') {
                 found = true;
+                foundVid = attributes.VendorID;
+                foundPid = attributes.ProductID;
                 break;
             }
         }
@@ -297,6 +474,9 @@ int ORBMDK_HID_OpenDevice(const char* serial)
     }
 
     g_hDevice = hDevice;
+    g_hidPlan = plan;
+    g_hidVid = foundVid;
+    g_hidPid = foundPid;
     g_isConnected = true;
 
     // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态（bug.md B1）。
@@ -314,12 +494,26 @@ void ORBMDK_HID_CloseDevice(void)
         g_hDevice = INVALID_HANDLE_VALUE;
     }
     g_isConnected = false;
+    g_hidPlan = HidReportPlan{};
 }
 
 int ORBMDK_HID_IsConnected(void)
 {
     std::lock_guard<std::mutex> lock(g_hidMutex);
     return g_isConnected ? 1 : 0;
+}
+
+size_t ORBMDK_HID_GetPayloadMax(void)
+{
+    std::lock_guard<std::mutex> lock(g_hidMutex);
+    return (g_isConnected && g_hidPlan.valid) ? g_hidPlan.payloadMax : 0;
+}
+
+void ORBMDK_HID_GetIdentity(uint16_t* vid, uint16_t* pid)
+{
+    std::lock_guard<std::mutex> lock(g_hidMutex);
+    if (vid) *vid = g_hidVid;
+    if (pid) *pid = g_hidPid;
 }
 
 int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen,
@@ -445,6 +639,8 @@ DWORD _dapHalfOpenWindow(LONG probeFails)
 // 这个负返回值是否意味着"DAP 通道没响应（超时）"。
 // ⚠ -2 的含义随传输层而变：V2 是 _bulkWrite/_bulkRead 超时，V1 却是 cmdLen 越界
 //   （编程错误）—— 后者绝不能拿来熔断。
+// ⚠ V1 只认 -3/-5（写/读超时）；-4/-6/-7 是**立即失败**（如报告长度不匹配被
+//   驱动当场拒收 err=87），设备其实活着，不参与熔断 —— 否则会误报"探针已死"。
 bool _dapIsTimeout(int rc)
 {
     if (rc >= 0) {
@@ -618,96 +814,147 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
 
     if (!g_isConnected || g_hDevice == INVALID_HANDLE_VALUE) {
         HidTrace("DAPCommand: cmd=0x%02X outLen=%zu -> NOT CONNECTED", cmd[0], cmdLen);
-        return -1;
+        return HID_RC_NOT_CONNECTED;
+    }
+    if (!g_hidPlan.valid) {
+        LOG_HID_ERROR("HID 报告布局未知（能力探测失败）-> 拒绝下发命令");
+        return HID_RC_WRITE_FAILED;
     }
 
-    // 上限必须是**实际输出缓冲区**的大小，不是 DAP_BUFFER_SIZE(512)：
-    // reportOut 只有 HID_MAX_PACKET_SIZE(65) 字节，下一行的
-    // memcpy(&reportOut[1], cmd, cmdLen) 在 cmdLen ∈ [65, 511] 时会栈溢出。
-    // 逐字 DAP_Transfer 最多 8 字节、碰不到；但接入块传输后
-    // count > 14（5 + 14*4 = 61 字节）就会踩中。
-    if (cmdLen == 0 || cmdLen > HID_MAX_PACKET_SIZE - 1) return -2;
-
-    uint8_t reportOut[HID_MAX_PACKET_SIZE] = {};
-    reportOut[0] = CMD_REPORT_ID;
-    memcpy(&reportOut[1], cmd, cmdLen);
-
-    // 使用 OVERLAPPED I/O 进行 WriteFile
-    OVERLAPPED writeOl = {};
-    writeOl.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-
-    DWORD bytesWritten = 0;
-    if (!WriteFile(g_hDevice, reportOut, HID_MAX_PACKET_SIZE, &bytesWritten, &writeOl)) {
-        DWORD err = GetLastError();
-        if (err != ERROR_IO_PENDING) {
-            LOG_HID_ERROR("HID WriteFile failed, error=%d, device=%p, connected=%d", err, g_hDevice, g_isConnected);
-            CloseHandle(writeOl.hEvent);
-            return -3;
-        }
-        // 等待写入完成
-        DWORD waitResult = WaitForSingleObject(writeOl.hEvent, timeoutMs > 0 ? timeoutMs : 1000);
-        if (waitResult == WAIT_TIMEOUT) {
-            CancelIo(g_hDevice);
-            CloseHandle(writeOl.hEvent);
-            return -3;
-        }
-        if (!GetOverlappedResult(g_hDevice, &writeOl, &bytesWritten, FALSE)) {
-            LOG_HID_ERROR("HID WriteFile GetOverlappedResult failed, error=%d", GetLastError());
-            CloseHandle(writeOl.hEvent);
-            return -3;
-        }
+    // 长度上限以**设备报告负载**为准，不是固定 65：报告长度随设备而变
+    // （栈上开 65 字节缓冲按固定长度发，会在别的设备上被驱动以 err=87 拒收）
+    if (cmdLen == 0 || cmdLen > g_hidPlan.payloadMax) {
+        LOG_HID_ERROR("DAP 命令 %zu 字节超出 HID 报告负载 %zu 字节",
+                      cmdLen, g_hidPlan.payloadMax);
+        return HID_RC_BAD_LENGTH;
     }
-    CloseHandle(writeOl.hEvent);
 
-    uint8_t reportIn[HID_MAX_PACKET_SIZE] = {};
+    std::vector<uint8_t> reportOut(g_hidPlan.writeLen, 0);
+    if (g_hidPlan.payloadOff > 0) {
+        reportOut[0] = g_hidPlan.reportId;
+    }
+    memcpy(&reportOut[g_hidPlan.payloadOff], cmd, cmdLen);
 
-    // 使用 OVERLAPPED I/O 进行 ReadFile
-    OVERLAPPED readOl = {};
-    readOl.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (g_hidPlan.writeIsFeature) {
+        // 没有 Output 报告的老式 DAPLink：命令走控制传输（同步调用，无 OVERLAPPED）
+        if (!HidD_SetFeature(g_hDevice, reportOut.data(), (ULONG)reportOut.size())) {
+            LOG_HID_ERROR("HidD_SetFeature failed, error=%lu, len=%zu",
+                          GetLastError(), reportOut.size());
+            return HID_RC_WRITE_FAILED;
+        }
+    } else {
+        OVERLAPPED writeOl = {};
+        writeOl.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
 
+        DWORD bytesWritten = 0;
+        if (!WriteFile(g_hDevice, reportOut.data(), (DWORD)reportOut.size(),
+                       &bytesWritten, &writeOl)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_IO_PENDING) {
+                // 立即失败（err=87 = 报告长度/报告ID 与设备描述符不符）：
+                // 设备是活的，绝不能算超时去触发熔断
+                LOG_HID_ERROR("HID WriteFile failed, error=%lu, len=%zu, 报告ID=0x%02X",
+                              err, reportOut.size(), (unsigned)g_hidPlan.reportId);
+                CloseHandle(writeOl.hEvent);
+                return HID_RC_WRITE_FAILED;
+            }
+            DWORD waitResult = WaitForSingleObject(writeOl.hEvent, timeoutMs > 0 ? timeoutMs : 1000);
+            if (waitResult == WAIT_TIMEOUT) {
+                CancelIo(g_hDevice);
+                CloseHandle(writeOl.hEvent);
+                return HID_RC_WRITE_TIMEOUT;
+            }
+            if (!GetOverlappedResult(g_hDevice, &writeOl, &bytesWritten, FALSE)) {
+                LOG_HID_ERROR("HID WriteFile GetOverlappedResult failed, error=%lu", GetLastError());
+                CloseHandle(writeOl.hEvent);
+                return HID_RC_WRITE_FAILED;
+            }
+        }
+        CloseHandle(writeOl.hEvent);
+    }
+
+    std::vector<uint8_t> reportIn(g_hidPlan.inputLen ? g_hidPlan.inputLen : HID_MAX_PACKET_SIZE, 0);
+
+    auto readReport = [&](uint8_t* buf, size_t len, DWORD* got) -> int {
+        OVERLAPPED ol = {};
+        ol.hEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        DWORD n = 0;
+        if (!ReadFile(g_hDevice, buf, (DWORD)len, &n, &ol)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_IO_PENDING) {
+                LOG_HID_ERROR("HID ReadFile failed, error=%lu", error);
+                CloseHandle(ol.hEvent);
+                return HID_RC_READ_FAILED;
+            }
+            if (WaitForSingleObject(ol.hEvent, timeoutMs > 0 ? timeoutMs : 1000) == WAIT_TIMEOUT) {
+                CancelIo(g_hDevice);
+                CloseHandle(ol.hEvent);
+                return HID_RC_READ_TIMEOUT;
+            }
+            if (!GetOverlappedResult(g_hDevice, &ol, &n, FALSE)) {
+                LOG_HID_ERROR("HID ReadFile GetOverlappedResult failed, error=%lu", GetLastError());
+                CloseHandle(ol.hEvent);
+                return HID_RC_READ_FAILED;
+            }
+        }
+        CloseHandle(ol.hEvent);
+        *got = n;
+        return HID_RC_OK;
+    };
+
+    // 一问一答：只认**回显了命令ID**的报告，偏移由回显位置自校准 ——
+    //   [报告ID][命令ID][负载] （Windows 规范路径，设备补报告ID）
+    //   [命令ID][负载]         （设备不补报告ID，命令ID 落在第 0 字节）
+    // 布局写死会在两种实现间二选一，设备选错了就整条链路读到移位数据。
     DWORD bytesRead = 0;
-    if (!ReadFile(g_hDevice, reportIn, HID_MAX_PACKET_SIZE, &bytesRead, &readOl)) {
-        DWORD error = GetLastError();
-        if (error != ERROR_IO_PENDING) {
-            LOG_HID_ERROR("HID ReadFile failed, error=%d", error);
-            CloseHandle(readOl.hEvent);
-            return -4;
+    size_t payloadStart = 0;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        bytesRead = 0;
+        const int rc = readReport(reportIn.data(), reportIn.size(), &bytesRead);
+        if (rc != HID_RC_OK) return rc;
+        if (bytesRead == 0) return HID_RC_EMPTY_RESPONSE;
+
+        // 先按描述符推出的布局判定（readHasPrefix），不符再试另一种：
+        // 反序判定会把"负载字节恰好等于命令ID"误认成前缀 -- 要避免。
+        const bool pref = g_hidPlan.readHasPrefix;
+        if (pref) {
+            if (bytesRead >= 2 && reportIn[1] == cmd[0]) { payloadStart = 2; break; }
+            if (reportIn[0] == cmd[0]) { payloadStart = 1; break; }
+        } else {
+            if (reportIn[0] == cmd[0]) { payloadStart = 1; break; }
+            if (bytesRead >= 2 && reportIn[1] == cmd[0]) { payloadStart = 2; break; }
         }
 
-        DWORD waitResult = WaitForSingleObject(readOl.hEvent, timeoutMs > 0 ? timeoutMs : 1000);
-        if (waitResult == WAIT_TIMEOUT) {
-            CancelIo(g_hDevice);
-            CloseHandle(readOl.hEvent);
-            return -5;
-        }
-
-        if (!GetOverlappedResult(g_hDevice, &readOl, &bytesRead, FALSE)) {
-            LOG_HID_ERROR("HID ReadFile GetOverlappedResult failed, error=%d", GetLastError());
-            CloseHandle(readOl.hEvent);
-            return -6;
-        }
+        // 既不回显也不是本命令的响应（陈旧/无关报告）：丢弃重读
+        LOG_HID_WARN("HID 响应不匹配：cmd=0x%02X 收到 IN[0..7]=%02X %02X %02X %02X "
+                     "%02X %02X %02X %02X (readLen=%lu, attempt=%d)",
+                     cmd[0], reportIn[0], reportIn[1], reportIn[2], reportIn[3],
+                     reportIn[4], reportIn[5], reportIn[6], reportIn[7],
+                     (unsigned long)bytesRead, attempt + 1);
+        payloadStart = 0;
     }
-    CloseHandle(readOl.hEvent);
-    if (bytesRead == 0) return -7;
+    if (payloadStart == 0) return HID_RC_BAD_RESPONSE;
 
-    // 响应约定（与上层所有 DAP_* 解析保持一致）：
-    //   ReadFile 返回的 IN 报告首字节为 **报告ID**，命令响应从索引 1 开始。
-    //   即：resp[0]=报告ID(通常 0x00), resp[1]=命令ID, resp[2..]=响应负载。
-    //   实测 orbtrace 固件 V1(HID) 路径为 64 字节 IN 报告且含报告ID前缀，
-    //   因此这里原样拷贝（含报告ID），由上层按上述偏移解析。
-    //   参考 COMPAT_ANALYSIS.md 第 11.3 节。
-    if (resp && respLen) {
-        size_t copyLen = std::min((size_t)bytesRead, *respLen);
-        memcpy(resp, reportIn, copyLen);
-        *respLen = copyLen;
-
-        if (copyLen > 0 && reportIn[0] != CMD_REPORT_ID) {
-            LOG_HID_DEBUG("HID response report ID = 0x%02X (expected 0x%02X)",
-                          reportIn[0], CMD_REPORT_ID);
-        }
+    // 响应约定（上层所有 DAP_* 解析都依赖）：resp[0]=报告ID占位, resp[1]=命令ID,
+    // resp[2..]=负载。这与 V2 分支的组装（tmp[0] 就是命令ID）必须**逐字节对齐**，
+    // 否则同一条 DAP_* 解析函数在两种传输上得到不同的结果。
+    //
+    // ⚠️ 命令ID 必须在这里**补回**：payloadStart 是"负载起点"，它已经跳过了命令ID
+    // （自校准的目的就是定位负载起点）。若直接把 reportIn[payloadStart] 当作 resp[1]，
+    // 上层拿到的是**第二个**负载字节：全体前移一位、respLen 少 1。
+    // DAP_Connect(0x02) 的负载只有 1 字节，于是 respLen=2 < 3 被 DAP_ConnectSWD 判为
+    // 失败 —— 现象正是"V2 正常、V1 读不到 IDCODE"。
+    if (resp && respLen && *respLen >= 2) {
+        size_t outLen = 1;
+        resp[0] = CMD_REPORT_ID;
+        resp[outLen++] = cmd[0];            // 回显命令ID（CMSIS-DAP 规范要求）
+        const size_t avail = bytesRead > payloadStart ? (size_t)bytesRead - payloadStart : 0;
+        const size_t copyLen = std::min(avail, *respLen - outLen);
+        memcpy(&resp[outLen], &reportIn[payloadStart], copyLen);
+        *respLen = outLen + copyLen;
     }
 
-    return 0;
+    return HID_RC_OK;
 }
 
 // ============================================================================

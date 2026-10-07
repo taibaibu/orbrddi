@@ -51,7 +51,7 @@ typedef struct {
 
 /**
  * @brief 初始化 USB Bulk 传输层
- * @param vid  Vendor ID
+ * @param vid  Vendor ID（0 且 pid 也为 0 时按 ORBMDK.h 的支持列表匹配）
  * @param pid  Product ID
  * @param serial 设备序列号 (可选)
  * @return 0 成功, <0 失败
