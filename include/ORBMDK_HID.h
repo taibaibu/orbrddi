@@ -23,6 +23,8 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen, uint8_t* resp, size
 // DAP Command Helpers
 int DAP_GetInfo(uint8_t infoId, char* buffer, size_t bufferLen);
 int DAP_ConnectTarget(void);
+// 指定端口连接：0=默认/自动，1=SWD，2=JTAG（COMPAT_ANALYSIS §18.9）
+int DAP_ConnectTargetPort(int port);
 int DAP_DisconnectTarget(void);
 int DAP_ConfigureTransfer(uint8_t idleCycles, uint16_t waitRetry, uint16_t matchRetry);
 int DAP_SetSWJClock(uint32_t clock);
@@ -38,8 +40,29 @@ int DAP_SWJ_Pins(uint8_t pinSelect, uint8_t pinOut, int* pinIn, int wait);
 int DAP_ResetTarget(void);
 
 // JTAG Operations
-int DAP_JTAG_Configure(uint8_t irLength, uint8_t devCount);
-int DAP_JTAG_Sequence(uint8_t sequenceInfo, uint8_t count, const uint8_t* tdiData, uint8_t* tdoData);
+int DAP_JTAG_Configure(const uint8_t* irLengths, uint8_t devCount);
+
+// JTAG 序列段：一次 USB 往返可带多段，段间 TMS 连续（TAP 状态机不停顿），
+// 这样"复位 TAP → 扫链"这类多步时序才是一次原子操作。
+//
+// 线上格式（CMSIS-DAP ID_DAP_JTAG_SEQUENCE = 0x14）：
+//     请求 [0x14][段数][info0][TDI0…][info1][TDI1…]…
+//     info = 本段位数(1..63；0 表示 64) | bit6 = 本段 TMS 电平 | bit7 = 捕获 TDO
+//     响应 [0x14][status][各捕获段的 TDO 依次拼接]
+//
+// 尺寸约定：bits 是**本段**位数（1..64）；tdi 指向的缓冲按 (bits+7)/8 字节读取，
+// LSB first（第 0 位 = 第一个时钟沿送出的位）。
+struct JtagSeg {
+    uint8_t bits;        // 1..64（线上以 0 编码 64）
+    uint8_t tms;         // 本段恒定 TMS 电平（0/1）
+    uint8_t capture;     // 1 = 捕获本段 TDO
+    const uint8_t* tdi;  // TDI 数据；NULL = 全 0（补 BYPASS 位时用）
+};
+
+// 返回 0 成功；tdoOut 收到捕获数据（tdoLen 可为 NULL）；<0 失败。
+int DAP_JTAG_Sequence(const JtagSeg* segs, int segCount,
+                      uint8_t* tdoOut, size_t tdoCap, size_t* tdoLen);
+
 int DAP_JTAG_IDCODE(int* idcodeCount, uint32_t* idcodes);
 
 // SWO Trace Operations

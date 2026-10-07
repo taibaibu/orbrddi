@@ -902,7 +902,23 @@ static int _bulkWrite(const uint8_t* data, size_t len, int timeoutMs)
         if (waitResult == WAIT_TIMEOUT) {
             _cancelOverlapped(g_winusb.deviceHandle, g_winusb.winusbHandle,
                               g_winusb.bulkOutPipe, &overlapped, 3000);
-            BulkTrace("  bulkWrite OUT ep=0x%02X len=%u TIMEOUT after %d ms",
+
+            // ★ 超时后**无条件复位 OUT 端点**。
+            //
+            // bulk OUT 超时几乎总意味着设备不再读这条管线（一直 NAK，或端点已 halt）。
+            // 只做 CancelIoEx 的话端点状态原样保留 → 下一条命令照样超时 → 上层重试
+            // 就退化成**死循环**。现场实测（2026-09-30）：一次会话里
+            // `bulkWrite OUT ep=0x03 len=64 TIMEOUT after 1000 ms` + `cmd=0x05 write
+            // failed (-2)` 连刷 36 次以上、每秒一次，从用户视角就是"程序卡死"。
+            //
+            // AbortPipe 结束该管线上所有 IRP，ResetPipe 清掉 halt 与 DATA toggle，
+            // 让下一条命令有机会真正发出去（而不是必然再次超时）。
+            // 注意：复位救不了"设备侧整体卡住"（那需要给调试器重新上电），
+            // 但它保证本层**快速如实失败**，而不是无限重试。
+            WinUsb_AbortPipe(g_winusb.winusbHandle, g_winusb.bulkOutPipe);
+            WinUsb_ResetPipe(g_winusb.winusbHandle, g_winusb.bulkOutPipe);
+
+            BulkTrace("  bulkWrite OUT ep=0x%02X len=%u TIMEOUT after %d ms (pipe reset)",
                       (unsigned)g_winusb.bulkOutPipe, (unsigned)len, timeoutMs);
             return -2;  // 超时
         }

@@ -2,8 +2,35 @@
 # PowerShell version - 参考项目根目录 build.ps1 风格
 
 param(
-    [string]$Source = "ORBMDK_RDDI_Test.cpp"
+    [string]$Source = "swdprobe.cpp",
+    [switch]$All      # 重建 test\ 下**全部**工具（改完 DLL 后常用）
 )
+
+# test\ 目录的完整工具清单（2026-09-30 整理后的命名）
+$AllSources = @(
+    "ORBMDK_RDDI_FullTest.cpp",     # 全面功能测试（40 项，含完整导出扫描）
+    "ORBMDK_BlockTransferTest.cpp", # 块传输提速/越界验证
+    "swdprobe.cpp",                 # SWD 通路功能回归（V2 或 V1，见用法）
+    "hidprobe.cpp",                 # CMSIS-DAP v1 (HID) 极简回归
+    "jtagprobe.cpp",                # JTAG 端到端（走本层 DLL）
+    "jtagrawprobe.cpp",             # JTAG 裸帧/引脚级诊断（绕开本层）
+    "v2rawprobe.cpp"                # V2 裸帧/包长/分片诊断（绕开本层）
+)
+
+# -All：逐个重建（改完 DLL 后一次把工具全刷一遍）
+if ($All) {
+    $failed = 0
+    foreach ($s in $AllSources) {
+        Write-Host ""
+        Write-Host "########## $s ##########" -ForegroundColor Cyan
+        & $PSCommandPath -Source $s
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) { $failed++ }
+    }
+    Write-Host ""
+    if ($failed -eq 0) { Write-Host "===== ALL BUILD SUCCESSFUL =====" -ForegroundColor Green; exit 0 }
+    Write-Host "===== $failed BUILD(S) FAILED =====" -ForegroundColor Red
+    exit 1
+}
 
 $ErrorActionPreference = "Continue"
 

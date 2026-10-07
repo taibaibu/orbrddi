@@ -7,8 +7,11 @@
 - 缓冲区、字符串一律由调用方提供，本 DLL 不跨模块传堆指针（可安全配 `/MT` 静态 CRT）。
 
 > 与 Keil 实际调试链路相关的约束（DAP 枚举契约、输出参数必须写、HID 响应偏移、
-> JTAG-to-SWD 切换序列、日志策略等）见 [README.md](README.md) 与
+> JTAG-to-SWD / SWD-to-JTAG 切换序列、日志策略等）见 [README.md](README.md) 与
 > [COMPAT_ANALYSIS.md](COMPAT_ANALYSIS.md)。本文只讲“怎么调”。
+>
+> **协议支持**：**SWD 与 JTAG 均已实机验证**（JTAG 建链 / 扫链 / 寄存器访问见 [§7](#7-jtag-接口)）。
+> 走哪条由 `CMSIS_DAP_ConfigureInterface` 的配置串 `Port=SW|JTAG` 决定。
 
 ---
 
@@ -102,11 +105,11 @@ static int load_all(void)
 RDDI_Open
   → CMSIS_DAP_Detect                （探测接口数，恒 >= 1）
   → CMSIS_DAP_Identify              （取适配器显示名/序列号）
-  → CMSIS_DAP_ConfigureInterface    （选定 V1(HID) 或 V2(Bulk)，锁定传输层）
-  → DAP_Configure                   （SWD/JTAG 配置）
+  → CMSIS_DAP_ConfigureInterface    （选 V1(HID)/V2(Bulk) 锁定传输层；配置串 Port=SW|JTAG 定协议）
+  → DAP_Configure                   （DAP 配置）
   → DAP_GetNumberOfDAPs             （恒 1，必须在 Connect 之前）
   → DAP_GetDAPIDList                （返回 [0]）
-  → CMSIS_DAP_Connect               （连接目标，内部完成 JTAG-to-SWD 切换 + DPIDR 读）
+  → CMSIS_DAP_Connect               （SWD：切换序列+DPIDR；JTAG：扫链，见 §7）
   → CMSIS_DAP_SWJ_Clock             （设时钟）
   → DAP_ReadReg / DAP_WriteReg ...  （寄存器/内存访问）
   → DAP_Disconnect → RDDI_Close
@@ -124,8 +127,7 @@ pfn_CMSIS_DAP_Detect(hd, &noOfIFs);           // 0=V2 Bulk, 1=V1 HID
 char name[64] = {0};
 pfn_CMSIS_DAP_Identify(hd, 0, 2, name, sizeof(name));   // idNo=2 产品名
 
-char cfg[64] = {0};
-pfn_CMSIS_DAP_ConfigureInterface(hd, 0, cfg);           // 选定 ifNo=0
+pfn_CMSIS_DAP_ConfigureInterface(hd, 0, "Port=SW");     // ifNo=0 选 V2(Bulk)；Port=SW|JTAG 定协议
 
 pfn_DAP_Configure(hd, "SWD");
 
@@ -509,12 +511,19 @@ pfn_CMSIS_DAP_Identify(hd, 0, 4, fw,      sizeof(fw));
 int CMSIS_DAP_ConfigureInterface(RDDIHandle handle, int ifNo, char *str);
 ```
 
-**锁定传输层**：`ifNo=0` 用 V2(Bulk)，`ifNo=1` 用 V1(HID)。选中的通道打不开时**直接返回错误**，绝不静默切换。
+**做两件事**：
+
+1. **锁定传输层**：`ifNo=0` 用 V2(Bulk)，`ifNo=1` 用 V1(HID)。选中的通道打不开时**直接返回错误**，绝不静默切换。
+2. **解析配置串** `str`（`键=值;` 分隔）：
+   - `Port=SW` → SWD；**其它值（如 `Port=JTAG`）→ JTAG** —— 决定后续 `CMSIS_DAP_Connect` 走哪条建链路径。
+   - `Clock=<Hz>` → 记录调试时钟（只接受合理范围）。
 
 ```c
-if (pfn_CMSIS_DAP_ConfigureInterface(hd, 0, NULL) != RDDI_SUCCESS) {
+if (pfn_CMSIS_DAP_ConfigureInterface(hd, 0, "Port=SW") != RDDI_SUCCESS) {
     /* 选中的接口不可用，按错误处理 */
 }
+/* 改走 JTAG： */
+pfn_CMSIS_DAP_ConfigureInterface(hd, 0, "Port=JTAG");
 ```
 
 ### 5.4 `CMSIS_DAP_DetectNumberOfDAPs` / `CMSIS_DAP_DetectDAPIDList`
@@ -572,6 +581,9 @@ int CMSIS_DAP_Capabilities(RDDIHandle handle, int ifNo, int *cap_info);
 ```
 
 位定义见头文件 `INFO_CAPS_*`（`SWD`/`JTAG`/`SWO_UART`/`ATOMIC_CMDS` …）。
+
+当前返回 `INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS` —— **`INFO_CAPS_JTAG` 位有意不置**（只宣称
+已验证能力；JTAG 通路本身可用，见 [§7](#7-jtag-接口)。Keil 的 Port 下拉框并不受该位限制）。
 
 ```c
 int caps = 0;
@@ -740,7 +752,11 @@ pfn_CMSIS_DAP_GetDeviceIDList(hd, idcodes, sizeof(idcodes));
 int CMSIS_DAP_Connect(RDDIHandle handle, int *connectedInterface);
 ```
 
-连接目标；内部完成 JTAG-to-SWD 切换序列 + DPIDR 读 + 清 sticky。
+连接目标；**按 `ConfigureInterface` 里 `Port=` 的选择分岔**：
+
+- **SWD**：`DAP_Connect(port=SWD)` → 补发 JTAG-to-SWD 切换序列 → **读 DPIDR**（建链收尾）→ 写 ABORT 清 sticky。
+- **JTAG**：`DAP_Connect(port=JTAG)` → SWD-to-JTAG 切换序列 → 扫链得 IDCODE/IR 长度 → 读 DP IDCODE（见 §7）。
+
 **仅当 `connectedInterface` 指向可写内存时才写**（AGDI 会传选中项索引），输出 `1`=SWD / `2`=JTAG。
 
 ```c
@@ -843,17 +859,23 @@ if (pfn_CMSIS_DAP_SWO_Data(hd, &n, buf, &st) == RDDI_SUCCESS && n > 0) {
 
 ## 7. JTAG 接口
 
+> JTAG 通路已实机打通（建链 / 扫链 / DP·AP 访问）。使用时先让 `CMSIS_DAP_ConfigureInterface`
+> 收到 `Port=JTAG`，再调用 `CMSIS_DAP_Connect`（§5.20）。ADIv5 的语义（选 IR、组 35 位 DR、
+> posted read）**全部由本层生成**，固件只负责把 `CMSIS_DAP_JTAG_Sequence` 的位流打到线上。
+
 ### 7.1 `CMSIS_DAP_JTAG_Configure`
 
 ```c
 int CMSIS_DAP_JTAG_Configure(RDDIHandle handle, int count, uint8_t *ir_len);
 ```
 
-`ir_len` 为各器件 IR 长度数组，`count` 为器件数。
+把**链上各器件的 IR 长度**告诉本层：`ir_len[0]` = **离 TDO 最近**的器件，`count` 为器件数（1..16）。
+本层据此记录链布局（也用于 `GetIRLengths` 回报）。建链时 `CMSIS_DAP_Connect` 会自动扫链得到同一份
+布局，因此通常**不必手动调用**。
 
 ```c
-uint8_t irLen[1] = { 4 };
-pfn_CMSIS_DAP_JTAG_Configure(hd, 1, irLen);
+uint8_t irLen[2] = { 4, 5 };      // 例：JTAG-DP(IR=4) + 边界扫描(IR=5)
+pfn_CMSIS_DAP_JTAG_Configure(hd, 2, irLen);
 ```
 
 ### 7.2 `CMSIS_DAP_JTAG_Sequence`
@@ -863,11 +885,24 @@ int CMSIS_DAP_JTAG_Sequence(RDDIHandle handle, int num, uint8_t *info,
                             uint8_t *tdi, uint8_t *tdo, uint8_t mask);
 ```
 
+**一次下发多段位流**，逐段语义：
+
+- `num` = **段数**（1..64）。
+- `info[i]` = 该段位数（低 6 位，`1..63`；**`0` 表示 64 位**）
+  `| 0x40`（该段 **TMS 恒为高**，否则恒为低）`| 0x80`（捕获该段 TDO）。
+- `tdi` = 各段 TDI **依次拼接**，每段占 `(bits+7)/8` 字节、**LSB first**（不需 TDI 时传 `NULL`）。
+- `tdo` = 各**捕获段**的 TDO 依次拼接（同样按字节对齐）。
+- `mask` 当前忽略（传 `0`）。
+
+> ⚠️ **每段 TMS 恒定**，所以状态迁移必须**一段一段**发（`RTI→Select-DR→Capture-DR→Shift-DR`
+> 各一段），不能指望一段内翻转 TMS。
+
 ```c
-uint8_t info[4] = { 0, 0, 0, 0 };
-uint8_t tdi [4] = { 0 };
-uint8_t tdo [4] = { 0 };
-pfn_CMSIS_DAP_JTAG_Sequence(hd, 1, info, tdi, tdo, 0);
+// 例：Shift-DR 移 32 位；最后 1 位同拍抬 TMS 进入 Exit1-DR
+uint8_t info[2] = { 31, 1 | 0x40 };              // 前 31 位 TMS=0；最后 1 位 TMS=1
+uint8_t tdi [8] = { 0x78, 0x56, 0x34, 0x12, 0 }; // 32 位数据（LSB first）
+uint8_t tdo [8] = { 0 };
+pfn_CMSIS_DAP_JTAG_Sequence(hd, 2, info, tdi, tdo, 0);
 ```
 
 ### 7.3 `CMSIS_DAP_JTAG_GetIDCODEs`
@@ -876,9 +911,18 @@ pfn_CMSIS_DAP_JTAG_Sequence(hd, 1, info, tdi, tdo, 0);
 int CMSIS_DAP_JTAG_GetIDCODEs(RDDIHandle handle, int *count, uint32_t *idcodes);
 ```
 
+返回扫描到的 **IDCODE 列表**与数量。实现**优先用与 `GetDeviceIDList` / `DetectDAPIDList`
+同一张目标表**（协议无关），表为空时才回退固件的 JTAG 扫描命令。
+
+> 这是 `CMSIS_DAP_*` 里**名字带 `JTAG_` 但协议无关**的典型：**SWD 会话同样会调用它**。
+> **“扫不到”不是错误** —— 返回 `RDDI_SUCCESS` + `*count = 0`（否则宿主不会清空列表、
+> 会残留上一台的显示）。`idcodes` 可为 `NULL`（只取数量）。官方按 4 参调用
+> （多一个 `sizeOfArray`），本实现忽略它。
+
 ```c
 int cnt = 0; uint32_t codes[8] = {0};
 pfn_CMSIS_DAP_JTAG_GetIDCODEs(hd, &cnt, codes);
+if (cnt > 0) printf("IDCODE[0] = 0x%08X\n", codes[0]);  // 例 0x4BA00477
 ```
 
 ### 7.4 `CMSIS_DAP_JTAG_GetIRLengths`
@@ -887,9 +931,12 @@ pfn_CMSIS_DAP_JTAG_GetIDCODEs(hd, &cnt, codes);
 int CMSIS_DAP_JTAG_GetIRLengths(RDDIHandle handle, int *count, uint8_t *lengths);
 ```
 
+返回链上**每个器件的 IR 位数**（`lengths[0]` = 离 TDO 最近者）与器件数。
+**SWD 模式一律报 `count = 0`**（避免宿主误以为链上有 JTAG 器件）。
+
 ```c
 int cnt = 0; uint8_t lens[8] = {0};
-pfn_CMSIS_DAP_JTAG_GetIRLengths(hd, &cnt, lens);
+pfn_CMSIS_DAP_JTAG_GetIRLengths(hd, &cnt, lens);   // JTAG: 例 cnt=2, lens={4,5}
 ```
 
 ---
@@ -1171,3 +1218,11 @@ Keil 扩展错误码（0x2000 段）：`RDDI_DAP_ERROR`(0x2000)、`RDDI_DAP_ERRO
 
 8. **32 位 DLL**：Keil µVision 是 32 位进程，必须用 x86 构建的 `ORBMDK_RDDI.dll`；
    覆盖 DLL 前需结束整个 `UV4.exe`（µVision 会把 DLL 常驻内存）。
+
+9. **JTAG 与 SWD 是两条独立建链路径**（由 `CMSIS_DAP_ConfigureInterface` 的 `Port=` 决定）：
+   - `Port=SW`：`Connect` 后补 **JTAG-to-SWD** 切换序列（`0xE79E`）再读 DPIDR；
+   - 其它（如 `Port=JTAG`）：`Connect` 走 **SWD-to-JTAG** 切换序列（`0xE73C`）+ 扫链 + 读 DP IDCODE。
+
+   同一会话内请固定一条。JTAG 下 `CMSIS_DAP_Connect` 建链时会**临时把 SWJ 时钟限到 4 MHz**
+   （JTAG 裕量）。若 JTAG 扫链为空，先查 **TDI/TDO 接线**与目标 JTAG 是否使能，再考虑目标是否
+   刚被 SWD 连接过（部分 SWJ-DP 需目标重新上电才回到 JTAG）。日常调试优先选 **SWD**。

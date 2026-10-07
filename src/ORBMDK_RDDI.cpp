@@ -65,6 +65,8 @@ static const uint8_t kDapRegOffsetMap[8] = {
 static constexpr uint32_t kDefaultClock = 1000000;  // 1 MHz
 static constexpr uint8_t kDefaultWaitRetry = 100;
 static constexpr uint8_t kDefaultMatchRetry = 10;
+// JTAG 链路自愈的连续失败上限（超过则停止重初始化，避免刷日志/占满探针）
+static constexpr int kJtagRecoverMaxFails = 3;
 
 // ---------------------------------------------------------------------------
 // 驱动自持的"固件版本"串（Identify(idNo=4) 的返回值）—— **不要**改成设备的 DAP_Info 串
@@ -149,6 +151,24 @@ struct RDDIContext {
 
     // Debug configuration
     bool isSWD = true;
+    // JTAG（§18.9 落地）：链上器件的 IR 长度与个数。
+    // 单器件 CoreSight JTAG-DP（Cortex-M）的 IR = 4 位；多 TAP 链暂不支持。
+    //
+    // ⚠️ jtagDevCount 初值必须是 **0**：它会被 CMSIS_DAP_JTAG_GetIRLengths 直接
+    // 报给宿主。SWD 会话里报"有 1 个 JTAG 器件"会让宿主认为链上存在 JTAG 设备 ——
+    // 这是纯 SWD 场景下不该出现的信息。只有 JTAG 建链/DAP_JTAG_Configure 成功才置非 0。
+    uint8_t jtagIrLength = 4;
+    int     jtagDevCount = 0;
+
+    // JTAG 引擎的链布局（§18.9）：探针只提供"通用位流"（ID_DAP_JTAG_SEQUENCE），
+    // 选 IR / 组 35 位 DR / 处理 posted read 全部由本层实现（见 JtagDapTransfer）。
+    uint8_t jtagIrLens[8] = { 4, 0, 0, 0, 0, 0, 0, 0 }; // 器件 i 的 IR 位数，i=0 离 TDO 最近
+    int     jtagChainCount  = 0;                        // 链上器件数（扫链得出）
+    int     jtagDpIndex     = 0;                        // JTAG-DP 在链上的位置
+    int     jtagChainIrBits = 0;                        // 全链 IR 总位数
+    uint8_t jtagCurIr       = 0;                        // DP 当前 IR；0 = 未知（需重选）
+    bool    jtagWritePending = false;                   // 有一次写已进 DP 流水线、待后续访问提交
+    int     jtagRecoverFails = 0;                       // 链路自愈的连续失败次数（超过阈值停止重试，防风暴）
     uint32_t debugClock = kDefaultClock;
     bool isConnected = false;
 
@@ -380,6 +400,14 @@ static void EnsureBlockTransferProbed(RDDIContext* ctx, int dapId)
         return;
     }
     ctx->blockTransferProbed = true;
+
+    // JTAG 模式统一走本层引擎的逐次传输：块传输命令会绕到固件自己的 IR/DR 引擎，
+    // 那条路径在本目标上没验证过，而逐次传输已经过扫链/DPIDR/ABORT 验证。
+    if (!ctx->isSWD) {
+        ctx->blockTransferSupported = false;
+        LOG_INFO("Block transfer: JTAG 模式使用逐次传输（不启用固件块传输命令）");
+        return;
+    }
 
     if (!BlockTransferEnabled()) {
         ctx->blockTransferSupported = false;
@@ -776,11 +804,513 @@ RDDI_FUNC int DAP_Disconnect(const RDDIHandle handle)
 //     line reset → JTAG-to-SWD → line reset → 写 ABORT(0x1E) → 读 DPIDR 校验
 // 恢复成功后把调用方那次传输重放一次。恢复期间用 ctx->swdRecovering 防重入。
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 主机侧 JTAG 引擎（COMPAT_ANALYSIS §18.9）
+//
+// orbtrace 固件提供的是"通用位流"命令 ID_DAP_JTAG_SEQUENCE(0x14)（见 DAP_JTAG_Sequence），
+// 于是 ADIv5 的"选 IR / 组 35 位 DR / 处理 posted read"这些语义**全在本层实现**，
+// 不依赖固件那套高层 JTAG 命令（其内部 IR 长度表在本目标上没能配对成功）。
+//
+// 位序权威来源：orbtrace-1.4.3/daplink/cmsis-dap/{JTAG_DP.c, DAP.c}
+//   JTAG_IR():       TDI = [TDO 侧器件旁路 1×ir_before][目标 IR, LSB first][TDI 侧旁路 1×ir_after]
+//                    TAP：2×TMS=1 进 → 2×TMS=0 移位 → 2×TMS=1 出 → 1×TMS=0 回 Idle
+//   JTAG_Transfer(): DR 移位序 = [RnW][A2][A3][D0..D31]；TDO 先出 3 位 ACK，
+//                    ack = (c0<<1)|(c1<<0)|(c2<<2)（OK=1 WAIT=2 FAULT=4）
+//   DAP.c DAP_JTAG_Transfer(): 读是 **posted** 的 —— 先发请求、再读 DP_RDBUFF 取数，
+//                    且读 RDBUFF 前 IR 必须切回 DPACC；写也要一次后续访问来提交。
+//
+// 链序约定（与固件一致）：ir_length[0] = 离 TDO 最近的器件，DR 扫描时靠 TDO 的旁路位先出。
+// DP 在链上的位置由扫链结果自动判定，不依赖 OpenOCD 的声明顺序。
+// ---------------------------------------------------------------------------
+
+// ADIv5 JTAG-DP 的 IR 指令码（对应 DAP.h 的 JTAG_ABORT/DPACC/APACC/IDCODE/BYPASS）
+enum : uint8_t {
+    kJtagIrAbort  = 0x08,
+    kJtagIrDpacc  = 0x0A,
+    kJtagIrApacc  = 0x0B,
+    kJtagIrIdcode = 0x0E,
+    kJtagIrBypass = 0x0F,
+};
+
+// 线上 ACK -> ORBMDK 返回码
+static inline int JtagAckToRes(uint8_t ack)
+{
+    switch (ack) {
+    case 1:  return ORBMDK::DAP_RES_OK;      // DAP_TRANSFER_OK
+    case 2:  return ORBMDK::DAP_RES_WAIT;    // DAP_TRANSFER_WAIT
+    case 4:  return ORBMDK::DAP_RES_FAULT;   // DAP_TRANSFER_FAULT
+    default: return ORBMDK::DAP_RES_NO_ACK;
+    }
+}
+
+// 位缓冲读写（LSB first：第 0 位 = 第一个时钟沿）
+static void JtagPackBits(uint8_t* buf, int* pos, uint32_t value, int bits)
+{
+    for (int i = 0; i < bits; ++i) {
+        if ((value >> i) & 1u) {
+            const int p = *pos + i;
+            buf[p >> 3] |= static_cast<uint8_t>(1u << (p & 7));
+        }
+    }
+    *pos += bits;
+}
+
+static uint32_t JtagUnpackBits(const uint8_t* buf, int* pos, int bits)
+{
+    uint32_t v = 0;
+    const int n = (bits > 32) ? 32 : bits;
+    for (int i = 0; i < n; ++i) {
+        const int p = *pos + i;
+        if ((buf[p >> 3] >> (p & 7)) & 1u) v |= (1u << i);
+    }
+    *pos += bits;
+    return v;
+}
+
+// JTAG 位流诊断：把字节数组转成十六进制串（仅用于日志）。
+static std::string JtagHex(const uint8_t* buf, int n)
+{
+    static const char kHex[] = "0123456789ABCDEF";
+    std::string s;
+    if (!buf || n <= 0) return s;
+    s.reserve(static_cast<size_t>(n) * 2);
+    for (int i = 0; i < n; ++i) {
+        s += kHex[buf[i] >> 4];
+        s += kHex[buf[i] & 0x0F];
+    }
+    return s;
+}
+
+// TAP 复位：TMS=1 连续 6 拍（>5 保证进 Test-Logic-Reset）后回 Run-Test/Idle。
+static bool JtagTapReset(void)
+{
+    const ORBMDK::JtagSeg segs[] = {
+        { 6, 1, 0, nullptr },
+        { 1, 0, 0, nullptr },
+    };
+    return ORBMDK::DAP_JTAG_Sequence(segs, 2, nullptr, 0, nullptr) == 0;
+}
+
+// 扫链：TAP 复位后所有 TAP 的 DR 装载 IDCODE（BYPASS 器件移出 0）。
+// ids[0] = 离 TDO 最近的器件，与 ir_length[0] 的序一致。返回链上器件数。
+static int JtagScanChain(uint32_t* ids, int maxIds)
+{
+    if (!ids || maxIds <= 0) return 0;
+    memset(ids, 0, sizeof(uint32_t) * static_cast<size_t>(maxIds));
+    if (!JtagTapReset()) return 0;
+
+    // Idle -> Select-DR -> Capture-DR -> Shift-DR，最多移出 128 位（4 个 TAP；
+    // 单段上限 64 位，故拆两段）。多移的位只是链上 BYPASS 器件/末端的 0。
+    const ORBMDK::JtagSeg segs[] = {
+        { 1, 1, 0, nullptr },
+        { 2, 0, 0, nullptr },
+        { 64, 0, 1, nullptr },
+        { 64, 0, 1, nullptr },
+        { 2, 1, 0, nullptr },   // Exit1-DR, Update-DR
+        { 1, 0, 0, nullptr },   // -> Run-Test/Idle
+    };
+    uint8_t tdo[16] = {0};
+    if (ORBMDK::DAP_JTAG_Sequence(segs, 6, tdo, sizeof(tdo), nullptr) != 0) return 0;
+
+    int count = 0;
+    for (int i = 0; i < 4 && i < maxIds; ++i) {
+        int bit = i * 32;
+        const uint32_t id = JtagUnpackBits(tdo, &bit, 32);
+        ids[i] = id;
+        // 有效 IDCODE：bit0 = 1（IEEE1149.1 约定）；0/全 1 表示该位置无器件
+        if ((id & 1u) && id != 0xFFFFFFFFu) count = i + 1;
+    }
+    return count;
+}
+
+// 已知 IDCODE -> IR 位数（掩掉版本位 [31:28]，故 0x2/0x4/0x6BA00477 都能命中）
+static int JtagIrLenForId(uint32_t id)
+{
+    switch (id & 0x0FFFFFFFu) {
+    case 0x0BA00477u: return 4;   // ARM CoreSight JTAG-DP（Cortex-M）
+    case 0x06413041u: return 5;   // STM32F4 边界扫描 TAP
+    default:          return 0;   // 未知：调用方按 4 位兜底并告警
+    }
+}
+
+// 选 IR：目标器件送 ir，其余器件全部 BYPASS(1)。IR 已对则直接返回（省一次往返）。
+static bool JtagSetIr(RDDIContext* ctx, uint8_t ir)
+{
+    if (ctx->jtagCurIr == ir) return true;
+    if (ctx->jtagChainCount <= 0 || ctx->jtagDpIndex < 0) return false;
+
+    const int idx = ctx->jtagDpIndex;
+    int before = 0, after = 0;
+    for (int i = 0; i < idx; ++i) before += ctx->jtagIrLens[i];
+    for (int i = idx + 1; i < ctx->jtagChainCount; ++i) after += ctx->jtagIrLens[i];
+
+    const int irLen = ctx->jtagIrLens[idx];
+    const int total = before + irLen + after;
+    if (total <= 0 || total > 64) {
+        LOG_ERROR("JtagSetIr: 全链 IR 位数 %d 超出单段上限 64", total);
+        return false;
+    }
+
+    uint8_t tdi[8] = {0};
+    int pos = 0;
+    for (int i = 0; i < before; ++i) { tdi[pos >> 3] |= static_cast<uint8_t>(1u << (pos & 7)); ++pos; }
+    JtagPackBits(tdi, &pos, ir, irLen);
+    for (int i = 0; i < after; ++i) { tdi[pos >> 3] |= static_cast<uint8_t>(1u << (pos & 7)); ++pos; }
+
+    LOG_DEBUG("JtagSetIr: ir=0x%02X len=%d total=%d before(TDO侧)=%d after(TDI侧)=%d tdi=%s",
+              ir, irLen, total, before, after, JtagHex(tdi, (total + 7) / 8).c_str());
+
+    // ⚠️ IEEE 1149.1：Shift-IR -> Exit1-IR 的那一拍**同时也要移位**，所以
+    //    "移 total 位" 必须正好用 total 拍，且**最后一拍的 TMS 必须是 1**。
+    //    参考固件 JTAG_DP.c:JTAG_IR_Function() 的 else 分支：
+    //        PIN_TMS_SET(); JTAG_CYCLE_TDI(ir);   /* Set last IR bit & Exit1-IR */
+    //    旧实现是"先移 total 拍 TMS=0，再补 {2,1} 退出"，多出来的那一拍把整个 IR
+    //    又推了一位：DP 收到的指令由 0xA(DPACC) 旋转成 0xD（非法）→ JTAG-DP 退化为
+    //    BYPASS → DR 只剩 1 位旁路 → TDO 整段恒 0（这正是 DPACC 恒 0 的根因）。
+    const int headBits = total - 1;
+    const int lastBit  = (tdi[(total - 1) >> 3] >> ((total - 1) & 7)) & 1u;
+    const uint8_t lastByte = static_cast<uint8_t>(lastBit);
+
+    ORBMDK::JtagSeg segs[6];
+    int n = 0;
+    segs[n++] = { 2, 1, 0, nullptr };                          // Idle -> Select-DR -> Select-IR
+    segs[n++] = { 2, 0, 0, nullptr };                          // Capture-IR, Shift-IR
+    if (headBits > 0) {
+        segs[n++] = { static_cast<uint8_t>(headBits), 0, 0, tdi };  // 前 total-1 位
+    }
+    segs[n++] = { 1, 1, 0, &lastByte };                        // 最后 1 位 + Exit1-IR（同一拍）
+    segs[n++] = { 1, 1, 0, nullptr };                          // Update-IR
+    segs[n++] = { 1, 0, 0, nullptr };                          // -> Run-Test/Idle
+
+    if (ORBMDK::DAP_JTAG_Sequence(segs, n, nullptr, 0, nullptr) != 0) {
+        LOG_WARN("JtagSetIr: IR=0x%02X 序列下发失败", ir);
+        return false;
+    }
+    ctx->jtagCurIr = ir;
+    return true;
+}
+
+// 一次 35(+旁路) 位 DR 扫描（IR 必须先选好）。返回 ack（线上编码）到 ackOut。
+static bool JtagDrScan(RDDIContext* ctx, uint8_t request, uint32_t wdata,
+                       uint32_t* rData, uint8_t* ackOut)
+{
+    const int idx = ctx->jtagDpIndex;
+    const int before = idx;                                    // TDO 侧器件数（各 1 位 BYPASS）
+    const int after  = ctx->jtagChainCount - idx - 1;           // TDI 侧器件数
+    const int total  = 35 + before + after;
+    if (total > 64) {
+        LOG_ERROR("JtagDrScan: DR 位数 %d 超出单段上限 64（链太长）", total);
+        return false;
+    }
+
+    uint8_t tdi[8] = {0};
+    int pos = 0;
+    pos += before;                                              // 旁路位（DR 仅 1 位，值随意）
+    JtagPackBits(tdi, &pos, (request >> 1) & 1u, 1);            // RnW
+    JtagPackBits(tdi, &pos, (request >> 2) & 1u, 1);            // A2
+    JtagPackBits(tdi, &pos, (request >> 3) & 1u, 1);            // A3
+    JtagPackBits(tdi, &pos, wdata, 32);                         // D0..D31
+    pos += after;
+
+    LOG_DEBUG("JtagDrScan: req=0x%02X wdata=0x%08X total=%d before(TDO侧)=%d after(TDI侧)=%d tdi=%s",
+              request, wdata, total, before, after, JtagHex(tdi, (total + 7) / 8).c_str());
+
+    // 同 JtagSetIr：Shift-DR -> Exit1-DR 的那一拍也要移位，故最后一拍必须 TMS=1。
+    const int headBits = total - 1;
+    const int lastBit  = (tdi[(total - 1) >> 3] >> ((total - 1) & 7)) & 1u;
+    const uint8_t lastByte = static_cast<uint8_t>(lastBit);
+
+    ORBMDK::JtagSeg segs[6];
+    int n = 0;
+    segs[n++] = { 1, 1, 0, nullptr };                          // Idle -> Select-DR
+    segs[n++] = { 2, 0, 0, nullptr };                          // Capture-DR, Shift-DR
+    if (headBits > 0) {
+        segs[n++] = { static_cast<uint8_t>(headBits), 0, 1, tdi };   // 前 total-1 位 + 捕获
+    }
+    segs[n++] = { 1, 1, 1, &lastByte };                        // 最后 1 位 + Exit1-DR（同一拍）+ 捕获
+    segs[n++] = { 1, 1, 0, nullptr };                          // Update-DR
+    segs[n++] = { 1, 0, 0, nullptr };                          // -> Run-Test/Idle
+
+    uint8_t tdo[8] = {0};
+    if (ORBMDK::DAP_JTAG_Sequence(segs, n, tdo, sizeof(tdo), nullptr) != 0) return false;
+
+    // 线上每个捕获段各自「按字节对齐」（补足 (bits+7)/8 字节），所以不能直接把
+    // 各段字节当连续位流 —— 先按位拼回一条连续位流再解码。
+    uint8_t stream[8] = {0};
+    int sp = 0;
+    if (headBits > 0) {
+        for (int i = 0; i < headBits; ++i) {
+            if ((tdo[i >> 3] >> (i & 7)) & 1u) {
+                stream[sp >> 3] |= static_cast<uint8_t>(1u << (sp & 7));
+            }
+            ++sp;
+        }
+    }
+    if (tdo[(headBits + 7) / 8] & 1u) {                        // 末段的 1 位
+        stream[sp >> 3] |= static_cast<uint8_t>(1u << (sp & 7));
+    }
+    ++sp;
+
+    int p = 0;
+    p += before;                                                // 丢弃 TDO 侧旁路位
+    const uint32_t c0 = JtagUnpackBits(stream, &p, 1);
+    const uint32_t c1 = JtagUnpackBits(stream, &p, 1);
+    const uint32_t c2 = JtagUnpackBits(stream, &p, 1);
+    const uint32_t data32 = JtagUnpackBits(stream, &p, 32);
+    const uint8_t  ack = static_cast<uint8_t>((c0 << 1) | (c1 << 0) | (c2 << 2));
+    if (rData)  *rData  = data32;
+    if (ackOut) *ackOut = ack;
+    LOG_DEBUG("JtagDrScan: tdo=%s -> raw c0=%u c1=%u c2=%u ack=%u data=0x%08X (%s)",
+              JtagHex(stream, (total + 7) / 8).c_str(), c0, c1, c2, ack, data32,
+              ack == 1 ? "OK" : (ack == 2 ? "WAIT" : "NO_ACK/FAULT"));
+    return true;
+}
+
+// 单次 DAP 传输（JTAG）。request 位定义与 SWD 一致：
+//   bit0 = APnDP, bit1 = RnW, bit2 = A2, bit3 = A3（bit4.. 的 MATCH/TIMESTAMP 未实现）
+// 返回值语义与 ORBMDK::DAP_Transfer 对齐（ORBMDK::DAP_RES_*）。
+static int JtagDapTransfer(RDDIContext* ctx, int request, uint32_t* data)
+{
+    const uint8_t req = static_cast<uint8_t>(request);
+    const bool isRead = (req & 0x02) != 0;
+    const uint8_t ir = (req & 0x01) ? kJtagIrApacc : kJtagIrDpacc;
+
+    if (!JtagSetIr(ctx, ir)) return ORBMDK::DAP_RES_NO_ACK;
+
+    // WAIT 重试：AP 传输常需等上一拍完成（等价于固件的 transfer.retry_count）
+    uint8_t ack = 0;
+    uint32_t rData = 0;
+    int retry = (kDefaultWaitRetry > 0) ? kDefaultWaitRetry : 1;
+    do {
+        if (!JtagDrScan(ctx, req, isRead ? 0u : (data ? *data : 0u), &rData, &ack)) {
+            return ORBMDK::DAP_RES_NO_ACK;
+        }
+    } while (ack == 2 && --retry > 0);
+    if (ack != 1) return JtagAckToRes(ack);
+
+    if (!isRead) {
+        ctx->jtagWritePending = true;   // 写已进 DP 流水线：由下一次访问（或 Flush）提交
+        return ORBMDK::DAP_RES_OK;
+    }
+
+    // posted read：本次扫描只发出请求，数据要在**下一次**访问返回 ——
+    // 读 DP_RDBUFF 取回（DAP.c DAP_JTAG_Transfer 同款；RDBUFF 是 DP 寄存器，IR 必须切 DPACC）
+    if (!JtagSetIr(ctx, kJtagIrDpacc)) return ORBMDK::DAP_RES_NO_ACK;
+    ctx->jtagWritePending = false;      // 上面那次访问已把挂起的写提交掉
+    retry = (kDefaultWaitRetry > 0) ? kDefaultWaitRetry : 1;
+    do {
+        if (!JtagDrScan(ctx, 0x0E /* DP_RDBUFF | RnW */, 0, &rData, &ack)) {
+            return ORBMDK::DAP_RES_NO_ACK;
+        }
+    } while (ack == 2 && --retry > 0);
+    if (ack != 1) return JtagAckToRes(ack);
+
+    if (data) *data = rData;
+    return ORBMDK::DAP_RES_OK;
+}
+
+// 提交挂起的写：ADIv5 JTAG-DP 的写和读一样"下一拍生效"，孤立的一次写需要
+// 一次后续访问才会真正落到目标上（与固件 DAP.c 里 "Check last write" 的 RDBUFF 读等价）。
+static bool JtagDapFlush(RDDIContext* ctx)
+{
+    if (ctx->isSWD || !ctx->jtagWritePending) return true;
+    if (!JtagSetIr(ctx, kJtagIrDpacc)) return false;
+
+    uint8_t ack = 0;
+    uint32_t dummy = 0;
+    int retry = (kDefaultWaitRetry > 0) ? kDefaultWaitRetry : 1;
+    do {
+        if (!JtagDrScan(ctx, 0x0E /* DP_RDBUFF | RnW */, 0, &dummy, &ack)) return false;
+    } while (ack == 2 && --retry > 0);
+
+    ctx->jtagWritePending = false;
+    return ack == 1;
+}
+
+// 统一的传输入口：SWD 走固件命令，JTAG 走本层引擎
+static int DapTransferFor(RDDIContext* ctx, int dapId, uint8_t request, uint32_t* data)
+{
+    if (ctx->isSWD) return ORBMDK::DAP_Transfer(dapId, request, data);
+    return JtagDapTransfer(ctx, request, data);
+}
+
+// ---------------------------------------------------------------------------
+// JTAG 建链（COMPAT_ANALYSIS §18.9 落地）
+//
+// 与 SWD 的关键差别：JTAG 的 IR/DR 时序**全部由本层生成**（见上方引擎），
+// 固件只负责把位流打到线上。顺序：
+//     1) DAP_Connect(port=JTAG)        确认探针真的进了 JTAG 模式
+//     2) SWD -> JTAG 切换序列          尽力而为（本目标为单向，通常需目标重新上电）
+//     3) 扫链                          复位 TAP + 移出 IDCODE，自动得出 IR 长度表与 DP 位置
+//     4) DAP_JTAG_Configure            把链布局同步给固件（可选，本层不依赖）
+//     5) 读 DP IDCODE                  选 IR -> 发读请求 -> 读 RDBUFF（posted read）
+// ---------------------------------------------------------------------------
+static bool JtagInitSequence(RDDIContext* ctx, int* outMode, uint32_t* outIdcode)
+{
+    if (outMode)   *outMode = 0;
+    if (outIdcode) *outIdcode = 0;
+
+    const int mode = ORBMDK::DAP_ConnectTargetPort(DAP_CONNECT_JTAG);
+    if (outMode) *outMode = mode;
+    if (mode != DAP_CONNECT_JTAG) {
+        LOG_ERROR("JtagInitSequence: DAP_Connect(port=JTAG) -> mode=%d（探针未进入 JTAG）", mode);
+        return false;
+    }
+    LOG_INFO("JtagInitSequence: 探针已进入 JTAG 模式");
+
+    // JTAG 时钟限幅：orbtrace 官方发布说明写明 "JTAG target access ... tends to run
+    // out of steam around 10-12Mbps"（SWD 可到 25Mbps）。Keil 传下来的 cfg 是
+    // Clock=10000000，正好压在 JTAG 的临界值上；这里主动限到 4 MHz 留裕量。
+    ORBMDK::DAP_SetSWJClock(4000000);
+    LOG_INFO("JtagInitSequence: SWJ 时钟限到 4 MHz（JTAG 通路裕量）");
+
+    // SWD -> JTAG 切换序列（ADIv5 / OpenOCD 的 swd_seq_swd_to_jtag）：
+    // ① TMS/SWDIO 保持 1 连续 ≥50 拍（线复位）② 在 TMS/SWDIO 上发 16 位 0xE73C。
+    // SWJ-DP 有"模式记忆"，刚用 SWD 通信过它就停在 SWD 模式，此时直接扫链必然为空。
+    //
+    // ⚠️ 实测（2026-09-30）：本目标（STM32 类 SWJ-DP）的 JTAG<-SWD 是**单向**的 ——
+    // 上电后只要跑过一次 SWD，补发这个序列也回不到 JTAG，**必须给目标断电重启**。
+    // 所以这里只作"协议正确"的尽力而为，失败不再当硬件故障报（见下面的日志提示）。
+    {
+        uint8_t lineReset[8];
+        memset(lineReset, 0xFF, sizeof(lineReset));      // 64 拍全 1
+        ORBMDK::DAP_SWJ_Sequence(64, lineReset);
+        const uint8_t swdToJtag[2] = { 0x3C, 0xE7 };     // 0xE73C, LSB first
+        ORBMDK::DAP_SWJ_Sequence(16, swdToJtag);
+
+        // SWJ 序列会把探针切到"引脚直驱"模式，切完要重新选一次 JTAG
+        const int mode2 = ORBMDK::DAP_ConnectTargetPort(DAP_CONNECT_JTAG);
+        if (mode2 != DAP_CONNECT_JTAG) {
+            LOG_WARN("JtagInitSequence: 切换序列后重新选 JTAG 返回 mode=%d", mode2);
+        }
+    }
+
+    // 扫链：复位 TAP + 移出 IDCODE，全走通用 JTAG 位流（本层引擎）
+    uint32_t ids[8] = {0};
+    const int devCount = JtagScanChain(ids, 8);
+    if (devCount <= 0) {
+        LOG_ERROR("JtagInitSequence: 扫链为空 —— TDI/TDO 上没有器件响应。"
+                  "若刚刚用过 SWD：本目标 SWJ-DP 的 JTAG<-SWD 是单向的，"
+                  "**必须给目标断电重启**后再试（实测结论，不是接线问题）。"
+                  "其它检查：① TDI/TDO 两根线是否接好（SWD 只用 4 根）；"
+                  "② JTAG 引脚是否被复用或被选项字节关闭（部分 STM32 可配成 JTAG-DP Disabled）；"
+                  "③ 目标是否在复位/掉电。详见 COMPAT_ANALYSIS §18.9。");
+        return false;
+    }
+
+    // 配链：ir_length[0] = 离 TDO 最近的器件（与固件 JTAG_DP.c 的约定一致）。
+    // DP 的位置由 IDCODE 自动判定，不依赖 OpenOCD 的声明顺序。
+    int dpIndex = -1;
+    for (int i = 0; i < devCount && i < 8; ++i) {
+        int irLen = JtagIrLenForId(ids[i]);
+        if (irLen == 0) {
+            LOG_WARN("JtagInitSequence: IDCODE 0x%08X 未知，IR 长度按 4 位兜底", ids[i]);
+            irLen = 4;
+        }
+        ctx->jtagIrLens[i] = static_cast<uint8_t>(irLen);
+        if (dpIndex < 0 && (ids[i] & 0x0FFFFFFFu) == 0x0BA00477u) dpIndex = i;
+    }
+    for (int i = devCount; i < 8; ++i) ctx->jtagIrLens[i] = 0;
+    if (dpIndex < 0) {
+        LOG_WARN("JtagInitSequence: 链上没找到 ARM JTAG-DP(0x?BA00477)，暂按位置 0 处理");
+        dpIndex = 0;
+    }
+
+    ctx->jtagChainCount   = devCount;
+    ctx->jtagDpIndex      = dpIndex;
+    ctx->jtagDevCount     = devCount;
+    ctx->jtagIrLength     = ctx->jtagIrLens[dpIndex];
+    ctx->jtagChainIrBits  = 0;
+    for (int i = 0; i < devCount; ++i) ctx->jtagChainIrBits += ctx->jtagIrLens[i];
+    ctx->jtagCurIr        = 0;       // 未知：让首次访问自己选 IR
+    ctx->jtagWritePending = false;
+
+    LOG_INFO("JtagInitSequence: 扫链成功 count=%d DP@%d(IR=%d) 全链IR=%d位  ID[0]=0x%08X ID[1]=0x%08X",
+             devCount, dpIndex, static_cast<int>(ctx->jtagIrLength), ctx->jtagChainIrBits,
+             ids[0], ids[1]);
+
+    // 把链布局同步给固件（供其 JTAG_IDCODE 等高层命令使用；本层引擎不依赖它）
+    {
+        uint8_t irLens[8] = {0};
+        for (int i = 0; i < devCount && i < 8; ++i) irLens[i] = ctx->jtagIrLens[i];
+        if (ORBMDK::DAP_JTAG_Configure(irLens, static_cast<uint8_t>(devCount)) != 0) {
+            LOG_WARN("JtagInitSequence: DAP_JTAG_Configure 下发失败（本层引擎不依赖）");
+        }
+    }
+
+    ORBMDK::DAP_ConfigureTransfer(0, kDefaultWaitRetry, kDefaultMatchRetry);
+
+    // 读 DP IDCODE：
+    //   ① 扫链（IDCODE 指令路径）已拿到 DP 的 IEEE1149.1 IDCODE（ids[dpIndex]）；
+    //   ② 再补一次 DPACC 读 DPIDR(0x0) 作为调试通路校验。
+    //
+    // 实测结论（对照 OpenOCD，2026-09-30）：本目标 STM32 的 ARM JTAG-DP 对 **DPACC
+    // 地址 0x0 的读恒返回 0**（同一条 DPACC 通道读 CTRL/STAT(0x4)=0xF0000000、经
+    // APACC 读 AP IDR(0xFC)=0x24770011 均正确）。OpenOCD 的 dap_dp_init() 同样
+    // **从不**读 DPIDR：它只 poll CTRL/STAT(0x4) 等 PWRUPACK，再读 AP IDR 识别 MEM-AP。
+    // 因此这里把建链判据从「DPIDR 值非 0」改为「DPIDR 读的 ACK 正常」，DP 身份优先用
+    // 扫链 IDCODE，DPIDR 仅在其可读时覆盖。
+    uint32_t dpidr = 0;
+    const int st = JtagDapTransfer(ctx, 0x02, &dpidr);
+    LOG_INFO("JtagInitSequence: DPIDR(DPACC 0x0) 读 -> status=%d, dpidr=0x%08X", st, dpidr);
+
+    const uint32_t chainId = (dpIndex >= 0 && dpIndex < devCount) ? ids[dpIndex] : 0;
+    if (st != ORBMDK::DAP_RES_OK) {
+        LOG_ERROR("JtagInitSequence: DP 无应答（status=%d）；扫链 IDCODE=0x%08X", st, chainId);
+        return false;
+    }
+    if (dpidr == 0 || dpidr == 0xFFFFFFFFu) {
+        LOG_INFO("JtagInitSequence: DPACC 0x0 读回 0x%08X（本 DP 不支持读 DPIDR），"
+                 "改用扫链 IDCODE=0x%08X 作为 DP 身份", dpidr, chainId);
+    }
+    const uint32_t idcode = (dpidr != 0 && dpidr != 0xFFFFFFFFu) ? dpidr : chainId;
+    if (outIdcode && *outIdcode == 0) *outIdcode = idcode;
+
+    // 清 sticky：ABORT(0x1E) = IR=ABORT 的 DR 写（与固件 JTAG_WriteAbort 同款）
+    {
+        uint8_t ack = 0;
+        uint32_t dummy = 0;
+        if (JtagSetIr(ctx, kJtagIrAbort) &&
+            JtagDrScan(ctx, 0x00 /* RnW=A2=A3=0 */, 0x1Eu, &dummy, &ack)) {
+            ctx->jtagWritePending = true;   // ABORT 同样走流水线：补一次访问提交
+            JtagDapFlush(ctx);
+            LOG_DEBUG("JtagInitSequence: DP ABORT(0x1E) 已下发 ack=%d", ack);
+        }
+        ctx->jtagCurIr = 0;   // IR 已被 ABORT 改过，标记为未知
+    }
+
+    ctx->jtagRecoverFails = 0;   // 建链成功：清空自愈失败计数
+    return true;
+}
+
 static bool SwdLinkRecover(RDDIContext* ctx)
 {
     if (ctx->swdRecovering) {
         return false;
     }
+    // JTAG 模式下**绝不能**走下面的 SWD 序列（线复位 + JTAG-to-SWD 会把刚建好的
+    // JTAG 链路直接打掉）：改为重新做一次 JTAG 建链（§18.9）。
+    if (!ctx->isSWD) {
+        ctx->swdRecovering = true;
+        // 风暴保护：JTAG 建链本身若连续失败（例如目标在 SWD 模式），每次失败都重初始化会
+        // 把日志刷爆、并让探针长时间满负荷。连续失败到阈值后只汇报、不再重初始化。
+        if (ctx->jtagRecoverFails >= kJtagRecoverMaxFails) {
+            ctx->swdRecovering = false;
+            LOG_ERROR("LinkRecover: JTAG 链路已连续 %d 次建链失败，停止重试。"
+                      "请检查目标是否需断电重启/线序，修复后再重新连接。",
+                      ctx->jtagRecoverFails);
+            return false;
+        }
+        LOG_WARN("LinkRecover: JTAG 模式 -> 重新初始化 JTAG 链路（第 %d/%d 次）",
+                 ctx->jtagRecoverFails + 1, kJtagRecoverMaxFails);
+        int mode = 0;
+        uint32_t idcode = 0;
+        const bool ok = JtagInitSequence(ctx, &mode, &idcode);
+        ctx->jtagRecoverFails = ok ? 0 : (ctx->jtagRecoverFails + 1);
+        ctx->swdRecovering = false;
+        return ok;
+    }
+
     ctx->swdRecovering = true;
 
     uint8_t lineReset[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
@@ -816,13 +1346,13 @@ static bool SwdLinkRecover(RDDIContext* ctx)
     return ok;
 }
 
-// 带自愈的传输：NO_ACK / FAULT 时恢复链路并重放一次
+// 带自愈的传输：NO_ACK / FAULT 时恢复链路并重放一次（JTAG 走本层引擎）
 static int TransferWithRecovery(RDDIContext* ctx, int dapId, uint8_t request, uint32_t* data)
 {
-    int status = ORBMDK::DAP_Transfer(dapId, request, data);
+    int status = DapTransferFor(ctx, dapId, request, data);
     if ((status == ORBMDK::DAP_RES_NO_ACK || status == ORBMDK::DAP_RES_FAULT) &&
         !ctx->swdRecovering && SwdLinkRecover(ctx)) {
-        status = ORBMDK::DAP_Transfer(dapId, request, data);
+        status = DapTransferFor(ctx, dapId, request, data);
     }
     return status;
 }
@@ -897,6 +1427,19 @@ RDDI_FUNC int DAP_WriteReg(const RDDIHandle handle, const int dapId, const int r
     // DP ABORT：ARM 中既可写编号 0（DP 地址 0x00 的写口），也可用专用编号 8
     if ((id == 0 || id == 8) && (regId & DAP_REG_RnW) == 0) {
         LOG_DEBUG("DAP_WriteReg: ABORT (id=%d), value=0x%08X", id, value);
+        if (!ctx->isSWD) {
+            // JTAG：IR=ABORT(0x08) 的 DR 写（RnW=A2=A3=0 + 32 位数据），ACK 忽略
+            uint8_t ack = 0;
+            uint32_t dummy = 0;
+            const bool ok = JtagSetIr(ctx, kJtagIrAbort) &&
+                            JtagDrScan(ctx, 0x00, static_cast<uint32_t>(value), &dummy, &ack);
+            ctx->jtagCurIr = 0;   // IR 已被改，标记为未知
+            if (ok) {
+                ctx->jtagWritePending = true;   // ABORT 也走流水线：补一次访问提交
+                JtagDapFlush(ctx);
+            }
+            return ok ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+        }
         return ORBMDK::DAP_WriteAbort(dapId, static_cast<uint32_t>(value)) == 0
                    ? RDDI_SUCCESS
                    : RDDI_DAP_ERROR;
@@ -1008,7 +1551,7 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
                 status = ORBMDK::DAP_RES_ERROR;
                 for (int r = 0; r < retries; r++) {
                     data = 0;
-                    status = ORBMDK::DAP_Transfer(dapId, request, &data);
+                    status = DapTransferFor(ctx, dapId, request, &data);
                     if (status != ORBMDK::DAP_RES_OK) {
                         break;
                     }
@@ -1025,7 +1568,7 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
                     return RDDI_DAP_NO_MATCH;
                 }
             } else {
-                status = ORBMDK::DAP_Transfer(dapId, request, &data);
+                status = DapTransferFor(ctx, dapId, request, &data);
             }
             if (status == ORBMDK::DAP_RES_OK) {
                 dataArray[i] = static_cast<int>(data);
@@ -1033,7 +1576,7 @@ RDDI_FUNC int DAP_RegAccessBlock(const RDDIHandle handle, const int dapId, const
         } else {
             const uint8_t request = static_cast<uint8_t>(offset);
             data = static_cast<uint32_t>(dataArray[i]);
-            status = ORBMDK::DAP_Transfer(dapId, request, &data);
+            status = DapTransferFor(ctx, dapId, request, &data);
             if (status == ORBMDK::DAP_RES_OK) {
                 // 状态 LED：跟踪 AP TAR(5) / DRW(7) 写入。
                 // AGDI 通过 SWD_WriteData（TAR + DRW）写 DHCSR，即走本分支。
@@ -1115,13 +1658,15 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
 
         for (int i = 0; i < chunk; i++) {
             uint32_t data = static_cast<uint32_t>(dataArray[done + i]);
-            const int status = ORBMDK::DAP_Transfer(dapId, request, &data);
+            const int status = DapTransferFor(ctx, dapId, request, &data);
             if (status != ORBMDK::DAP_RES_OK) {
                 LOG_ERROR("DAP_RegWriteRepeat: single write failed at %d/%d, status=%d",
                           done + i, numRepeats, status);
                 return RDDI_DAP_ERROR;
             }
         }
+        // JTAG 的写是流水线的：最后那笔要一次后续访问才真正落到目标上
+        JtagDapFlush(ctx);
         done += chunk;
     }
 
@@ -1174,7 +1719,7 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
 
         for (int i = 0; i < chunk; i++) {
             uint32_t data = 0;
-            const int status = ORBMDK::DAP_Transfer(dapId, request, &data);
+            const int status = DapTransferFor(ctx, dapId, request, &data);
             if (status != ORBMDK::DAP_RES_OK) {
                 LOG_ERROR("DAP_RegReadRepeat: single read failed at %d/%d, status=%d",
                           done + i, numRepeats, status);
@@ -1431,19 +1976,11 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
         std::string valueStr(value, static_cast<size_t>(p - value));
 
         if (keyStr == "Port") {
+            // 这里决定后面走 SWD 还是 JTAG 建链（§18.9）：CMSIS_DAP_Connect /
+            // DetectTargetDapIdList / LinkRecover 都会读 ctx->isSWD 分岔。
             ctx->isSWD = (valueStr == "SW");
-            if (!ctx->isSWD) {
-                // ⚠️ 本层**尚未实现 JTAG**（见 COMPAT_ANALYSIS §18.9）：连接路径
-                // （DAP_ConnectTarget 恒按 SWD）、链路恢复序列、能力位
-                // （CMSIS_DAP_Capabilities 无 JTAG 位）、JTAG_GetIRLengths（桩）
-                // 全都只支持 SWD。宿主一旦选 JTAG，我们仍按 SWD 建链 →
-                // 目标进不了 JTAG 模式 → Keil 报 "Cannot enter Debug Mode"。
-                // 这里显式告警：下次不用再靠翻命令级日志反推。
-                LOG_WARN("CMSIS_DAP_ConfigureInterface: Port='%s' 不受支持"
-                         "（本层仅实现 SWD，见 COMPAT_ANALYSIS §18.9）"
-                         " —— 请在 Keil 的 Debug 设置里把 Port 选回 SWD",
-                         valueStr.c_str());
-            }
+            LOG_INFO("CMSIS_DAP_ConfigureInterface: Port='%s' -> %s 模式",
+                     valueStr.c_str(), ctx->isSWD ? "SWD" : "JTAG");
         } else if (keyStr == "Clock") {
             try {
                 const unsigned long hz = std::stoul(valueStr);
@@ -1508,6 +2045,12 @@ RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap
 
     // 返回支持的协议能力
     // Bit 0: SWD, Bit 1: JTAG, Bit 4: Atomic Commands
+    //
+    // ⚠️ 这里**只宣称已验证的能力**：JTAG 代码路径已实现（§18.9），但目标侧
+    // 还没验证通过（扫链为空，见 §18.9 的实测记录），所以暂时**不加** JTAG 位 ——
+    // 宣称未验证的能力等于骗宿主。（Keil 的 Port 下拉框并不按能力位限制，
+    // 因此需要试 JTAG 时照样可选：本层会按 ConfigureInterface 的 Port= 走 JTAG 路径。）
+    // JTAG 在真机上验证通过后，把 `| INFO_CAPS_JTAG` 加回来。
     *cap_info = INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS;
 
     return RDDI_SUCCESS;
@@ -1533,8 +2076,21 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
         *outMode = 0;
     }
 
-    // Connect to target (0=默认/自动, 1=SWD, 2=JTAG)
-    int mode = ORBMDK::DAP_ConnectTarget();
+    // Connect to target (0=默认/自动, 1=SWD, 2=JTAG) —— 按 Port= 的选择分岔（§18.9）。
+    // JTAG 下 JtagInitSequence 已下发 IR 长度、复位 TAP 并扫到 IDCODE。
+    int mode;
+    uint32_t jtagIdcode = 0;
+    if (ctx->isSWD) {
+        mode = ORBMDK::DAP_ConnectTarget();
+    } else {
+        int jmode = 0;
+        if (!JtagInitSequence(ctx, &jmode, &jtagIdcode)) {
+            LOG_ERROR("DetectTargetDapIdList: JTAG 建链失败");
+            ctx->dapIdList.clear();
+            return 0;
+        }
+        mode = DAP_CONNECT_JTAG;
+    }
     if (mode < 0 || mode > 2) {
         ctx->dapIdList.clear();
         return 0;  // 不返回错误，让调用方决定如何处理
@@ -1569,7 +2125,7 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
     // Read IDCODE: DP 寄存器 0x00，读操作 (APnDP=0, RnW=1, A[3:2]=0)
     // 请求字节 = 0x00 | 0x02 = 0x02
     uint32_t idcode = 0;
-    int status = ORBMDK::DAP_Transfer(0, 0x02, &idcode);  // Read IDCODE request
+    int status = DapTransferFor(ctx, 0, 0x02, &idcode);  // Read IDCODE request
 
     // DPIDR 不可能为 0 或 0xFFFFFFFF。读回这些值说明目标还没进入 SWD 模式，
     // 补一次线复位后重试一次。
@@ -1580,7 +2136,7 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
             ORBMDK::DAP_SWJ_Sequence(56, lineReset);
             ORBMDK::DAP_SWJ_Sequence(8, idle);
         }
-        status = ORBMDK::DAP_Transfer(0, 0x02, &idcode);
+        status = DapTransferFor(ctx, 0, 0x02, &idcode);
     }
 
     ctx->dapIdList.clear();
@@ -1588,6 +2144,12 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
         ctx->dapIdList.push_back(idcode);
         if (outIdcode) {
             *outIdcode = idcode;
+        }
+    } else if (!ctx->isSWD && jtagIdcode != 0) {
+        // JTAG：DP IDCODE 偶发读失败时，用上面扫链的结果兜底
+        ctx->dapIdList.push_back(jtagIdcode);
+        if (outIdcode) {
+            *outIdcode = jtagIdcode;
         }
     }
 
@@ -1824,11 +2386,27 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
               handle, (void *)connectedInterface, (int)(intptr_t)connectedInterface);
     LOG_DEBUG("CMSIS_DAP_Connect: starting SWD connection sequence");
 
-    // 连接目标并获取模式 (0=默认/自动, 1=SWD, 2=JTAG)
-    int mode = ORBMDK::DAP_ConnectTarget();
-    LOG_DEBUG("CMSIS_DAP_Connect: DAP_ConnectTarget returned mode=%d", mode);
+    // 连接目标：**按 ConfigureInterface 里 Port= 的选择分岔**（§18.9）。
+    //   SWD  : 沿用历史路径（port=1 + 主机侧补切换序列）
+    //   JTAG : JtagInitSequence（port=2 + 下发 IR 长度 + TAP 复位 + 扫链）
+    // 下面所有 SWD 专有步骤都被 `if (mode == 1)` 保护，JTAG 下自动跳过。
+    int mode;
+    if (ctx->isSWD) {
+        mode = ORBMDK::DAP_ConnectTarget();
+        LOG_DEBUG("CMSIS_DAP_Connect: DAP_ConnectTarget returned mode=%d", mode);
+    } else {
+        uint32_t jtagIdcode = 0;
+        int jmode = 0;
+        if (!JtagInitSequence(ctx, &jmode, &jtagIdcode)) {
+            LOG_ERROR("CMSIS_DAP_Connect: JTAG 建链失败（检查目标是否物理接了 TDI/TDO、"
+                      "以及 Keil 的 Port 是否确实选了 JTAG）");
+            return RDDI_DAP_ERROR;
+        }
+        mode = DAP_CONNECT_JTAG;
+        LOG_INFO("CMSIS_DAP_Connect: JTAG 建链完成，IDCODE=0x%08X", jtagIdcode);
+    }
     if (mode < 0 || mode > 2) {
-        LOG_ERROR("CMSIS_DAP_Connect: DAP_ConnectTarget failed, mode=%d", mode);
+        LOG_ERROR("CMSIS_DAP_Connect: connect failed, mode=%d", mode);
         return RDDI_DAP_ERROR;
     }
     // 如果 mode=0，使用 SWD 作为默认
@@ -1874,7 +2452,7 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
     // （Transfer Response = 0x07 / ACK=7=NO_ACK）。
     //
     // 实测（orbtrace + STM32F1，V1(HID) 与 V2(Bulk) 同一现象）：
-    //   * 我们的最小宿主（test/orbprobe.cpp）在 Connect 之后立刻读 DPIDR
+    //   * 我们的最小宿主（test/swdprobe.cpp）在 Connect 之后立刻读 DPIDR
     //     → 稳定拿到 0x2BA01477；
     //   * Keil 的 AGDI 在 Connect 之后**第一条**访问是
     //     DAP_WriteReg(DP SELECT = 0xF0)（扫 ROM 表用）→ 直接 NO_ACK，
@@ -1983,6 +2561,20 @@ RDDI_FUNC int CMSIS_DAP_WriteABORT(const RDDIHandle handle, int dap_id, unsigned
         return RDDI_INVHANDLE;
     }
 
+    if (!ctx->isSWD) {
+        // JTAG：ABORT 是 IR=ABORT 的 DR（RnW=A2=A3=0 + 32 位数据），ACK 忽略
+        uint8_t ack = 0;
+        uint32_t dummy = 0;
+        const bool ok = JtagSetIr(ctx, kJtagIrAbort) &&
+                        JtagDrScan(ctx, 0x00, abort, &dummy, &ack);
+        ctx->jtagCurIr = 0;
+        if (ok) {
+            ctx->jtagWritePending = true;
+            JtagDapFlush(ctx);
+        }
+        return ok ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+    }
+
     int status = ORBMDK::DAP_WriteAbort(dap_id, abort);
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
@@ -2035,7 +2627,30 @@ RDDI_FUNC int CMSIS_DAP_JTAG_Configure(const RDDIHandle handle, int count, uint8
         return RDDI_INVHANDLE;
     }
 
-    int status = ORBMDK::DAP_JTAG_Configure(ir_len[0], (uint8_t)count);
+    // 宿主显式下发 IR 长度的入口（ARM rddi_dap.h 的 CMSIS_DAP_JTAG_Configure）。
+    // 本层自己要用的那份在 JtagInitSequence 里，两者走同一个 DAP 层实现。
+    if (!ir_len || count <= 0 || count > 16) {
+        return RDDI_BADARG;
+    }
+    const int status = ORBMDK::DAP_JTAG_Configure(ir_len, (uint8_t)count);
+    if (status == 0) {
+        // 记下来，供 CMSIS_DAP_JTAG_GetIRLengths 回给宿主，同时作为本层引擎的链布局。
+        // ir_len[0] = 离 TDO 最近的器件（与固件 JTAG_DP.c 的约定一致）。
+        const int n = (count > 8) ? 8 : count;
+        ctx->jtagDevCount    = n;
+        ctx->jtagChainCount  = n;
+        for (int i = 0; i < 8; ++i) {
+            ctx->jtagIrLens[i] = (i < n) ? ir_len[i] : 0;
+        }
+        ctx->jtagIrLength    = ir_len[0];
+        ctx->jtagChainIrBits = 0;
+        for (int i = 0; i < n; ++i) ctx->jtagChainIrBits += ctx->jtagIrLens[i];
+        // 未扫过链时无法定位 DP：先按位置 0 处理（JtagInitSequence 会按 IDCODE 自动判定）
+        if (ctx->jtagDpIndex < 0 || ctx->jtagDpIndex >= n) ctx->jtagDpIndex = 0;
+        ctx->jtagCurIr = 0;
+        LOG_INFO("CMSIS_DAP_JTAG_Configure: count=%d IR[0]=%d 全链IR=%d位",
+                 n, static_cast<int>(ir_len[0]), ctx->jtagChainIrBits);
+    }
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
 
@@ -2047,7 +2662,33 @@ RDDI_FUNC int CMSIS_DAP_JTAG_Sequence(const RDDIHandle handle, int num, uint8_t 
         return RDDI_INVHANDLE;
     }
 
-    int status = ORBMDK::DAP_JTAG_Sequence((uint8_t)num, (uint8_t)num, tdi, tdo);
+    // 宿主 API 语义（ARM rddi_dap.h 的 CMSIS_DAP_JTAG_Sequence）：
+    //   num  = 段数；info[i] = 位数(1..63；0 表示 64) | 0x40 = TMS 电平 | 0x80 = 捕获 TDO；
+    //   tdi  = 各段 TDI 依次拼接（每段 (bits+7)/8 字节，LSB first）；tdo = 各捕获段拼接。
+    // 与本层 HID 接口语义一致，逐段拆开后下发。
+    if (num <= 0 || num > 64 || !info) {
+        return RDDI_BADARG;
+    }
+
+    std::vector<ORBMDK::JtagSeg> segs;
+    segs.reserve(static_cast<size_t>(num));
+    const uint8_t* tdiCur = tdi;
+    size_t tdoCap = 0;
+    for (int i = 0; i < num; ++i) {
+        const int bits = (info[i] & 0x3F) ? (info[i] & 0x3F) : 64;
+        ORBMDK::JtagSeg s;
+        s.bits    = static_cast<uint8_t>(bits);
+        s.tms     = (info[i] & 0x40) ? 1 : 0;
+        s.capture = (info[i] & 0x80) ? 1 : 0;
+        s.tdi     = tdiCur;
+        segs.push_back(s);
+        if (tdiCur) tdiCur += (bits + 7) / 8;
+        if (s.capture) tdoCap += static_cast<size_t>((bits + 7) / 8);
+    }
+
+    size_t tdoLen = 0;
+    const int status = ORBMDK::DAP_JTAG_Sequence(segs.data(), static_cast<int>(segs.size()),
+                                                 tdo, tdo ? tdoCap : 0, &tdoLen);
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }
 
@@ -2143,9 +2784,28 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIRLengths(const RDDIHandle handle, int *count, u
         return RDDI_INVHANDLE;
     }
 
-    // JTAG IR 长度通常在 JTAG_Configure 中获取
-    // 这里返回默认值
-    (void)lengths;
+    // IR 长度由 JtagInitSequence 下发给探针并记录在 ctx（§18.9）。
+    // 宿主（AGDI）必须拿到它才能自己生成 JTAG_Sequence；链上单器件时就是 4。
+    //
+    // ⚠️ SWD 模式必须报 0：否则宿主会以为链上存在 JTAG 器件（纯 SWD 会话下
+    // 不该出现的信息）。jtagDevCount 只在 JTAG 建链 / DAP_JTAG_Configure 成功时置非 0。
+    if (ctx->isSWD) {
+        LOG_DEBUG("CMSIS_DAP_JTAG_GetIRLengths: SWD mode -> count=0");
+        return RDDI_SUCCESS;   // *count 已在函数开头写入 0
+    }
+    if (count) {
+        *count = ctx->jtagDevCount;
+    }
+    if (lengths && ctx->jtagDevCount > 0) {
+        // 逐器件回报（irLens[0] = 离 TDO 最近的器件）。
+        // 旧实现把首器件的长度复制给所有器件 —— 多 TAP 链（本目标有 2 个 TAP：
+        // IR=4 的 JTAG-DP + IR=5 的边界扫描）会因此配错，扫链/IDCODE 全错。
+        for (int i = 0; i < ctx->jtagDevCount && i < 8; ++i) {
+            lengths[i] = ctx->jtagIrLens[i];
+        }
+    }
+    LOG_INFO("CMSIS_DAP_JTAG_GetIRLengths: count=%d, ir[0]=%u ir[1]=%u",
+             ctx->jtagDevCount, (unsigned)ctx->jtagIrLens[0], (unsigned)ctx->jtagIrLens[1]);
     return RDDI_SUCCESS;
 }
 
@@ -2348,10 +3008,21 @@ RDDI_FUNC int CMSIS_DAP_ResetDAP(const RDDIHandle handle)
     LOG_DEBUG("CMSIS_DAP_ResetDAP: starting DAP reset sequence");
 
     // 执行 DAP 复位序列
-    // 1. 重新连接目标 (0=默认/自动, 1=SWD, 2=JTAG)
-    int mode = ORBMDK::DAP_ConnectTarget();
+    // 1. 重新连接目标 —— 按 Port= 的选择分岔（§18.9）
+    int mode;
+    if (ctx->isSWD) {
+        mode = ORBMDK::DAP_ConnectTarget();
+    } else {
+        int jmode = 0;
+        uint32_t jid = 0;
+        if (!JtagInitSequence(ctx, &jmode, &jid)) {
+            LOG_ERROR("CMSIS_DAP_ResetDAP: JTAG 建链失败");
+            return RDDI_DAP_ERROR;
+        }
+        mode = DAP_CONNECT_JTAG;
+    }
     if (mode < 0 || mode > 2) {
-        LOG_ERROR("CMSIS_DAP_ResetDAP: DAP_ConnectTarget failed, mode=%d", mode);
+        LOG_ERROR("CMSIS_DAP_ResetDAP: connect failed, mode=%d", mode);
         return RDDI_DAP_ERROR;
     }
     if (mode == 0) mode = 1;  // 使用 SWD 作为默认
@@ -2374,8 +3045,10 @@ RDDI_FUNC int CMSIS_DAP_ResetDAP(const RDDIHandle handle)
         LOG_DEBUG("CMSIS_DAP_ResetDAP: sent JTAG-to-SWD switch sequence");
     }
 
-    // 3. 配置传输参数
-    ORBMDK::DAP_ConfigureSWD(0);
+    // 3. 配置传输参数（SWD_Configure 是 SWD 专有命令，JTAG 下不发）
+    if (mode == 1) {
+        ORBMDK::DAP_ConfigureSWD(0);
+    }
     ORBMDK::DAP_ConfigureTransfer(0, kDefaultWaitRetry, kDefaultMatchRetry);
 
     // 4. 重置目标

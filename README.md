@@ -65,10 +65,15 @@ ORBMDK/
 │   └── ORBMDK_Symbols.cpp      # 符号解析实现
 ├── deprecated/                  # 废弃文件（不参与编译）
 ├── obj/                         # 编译中间文件
-├── test/                        # 测试文件
-│   ├── ORBMDK_RDDI_FullTest.cpp # 实机功能测试（40 项）
-│   ├── ORBMDK_RDDI_Test.cpp     # 基础接口测试
-│   └── build_test.ps1           # 测试构建脚本
+├── test/                        # 测试工具（清单见"验证"一节）
+│   ├── ORBMDK_RDDI_FullTest.cpp # 全面功能测试（40 项，含完整导出扫描）
+│   ├── ORBMDK_BlockTransferTest.cpp # 块传输提速 / 越界验证
+│   ├── swdprobe.cpp             # SWD 通路功能回归（V2 / V1，PASS-FAIL 统计）
+│   ├── hidprobe.cpp             # CMSIS-DAP v1 (HID) 极简回归
+│   ├── jtagprobe.cpp            # JTAG 端到端（走本层 DLL）
+│   ├── jtagrawprobe.cpp         # JTAG 裸帧 + 引脚级诊断（绕开本层）
+│   ├── v2rawprobe.cpp           # V2 裸帧 / 包长 / 分片诊断（绕开本层）
+│   └── build_test.ps1           # 测试构建脚本（-All 重建全部）
 ├── bin/                         # 编译输出
 │   └── ORBMDK_RDDI.dll         # RDDI 驱动 DLL
 ├── build.ps1                    # PowerShell 构建脚本
@@ -138,12 +143,34 @@ RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指�
 ## 验证
 
 ```powershell
-.\test\build_test.ps1 -Source ORBMDK_RDDI_FullTest.cpp
-.\bin\ORBMDK_RDDI_FullTest.exe
+.\test\build_test.ps1 -All              # 一次重建全部工具（改完 DLL 后常用）
+.\bin\ORBMDK_RDDI_FullTest.exe          # 全面功能测试（40 项）
+.\bin\swdprobe.exe                      # SWD 回归：ifNo=0 (V2 / Bulk)
+.\bin\swdprobe.exe ORBMDK_RDDI.dll v1   # SWD 回归：ifNo=1 (V1 / HID)
 ```
 
 测试程序默认从**自身所在目录**加载 `ORBMDK_RDDI.dll`（`build_test.ps1` 把 exe 与 DLL 都输出到 `bin\`），
 也可用参数显式指定：`.\bin\ORBMDK_RDDI_FullTest.exe <dll路径>`。
+
+### 测试工具清单（2026-09-30 整理）
+
+| 工具 | 层次 | 用途 / 何时用 |
+|------|------|----------------|
+| `ORBMDK_RDDI_FullTest.exe` | 走 DLL | 全面功能测试 40 项 + 完整导出扫描；**改完 DLL 先跑它** |
+| `ORBMDK_BlockTransferTest.exe <ramAddr>` | 走 DLL | 块传输提速与哨兵越界验证（flash 下载热路径，§13.7） |
+| `swdprobe.exe [dll] [v1]` | 走 DLL | SWD 通路回归：导出自检 / 适配器字段 / 版本串闸门 / 假冒指针回归 / AP 寄存器解码 / halt-PC-RAM / 日志回调，末尾给出 PASS-FAIL 统计。默认 V2，加 `v1` 走 HID |
+| `hidprobe.exe` | 走 DLL | HID(V1) 极小回归（比 `swdprobe ... v1` 更快更薄） |
+| `jtagprobe.exe` | 走 DLL | JTAG 端到端：`Port=JTAG` → 扫链 → IR 长度 → DP 上电（验证**本层** JTAG 建链） |
+| `jtagrawprobe.exe` | 直连 WinUSB | JTAG 原始帧 + **引脚电平读取** + **手工位拷贝扫 TAP** + 时钟扫描；用于判定"固件 / 接线"卡在哪一层（§18.9） |
+| `v2rawprobe.exe [pad]` | 直连 WinUSB | V2 出包长度与响应分片定标（§17.2 的"整包 = wMaxPacketSize"陷阱） |
+
+> **直连工具会独占设备**：`jtagrawprobe` / `v2rawprobe` 运行前必须关闭 Keil（或让它退出调试会话），
+> 否则会与 µVision 抢同一个 WinUSB 接口，两侧都报错。它们会在结束前恢复 SWD 并 Disconnect。
+
+**改名对照（旧 → 新，2026-09-30）**：`orbprobe` / `orbprobe2` / `orbprobe3` / `ORBMDK_RDDI_Test`
+四者合并为 **`swdprobe`**；`v1probe` → **`hidprobe`**；`v2padprobe` → **`v2rawprobe`**；
+`jtagprobe2` → **`jtagrawprobe`**（`jtagprobe` 名字保留给"走本层 DLL"的那个）。
+`COMPAT_ANALYSIS.md` 的历史章节保留当时的旧文件名，属现场记录，不再逐一回改。
 
 在 ORBTrace + STM32F1 目标上实测 **40/40 全部通过**：
 

@@ -572,6 +572,19 @@ int DAP_ConnectTarget(void)
     return mode;
 }
 
+int DAP_ConnectTargetPort(int port)
+{
+    // ID_DAP_CONNECT: port 0=默认/自动, 1=SWD, 2=JTAG
+    // 响应（含报告ID）：[报告ID][命令ID][端口] = 实际建立的模式
+    uint8_t cmd[2] = {ID_DAP_CONNECT, static_cast<uint8_t>(port)};
+    uint8_t resp[4] = {};
+    size_t respLen = sizeof(resp);
+
+    const int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    if (result != 0 || respLen < 3) return -1;
+    return resp[2];
+}
+
 int DAP_DisconnectTarget(void) {
     uint8_t cmd[1] = {ID_DAP_DISCONNECT};
     uint8_t resp[4] = {};
@@ -763,47 +776,77 @@ int DAP_TransferAbort(int dapId)
 // JTAG Operations
 // ============================================================================
 
-int DAP_JTAG_Configure(uint8_t irLength, uint8_t devCount)
+int DAP_JTAG_Configure(const uint8_t* irLengths, uint8_t devCount)
 {
-    uint8_t cmd[3] = {ID_DAP_JTAG_CONFIGURE, irLength, devCount};
+    // CMSIS-DAP ID_DAP_JTAG_CONFIGURE 请求格式：[0x15][器件数][IR长度0..N-1]
+    //
+    // ⚠️ 旧实现的形参语义是**反的**（把 irLength 当成"器件数"发出去，把 devCount
+    // 当成"IR 长度"）—— 因为 JTAG 通路从来没被调用过，这个错一直没暴露。
+    // 实现 JTAG（§18.9）时必须按规范来，否则探针算不出 IR/DR 序列。
+    if (!irLengths || devCount == 0 || devCount > 16) {
+        return -1;
+    }
+
+    uint8_t cmd[2 + 16];
+    cmd[0] = ID_DAP_JTAG_CONFIGURE;
+    cmd[1] = devCount;
+    memcpy(&cmd[2], irLengths, devCount);
+
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    const int result = ORBMDK_HID_DAPCommand(cmd, (size_t)(2 + devCount), resp, &respLen, 1000);
     if (result != 0 || respLen < 3) return -1;
     // 响应格式：[报告ID][命令ID][状态]
     return resp[2] == 0 ? 0 : -1;
 }
 
-int DAP_JTAG_Sequence(uint8_t sequenceInfo, uint8_t count, const uint8_t* tdiData, uint8_t* tdoData)
+int DAP_JTAG_Sequence(const JtagSeg* segs, int segCount,
+                      uint8_t* tdoOut, size_t tdoCap, size_t* tdoLen)
 {
-    if (count == 0) return -1;
+    if (tdoLen) *tdoLen = 0;
+    if (!segs || segCount <= 0) return -1;
 
+    // 线上格式：[0x14][段数][info][TDI…]…
+    //   info = 位数(1..63；0 表示 64) | bit6 = TMS 电平 | bit7 = 捕获 TDO
+    // 固件侧 DAP.c:DAP_JTAG_Sequence() 逐段取出 info 与 (bits+7)/8 字节 TDI。
     std::vector<uint8_t> cmd;
+    cmd.reserve(2 + static_cast<size_t>(segCount) * 10);
     cmd.push_back(ID_DAP_JTAG_SEQUENCE);
-    cmd.push_back(sequenceInfo);
-    cmd.push_back(count);
+    cmd.push_back(static_cast<uint8_t>(segCount));
 
-    // Calculate bytes needed for TDI data
-    size_t tdiBytes = (count + 7) / 8;
-    if (tdiData) {
-        cmd.insert(cmd.end(), tdiData, tdiData + tdiBytes);
-    } else {
-        cmd.insert(cmd.end(), tdiBytes, 0);
+    for (int i = 0; i < segCount; ++i) {
+        const JtagSeg& s = segs[i];
+        const int bits = (s.bits == 0 || s.bits > 64) ? 64 : s.bits;
+        const uint8_t info = static_cast<uint8_t>((bits & 0x3F) |
+                                                  (s.tms ? 0x40u : 0x00u) |
+                                                  (s.capture ? 0x80u : 0x00u));
+        cmd.push_back(info);
+
+        const size_t nbytes = static_cast<size_t>((bits + 7) / 8);
+        if (s.tdi) {
+            cmd.insert(cmd.end(), s.tdi, s.tdi + nbytes);
+        } else {
+            cmd.insert(cmd.end(), nbytes, 0);   // 未给 TDI 时按全 0 发送
+        }
     }
 
-    uint8_t resp[64] = {};
+    uint8_t resp[128] = {};
     size_t respLen = sizeof(resp);
+    const int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 1000);
+    if (result != 0) return -1;
 
-    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 1000);
-    if (result != 0 || respLen < 2) return -1;
+    // 响应（已规整为 V1 布局）：[报告ID][0x14][status][捕获段的 TDO 依次拼接]
+    //   旧实现漏了 status，直接从 resp[2] 取 TDO —— 每个捕获字节都错位一字节，
+    //   这正是"JTAG 扫链恒为空"的直接原因之一（见 COMPAT_ANALYSIS §18.9）。
+    if (respLen < 3 || resp[1] != ID_DAP_JTAG_SEQUENCE) return -1;
+    if (resp[2] != 0) return -2;   // 固件拒绝（DAP_ERROR，如参数非法）
 
-    // Extract TDO data if provided
-    // 响应（含报告ID）：[报告ID][命令ID][TDO 数据...]
-    if (tdoData && (sequenceInfo & 0x01) && respLen > 2) {
-        size_t tdoBytes = respLen - 2;
-        memcpy(tdoData, &resp[2], std::min(tdoBytes, tdiBytes));
+    const size_t avail = respLen - 3;
+    if (tdoOut && tdoCap > 0 && avail > 0) {
+        const size_t n = (avail < tdoCap) ? avail : tdoCap;
+        memcpy(tdoOut, &resp[3], n);
+        if (tdoLen) *tdoLen = n;
     }
-
     return 0;
 }
 

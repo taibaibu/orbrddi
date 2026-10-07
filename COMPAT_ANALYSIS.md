@@ -18,6 +18,7 @@
 | 导出符号 | `ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **78 个** |
 | 实机验证 | ✅ `ORBMDK_RDDI_FullTest.exe` **40/40 全部通过** |
 | 目标识别 | ✅ DP IDCODE `0x2BA01477`、AP IDR `0x24770011`（STM32F1） |
+| JTAG 通路 | ✅ **已打通**（§18.9 第九步）：`Port=JTAG` 建链成功；扫链 IDCODE `0x4BA00477`、DP CTRL/STAT `0xF0000000`、AP IDR `0x24770011`，与 OpenOCD 交叉一致；SWD 无回归 |
 | Keil 联调 | ✅ 官方 AGDI v1.33.24 下对话框正确显示 `IDCODE 0x2BA01477` / `ARM CoreSight SW-DP`（见 4.7） |
 | Flash 下载 | ✅ 烧录与调试均验证通过（擦除失败根因见 4.8） |
 | 烧录速率 | 🔧 块传输已接入且**能力探测通过**（日志 `Block transfer probe OK`，§13.7 更正）；`test/ORBMDK_BlockTransferTest.exe` 的越界/提速验证**待目标在线时补跑**（§9.9 的验证要求） |
@@ -541,7 +542,8 @@ if (ctx->initialized) {          // RDDI_Open 之后恒为 true
 
 > 注：`CMSIS_DAP_GetNumberOfDevices`（RDDI 层另一个计数接口，AGDI 仅在 JTAG 分支
 > 调用，见 `0x1002C9BC`）仍返回 `kSingleDapCount`，本次未改动 —— 它是 §4.6 #16
-> 为修复 "No Debug Unit Found" 而定，且不在 SWD 路径上。若后续启用 JTAG，需一并复核。
+> 为修复 "No Debug Unit Found" 而定，且不在 SWD 路径上。**JTAG 已于 §18.9 第九步打通**，
+> 此项在 JTAG 路径上是否仍适用待复核（当前 SWD 路径不受影响）。
 
 > 另注：设备拔出后适配器下拉框仍显示 `CMSIS-DAP v1` / 序列号，属 AGDI 缓存的
 > `MonConf` 与 HID 层连接状态未失效，**不影响** 上述列表行为。如需一并处理，
@@ -2544,41 +2546,211 @@ GUID）、`DAP_Target` 的 Halt/Resume/Step、Trace 适配层 3 个空函数、E
 - ULINK+ 专有接口（`ULINKPLUS_*`）：Keil 独有，ORBTrace 用不到。
 - §7.3 符号搜索路径：属设计内 fallback，保持现状。
 
-### 18.9 🔴 JTAG 通路**未实现**（Keil 选 JTAG → "Cannot enter Debug Mode"）
+### 18.9 ✅⭐ JTAG 通路（2026-09-30 定位并打通 —— 结论见**第九步**）
 
-**现象**（2026-09-30 实测）：Debug 设置里把 Port 由 SW 改成 **JTAG** 后，Keil 报
-`Cannot enter Debug Mode`。日志与之吻合：`SWD link recovery failed: target still not
-responding` 与 `DAP_WriteReg: WAIT/NO_ACK, regId=0x00000001` 反复出现，最后
-`CMSIS_DAP_Disconnect` 收场；设备对 `cmd=0x02`(Connect) 回的是 **`01` = SWD 模式**。
+**现象**（起因）：Debug 设置里把 Port 由 SW 改成 **JTAG** 后，Keil 报
+`Cannot enter Debug Mode`；当时设备对 `cmd=0x02`(Connect) 回的是 **`01` = SWD 模式**
+（因为本层过去恒发 `port=1`）。
 
-**结论：不是"坏了"，是这条通路从来没实现过。** 六处证据：
+#### 第一步（已完成）：宿主侧实现
 
-| 位置 | 现状 |
-|------|------|
-| `CMSIS_DAP_ConfigureInterface` | `Port=` 只记 `ctx->isSWD = (value=="SW")`，**不切模式**（`isSWD` 也无处读取） |
-| `DAP_ConnectTarget()`（`ORBMDK_HID.cpp:561`） | 恒调 `DAP_ConnectSWD()`，即 `ID_DAP_CONNECT port=1`；无 JTAG(port=2) 分支 |
-| `CMSIS_DAP_Connect`（`ORBMDK_RDDI.cpp:1813`） | 硬编码 "starting SWD connection sequence"；仅 `mode==1` 时补 JTAG-to-SWD 切换 |
-| `SwdLinkRecover()` | 恢复序列强制 SWD（线复位 + JTAG-to-SWD + `DAP_ConnectTarget()`），JTAG 下每次恢复都把链路拉回 SWD |
-| `CMSIS_DAP_Capabilities` | `INFO_CAPS_SWD \| INFO_CAPS_ATOMIC_CMDS`，**无 JTAG 位**（Keil 的 Port 下拉框并不按能力位限制，所以仍能选 JTAG） |
-| `CMSIS_DAP_JTAG_GetIRLengths` | 桩：`*count = 0`（§5.1）；`JTAG_GetIDCODEs` 复用的是 SWD 扫描出的 `dapIdList` |
+| # | 位置 | 改动 |
+|---|------|------|
+| 1 | `DAP_ConnectTargetPort(port)` | 新增：`Connect(0/1/2)` 由参数决定（原来恒 `port=1`） |
+| 2 | `CMSIS_DAP_Connect` | 按 `ctx->isSWD` 分岔：SWD 走原序列；JTAG 走新的 `JtagInitSequence` |
+| 3 | `JtagInitSequence`（新） | `Connect(2)` → **SWD->JTAG 切换序列**（线复位 64×1 + 16 位 `0xE73C`）→ 重选 `Connect(2)` → `JTAG_Configure(1, ir=4)` → TAP 复位（尽力）→ `JTAG_IDCODE` 扫链 → 读 DP IDCODE |
+| 4 | `SwdLinkRecover` | JTAG 模式下**不再**走 SWD 恢复序列（那会把链路打回 SWD），改为重做 JTAG 建链 |
+| 5 | `CMSIS_DAP_JTAG_Configure` / `GetIRLengths` | 记录 IR 长度/器件数并回给宿主；SWD 模式下报 **count=0** |
+| 6 | `INFO_CAPS_JTAG` | **暂不加**——能力位只宣称已验证能力；JTAG 已于第九步实测打通，是否对外宣称待评估（Keil 的 Port 下拉框不受该位限制，照样能选） |
 
-**要做（若确实需要 JTAG）**：
+#### 第二步：直连 WinUSB 探测（`test/jtagrawprobe.cpp`，绕开本层）
 
-1. `INFO_CAPS_JTAG` 能力位（**只在真正实现后才加**，否则等于骗宿主）；
-2. `DAP_ConnectTarget(port)` 支持 port=2；`CMSIS_DAP_Connect` 分岔出 JTAG 建链
-   （`JTAG_Configure` 下发 IR 长度 + `JTAG_Sequence` 复位/Idle + `ID_DAP_JTAG_IDCODE` 扫描）；
-3. `CMSIS_DAP_JTAG_GetIRLengths` 用扫描结果填充（链上单 TAP 时 IR 长度由 IDCODE 反查或由固件返回）；
-4. 链路恢复按当前模式走（SWD 序列 vs JTAG 复位）；
-5. 验证：需要**目标板物理接了 TDI/TDO/TRST**（很多板子只引 SWDIO/SWCLK，那样 JTAG 无论如何都不通）。
+> 工具名对照见 README"测试工具清单（2026-09-30 整理）"：`jtagprobe2` → `jtagrawprobe`，
+> `orbprobe*` → `swdprobe`，`v1probe` → `hidprobe`，`v2padprobe` → `v2rawprobe`。
 
-**当前处置**：`CMSIS_DAP_ConfigureInterface` 遇到非 `SW` 的 `Port` 值会打 **WARN** 明确说明
-"本层仅实现 SWD"，避免下次再从命令级日志反推（2026-09-30 加）。日常调试请选 **SWD**。
+| 探测 | 固件回应 | 结论 |
+|------|---------|------|
+| `Info(0xF0)` | `00 01 03` | caps = SWD+JTAG（固件自报支持 JTAG）|
+| `Connect(0)` / `Connect(1)` | `02 01` | SWD ✓ |
+| **`Connect(2)`** | **`02 02`** | **真的进入 JTAG 模式** ✓（并非强行回 SWD） |
+| `JTAG_Configure(1, ir=4)` | `15 00` | 接受 ✓ |
+| `JTAG_Configure(ir=5)` / `(count=2, ir=4)` | `15 FF` | 固件只支持**单 TAP / IR=4**（正合 Cortex-M JTAG-DP）|
+| **`JTAG_IDCODE`** | `16 00 00 00 00 00` | **count = 0：链上无器件** ✗ |
+| `JTAG_Sequence`（穷举 info=0x00~0x03、32 位、并**多段读**） | 只回 `14 00`，**从不回 TDO 数据** | 固件不提供通用位流（见第三步）|
+| 补发 SWD->JTAG 切换序列后再扫（两种先后顺序） | 仍 count = 0 | 排除"SWJ-DP 停在 SWD 模式" |
+
+#### 第三步：gateware 源码核实（`orbtrace-1.4.3/verilog/`）
+
+- `jtagIF.v` **是真实实现**：`JTAG_CMD_IR`（写 IR）、`JTAG_CMD_TFR`（35 位 ADIv5 DR 传输）、
+  `JTAG_CMD_READID`（读 IDCODE）、`JTAG_CMD_RESET`（TAP 复位）；且 `assign jtag_tdo = tdo_swo;`
+  → **TDO 确实被采样** ✓。
+- 但它**只实现这四件事**，没有通用 TMS/TDI/TDO 位流 → `DAP_JTAG_Sequence` 只 ACK、不回数据，
+  属**设计如此**（不是故障）。因此链检测只能依赖 `DAP_JTAG_IDCODE`。
+- `dbgIF.v` 侧命令：`CMD_SET_JTAG_CFG=6`、`CMD_JTAG_GET_ID=13`、`CMD_JTAG_RESET=14`、`CMD_JTAG_REG=15`；
+  `assign pinsout = {nReset, nTRST=1, TDO, TDI, SWDIO, SWCLK}` → **TCK/TMS 与 SWCLK/SWDIO 是同一对**，
+  JTAG 比 SWD 多需要 **TDI/TDO 两根**。
+- 推论：**扫链为空 = TDO 上没有任何器件驱动** → 属物理层，软件侧已无可再试。
+
+#### 第四步：结论与排查方向（硬件侧）
+
+1. **TDI/TDO 接线**（最可能）：SWD 只需 SWCLK/SWDIO，JTAG 还要 TDI 与 TDO。用 4 针 SWD 线、
+   或目标板只引出 SWD 接口时，JTAG 必然扫不到（本机现象与之完全一致）。
+2. **目标 JTAG 是否使能**：JTAG 引脚被复用成 GPIO，或选项字节配成 "JTAG-DP Disabled"
+   （部分 STM32 支持该配置）→ 接线正确也扫不到。
+3. **目标状态**：处于复位/掉电时 TDO 无驱动。
+
+#### 第五步：引脚级判定（把"软件侧已穷尽"钉死）
+
+把 `SWJ_Pins`（操作码 **0x10**，注意不是标准里的 0x07——本方言 `0x07=TRANSFER_ABORT`，
+用错会得到"恒 `FF`"的假读数）用起来之后：
+
+| 检查 | 结果 | 含义 |
+|------|------|------|
+| 驱动 nRESET=0 后读回 | `0x6F`（bit7=0）| **引脚回读可信**（拉低即跟随） |
+| 驱动 TMS/TDI=1、再=0 | 读回跟随 | **引脚驱动可信** |
+| **TDO（bit3）** | **恒为 1**（翻转 TMS/TDI/TCK 均不变）| 目标侧**没有任何器件驱动 TDO** |
+| **位拷贝扫 DR**（手工走 TAP：复位→RTI→Select-DR→Capture-DR→Shift-DR→移 32 位）| `0xFFFFFFFF` | **完全绕开 gateware 的 JTAG 引擎**，结论一致 |
+| 拉低 nRESET（复位态）后再扫 | 仍 0 | **connect-under-reset 已排除**（复位线有效）|
+| SWJ 时钟 100k/500k/1M/4M/10M 逐档 | 全部 count=0 | **不是时钟过快**（orbtrace 官方 JTAG 上限 10-12Mbps）|
+
+两套互不相关的读链实现（gateware 的 `JTAG_CMD_READID` 与宿主手工位拷贝）都读不到器件；
+而 **SWD 完全正常**（DPIDR `0x2BA01477`）→ 目标已上电、DP 活着。orbtrace 官方发布说明
+亦确认 JTAG 是可用特性（v1.0.0 起）。据此：
+
+> **结论：TDO 上没有信号 = 物理链路问题**，宿主侧变量已全部排除
+> （模式切换 / IR 配置 / TAP 复位 / SWD→JTAG 切换 / 复位态 / 时钟 / info 编码 /
+> 多段响应 / 独立位拷贝）。
+
+**待用户侧验证（按性价比排序）**：
+
+1. **逐根查线（含"有没有把 TDI/TDO 接反/交叉"）**：原理图正确 ≠ 线接对。JTAG 的 TDI/TDO
+   是**直连**（不是 UART 那种交叉）。若交叉：探针 TDO 输入悬空 → 恒读 1，与本机现象完全吻合。
+2. **换一块已知 JTAG 可用的目标板**（老 F1/F4 开发板，JTAG 引脚未被复用）→ 二分定位
+   "目标板"还是"探针/线缆"。
+3. **第三方宿主交叉验证**：用 OpenOCD(+orbtrace) 走 JTAG 试同一目标 —— 若 OpenOCD 也失败，
+   即可断定与本层实现无关。
+
+#### 第六步（2026-09-30，用户定位）：**目标 SWJ-DP 的 JTAG→SWD 是单向的**
+
+用户实测确认：**目标一旦执行过一次 JTAG→SWD（即任何 SWD 连接），就再也回不到 JTAG**，
+只能给目标**断电重上电**。补发 ADIv5 规定的 SWD→JTAG 序列（线复位 + `0xE73C`）无效 ——
+该步骤已做进 `JtagInitSequence`，实测救不回来。
+
+这一条一次性解释了此前所有"TDO 恒 1 / 扫链为空"的观察：**是我们自己先发了 SWD**
+（探测程序第 [1] 步的 `Connect(0)`、以及 Keil Debug 设置对话框的设备扫描，发的都是 SWD），
+把目标锁进 SWD；此后的 JTAG 尝试自然全为空。
+
+**据此修正两条旧结论**：
+
+1. 第五步"拉低 nRESET 后再扫仍为 0 → connect-under-reset 已排除"**不成立**：当时目标已锁在
+   SWD，"复位也没用"只说明**当次实验无效**，需要**重新验证**。若 nRESET 能复位 SWJ-DP 的
+   模式选择，驱动就能在 JTAG 建链失败时自动恢复（值得做，也值得写进 §18.9 的处置）。
+2. 第五步据此推出的"接线/TDO 无驱动"**同样待重验**：目标被锁时 TDO 本来就无响应。
+
+**正确姿势（本目标走 JTAG 的唯一路径）**：**给目标断电 → 上电 → 第一件事就用 JTAG 连接**
+（`Port=JTAG`），中途**绝不能**发生任何 SWD 连接。驱动侧已保证这一点：三处
+`DAP_ConnectTarget()`（SWD）全部在 `if (ctx->isSWD)` 分支内，选 JTAG 时本层不碰 SWD。
+探测工具对应 `test/jtagrawprobe.cpp --no-swd`（JTAG-only：跳过全部 `Connect(0)`/`Connect(1)`）。
+
+#### 第八步（2026-09-30）：帧格式根因**已定位并实测读通** ⭐
+
+用 **OpenOCD 交叉验证**（`OpenOCD-20260302-0.12.0\test.bat` = `transport select jtag` +
+`stm32f4x.cfg`）**一次成功**：
+
+```
+Info : CMSIS-DAP: Interface Initialised (JTAG)
+Info : cmsis-dap JTAG TLR_RESET
+Info : JTAG tap: stm32f4x.cpu tap/device found: 0x4ba00477   (IR=4)
+Info : JTAG tap: stm32f4x.bs  tap/device found: 0x06413041   (IR=5)
+Info : Cortex-M4 r0p1 processor detected / Examination succeed
+```
+
+⇒ **探针/线缆/TDO/目标 JTAG 全部正常**；第六步里"TDO 无驱动""connect-under-reset 无效"
+**全部作废**；同时确认链上是 **两个 TAP**（cpu IR=4 + bs IR=5）。
+
+**真正的根因**（在 orbtrace 自带固件源码里找到权威定义）：
+`orbtrace-1.4.3/daplink/cmsis-dap/DAP.c` + `DAP.h`：
+
+```c
+// 请求：[0x14][count][info][data...]   响应：[0x14][status][TDO...]
+sequence_count = *request++;            // 第 1 字节 = 段数（★ 在前！）
+sequence_info  = *request++;            // 第 2 字节 = info（★ 在后！）
+count = sequence_info & 0x3F;           // 低 6 位 = TCK 位数（0 视为 64）
+count = (count + 7) / 8;                // 数据字节数，LSB first
+if (sequence_info & 0x80) response += count;   // bit7 = TDO 捕获
+// DAP.h: JTAG_SEQUENCE_TCK=0x3F  JTAG_SEQUENCE_TMS=0x40  JTAG_SEQUENCE_TDO=0x80
+```
+
+且 `JTAG_Sequence()`（`JTAG_DP.c`）里 **TMS 是整段恒定值** → 状态迁移必须一段一段发
+（与 OpenOCD 日志里的 "1 bits, tms HIGH" 完全吻合）。
+
+**修前 vs 修后**（`test/jtagrawprobe.cpp --no-swd --path`）：
+
+| | 帧 | 结果 |
+|---|---|---|
+| 修前 | `[0x14][info][count]`，info 用 bit0/bit1 | `14 00` —— 无 TDO ✗ |
+| **修后** | `[0x14][count=1][info]`，info = 位数｜TMS?0x40｜TDO?0x80 | `14 00 77 04 A0 4B 41 30 41 06` → **TDO=0x4BA00477 + 0x06413041** ✓ |
+
+**待办 → ✅ 2026-09-30 已完成**：本层（`ORBMDK_HID.cpp` 的 `DAP_JTAG_Sequence`）已按上表
+改成**正确帧**；由于固件的 `DAP_Transfer`（0x05）在 JTAG 模式下**不响应**（实测超时），JTAG 的
+DP/AP 访问由本层用 `JTAG_Sequence` 自己实现（IR=0xA/0xB + 35 位 DR + 3 位 ACK 解析）。详见 **第九步**。
+
+**旧处置 → 已作废**：`Port=JTAG` 时"把 SWJ 时钟限到 4 MHz、失败即打 ERROR"的降级处置已被
+第九步的完整实现取代。**现状：SWD / JTAG 两条通路均可正常建链、读寄存器。**
+
+#### 第九步（2026-09-30）：JTAG 全链路打通 ⭐
+
+第八步把**扫链**（IDCODE 路径）改对后，DP/AP 访问仍失败（`TDO` 恒 0、`ACK=0`）。继续排查，
+**两项根因均在宿主侧**，已一并修复：
+
+**① IR / DR 移位多推一位**（`JtagSetIr` / `JtagDrScan`）
+
+原实现先移 `total` 拍（TMS 恒 0）再补两位退出（`{2,1}`）——等于**多送一拍**，使 IR 发生旋转、
+落入非法指令，DP 退化为 **BYPASS** → `TDO` / `ACK` 恒 0。按 IEEE 1149.1 改为：
+
+- 前 `total-1` 位为一段（TMS=0）；**最后 1 位与 Exit1 同拍发出（TMS=1）**；再 Update + RTI。
+- `JtagDrScan` 同样修正最后一拍，并把**分段捕获到的 TDO 按位拼回**连续位流后再解析
+  （`DAP_JTAG_Sequence` 的每段响应按**字节**对齐，不能当作连续位流直接用）。
+
+**② 建链判据错用 DPIDR 的值**（`JtagInitSequence`）
+
+原以"DPACC 读 DPIDR(0x0) 的值非 0"判建链成功。实测本目标 STM32 的 ARM JTAG-DP 对
+**DPACC 地址 0x0 的读恒返回 0**（同一条 DPACC 通道读 CTRL/STAT(0x4)=`0xF0000000`、经 APACC
+读 AP IDR(0xFC)=`0x24770011` 均**正确**）。OpenOCD 的 `dap_dp_init()` **同样从不读 DPIDR**——
+它只 poll CTRL/STAT 等 PWRUPACK，再读 AP IDR 识别 MEM-AP。据此改为：
+
+> **以 DPIDR 读的 ACK 状态为通路判据，DP 身份优先取扫链 IDCODE**（`ids[dpIndex]`），
+> DPIDR 仅在其可读时覆盖。
+
+**验证**（`bin\jtagprobe.exe`，JTAG 模式）：
+
+| 项 | 结果 |
+|----|------|
+| `CMSIS_DAP_Connect` | **0（mode=2, JTAG）** ✓ |
+| 扫链 / DP 身份 | IDCODE `0x4BA00477`（TAP1 `0x06413041`）✓ |
+| DP CTRL/STAT (0x4) | `0xF0000000`（powered up）✓ |
+| AP CSW (0x0) 读写 | 写 `0x23000052` 回读一致 ✓ |
+| **AP IDR (0xFC)** | **`0x24770011`** ✓（需先写 `DP SELECT=0x000000F0`：`APSEL` 在高 8 位、`APBANKSEL` 在 bits[7:4]）|
+
+**SWD 无回归**（`bin\swdprobe.exe`）：`DPIDR=0x2BA01477`、AP CSW `0x23000052`、
+`SCB->CPUID=0x410FC241` 全部正常 —— 这也**反证**"JTAG 下 DPIDR 读 0"是该 **JTAG-DP 的器件行为**
+（同一 DLL 走 SWD 时读得完全正确），并非本层缺陷。
+
+**与 OpenOCD 交叉一致**：IDCODE `0x4BA00477`、AP IDR `0x24770011` **完全相同**。
+
+**对前文结论的修正**：第六步"SWJ-DP 只能 JTAG→SWD、必须给目标**断电**才能回到 JTAG"与本次实测
+**不符** —— 本次 JTAG 成功前同一上电周期内发生过 SWD，且 `JtagInitSequence` 里的
+**SWD→JTAG 切换序列**（线复位 64×1 + 16 位 `0xE73C`）实测**有效**，无需断电。结合第八步可知：
+早前"扫链为空 / TDO 恒 1"的真因是**帧格式错 + 上面①的移位错位**，而非 SWJ-DP 锁死。
+
+**改动文件**：`src/ORBMDK_RDDI.cpp`（`JtagSetIr` / `JtagDrScan` / `JtagInitSequence`）；
+`test/jtagprobe.cpp`（新增"写 `DP SELECT` 后读 AP IDR"的端到端校验）。
 
 ### 18.8 ✅ 2026-09-30 已闭环
 
 V2 真因与修复（§17.1 / §17.2）、四个隐藏开关删除（§17.4）、版本门单变量 A/B +
 反汇编证据（§17.5 / §17.6）、§5.4 的"V2 实机验证"、§11.1.5 的"退化到 V1"、
-§16.4 的三项待实测。
+§16.4 的三项待实测、**§18.9 的 JTAG 通路打通（第九步）**。
 
 
 
