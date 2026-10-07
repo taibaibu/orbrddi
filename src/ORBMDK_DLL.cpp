@@ -9,6 +9,7 @@
 #include "ORBMDK_RDDI.h"
 #include "ORBMDK_HID.h"
 #include "ORBMDK_USB_Bulk.h"
+#include "ORBMDK_Log.h"
 
 using namespace ORBMDK;
 
@@ -34,6 +35,10 @@ BOOL APIENTRY DllMain(HMODULE hModule,
             // 这正是"V2 只有第一次能打开、之后整场会话都退化成 V1"的根因。
             ORBMDK_USB_Bulk_Shutdown();
             ORBMDK_HID_Shutdown();
+
+            // 统一日志的收尾（清掉宿主回调指针，避免卸载后仍被回调进来）。
+            // 日志文件是"写后即关"，没有常驻句柄需要关闭（§8.3(7)）。
+            ORBMDK_LogShutdown();
             break;
         case DLL_THREAD_ATTACH:
         case DLL_THREAD_DETACH:

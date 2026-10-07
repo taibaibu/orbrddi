@@ -1,0 +1,1173 @@
+# ORBMDK_RDDI.dll 使用手册
+
+本文给出 `ORBMDK_RDDI.dll` **全部 RDDI 导出函数**的调用用例。
+
+- 导出方式：每个函数都带 `RDDI_FUNC`（`extern "C" __declspec(dllexport)`），共 **78+ 个**，纯 C ABI。
+- 调用方式：宿主（Keil 的 AGDI 层、或你自己的程序）用 `LoadLibrary` + `GetProcAddress` 逐个取指针调用。
+- 缓冲区、字符串一律由调用方提供，本 DLL 不跨模块传堆指针（可安全配 `/MT` 静态 CRT）。
+
+> 与 Keil 实际调试链路相关的约束（DAP 枚举契约、输出参数必须写、HID 响应偏移、
+> JTAG-to-SWD 切换序列、日志策略等）见 [README.md](README.md) 与
+> [COMPAT_ANALYSIS.md](COMPAT_ANALYSIS.md)。本文只讲“怎么调”。
+
+---
+
+## 目录
+
+1. [加载与函数指针](#1-加载与函数指针)
+2. [典型调试会话（最小可用流程）](#2-典型调试会话最小可用流程)
+3. [RDDI 核心](#3-rddi-核心)
+4. [DAP 基础与寄存器](#4-dap-基础与寄存器)
+5. [CMSIS-DAP 接口](#5-cmsis-dap-接口)
+6. [SWO 接口](#6-swo-接口)
+7. [JTAG 接口](#7-jtag-接口)
+8. [PC 采样接口](#8-pc-采样接口)
+9. [StreamingTrace 接口](#9-streamingtrace-接口)
+10. [日志回调](#10-日志回调)
+11. [错误码速查](#11-错误码速查)
+12. [注意事项（易踩的坑）](#12-注意事项易踩的坑)
+
+---
+
+## 1. 加载与函数指针
+
+### 1.1 头文件中的常量与类型
+
+```c
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "../include/ORBMDK_RDDI.h"   // 提供 RDDIHandle / 错误码 / DAP_REG_* / RDDI_DAP_CONN_DETAILS
+
+// VID/PID（定义于 include/ORBMDK.h）
+//   ORBMDK_ORBTRACE_VID = 0x1209
+//   ORBMDK_ORBTRACE_PID = 0x3443
+
+// 版本（定义于 include/ORBMDK.h）
+//   ORBMDK_VERSION_STRING = "1.0.0"
+```
+
+`RDDIHandle` 是 `int` 类型，**从 1 开始编号，0 恒为无效句柄**。
+
+### 1.2 通用加载骨架
+
+```c
+typedef int  (*PFN_RDDI_Open)(RDDIHandle*, const void*);
+typedef int  (*PFN_RDDI_Close)(RDDIHandle);
+typedef int  (*PFN_RDDI_GetLastError)(int*, char*, size_t);
+
+HMODULE h = LoadLibraryA("ORBMDK_RDDI.dll");
+if (!h) { printf("load failed: %lu\n", GetLastError()); return 1; }
+
+PFN_RDDI_Open  pRDDI_Open  = (PFN_RDDI_Open) GetProcAddress(h, "RDDI_Open");
+PFN_RDDI_Close pRDDI_Close = (PFN_RDDI_Close)GetProcAddress(h, "RDDI_Close");
+/* ...其余同名取指针... */
+
+RDDIHandle handle = 0;
+int rc = pRDDI_Open(&handle, NULL);   // 成功时 handle >= 1
+```
+
+### 1.3 一次性取全部函数指针（推荐）
+
+```c
+#define LOAD(name)  pfn_##name = (void*)GetProcAddress(h, #name)
+
+static HMODULE h;
+static PFN_RDDI_Open          pfn_RDDI_Open;
+static PFN_RDDI_Close         pfn_RDDI_Close;
+static PFN_RDDI_GetLastError  pfn_RDDI_GetLastError;
+/* ... 在函数内继续声明需要的槽位 ... */
+
+static int load_all(void)
+{
+    h = LoadLibraryA("ORBMDK_RDDI.dll");
+    if (!h) return -1;
+    LOAD(RDDI_Open);
+    LOAD(RDDI_Close);
+    LOAD(RDDI_GetLastError);
+    /* ... 这里把用到的函数都 LOAD 一遍 ... */
+    return 0;
+}
+```
+
+> 每个导出名都可用 `GetProcAddress` 直接取到；空指针表示该 DLL 里没有这个导出。
+
+---
+
+## 2. 典型调试会话（最小可用流程）
+
+这是与 Keil AGDI 内部一致的调用顺序，也是自测程序 `test/ORBMDK_RDDI_FullTest.cpp` 的骨架：
+
+```
+RDDI_Open
+  → CMSIS_DAP_Detect                （探测接口数，恒 >= 1）
+  → CMSIS_DAP_Identify              （取适配器显示名/序列号）
+  → CMSIS_DAP_ConfigureInterface    （选定 V1(HID) 或 V2(Bulk)，锁定传输层）
+  → DAP_Configure                   （SWD/JTAG 配置）
+  → DAP_GetNumberOfDAPs             （恒 1，必须在 Connect 之前）
+  → DAP_GetDAPIDList                （返回 [0]）
+  → CMSIS_DAP_Connect               （连接目标，内部完成 JTAG-to-SWD 切换 + DPIDR 读）
+  → CMSIS_DAP_SWJ_Clock             （设时钟）
+  → DAP_ReadReg / DAP_WriteReg ...  （寄存器/内存访问）
+  → DAP_Disconnect → RDDI_Close
+```
+
+完整示例：
+
+```c
+RDDIHandle hd = 0;
+if (pfn_RDDI_Open(&hd, NULL) != RDDI_SUCCESS) { /* 设备未插/打不开 */ }
+
+int noOfIFs = 0;
+pfn_CMSIS_DAP_Detect(hd, &noOfIFs);           // 0=V2 Bulk, 1=V1 HID
+
+char name[64] = {0};
+pfn_CMSIS_DAP_Identify(hd, 0, 2, name, sizeof(name));   // idNo=2 产品名
+
+char cfg[64] = {0};
+pfn_CMSIS_DAP_ConfigureInterface(hd, 0, cfg);           // 选定 ifNo=0
+
+pfn_DAP_Configure(hd, "SWD");
+
+int nDaps = 0;
+pfn_DAP_GetNumberOfDAPs(hd, &nDaps);                    // -> 1
+int ids[8] = {0};
+pfn_DAP_GetDAPIDList(hd, ids, sizeof(ids));             // ids[0] = 0（DAP 索引）
+
+int iface = 0;
+pfn_CMSIS_DAP_Connect(hd, &iface);                      // 1=SWD, 2=JTAG
+pfn_CMSIS_DAP_SWJ_Clock(hd, 1000000);
+
+int idcode = 0;
+pfn_DAP_ReadReg(hd, 0, DAP_REG_DP_IDCODE, &idcode);     // 例如 0x2BA01477
+
+pfn_DAP_Disconnect(hd);
+pfn_RDDI_Close(hd);
+FreeLibrary(h);
+```
+
+---
+
+## 3. RDDI 核心
+
+### 3.1 `RDDI_Open`
+
+```c
+int RDDI_Open(RDDIHandle *pHandle, const void *pDetails);
+```
+
+打开设备并分配会话句柄。`pDetails` 传 `NULL` 即可（AGDI 实测传 `NULL`）。
+- V2(Bulk) 优先，不可用回退 V1(HID)。
+- 失败时 `*pHandle = 0`。
+
+```c
+RDDIHandle hd = 0;
+int rc = pfn_RDDI_Open(&hd, NULL);
+if (rc != RDDI_SUCCESS || hd == 0) { /* 打开失败 */ }
+```
+
+### 3.2 `RDDI_Close`
+
+```c
+int RDDI_Close(RDDIHandle handle);
+```
+
+释放会话上下文并熄灭状态 LED。句柄编号不复用（只增不减）。
+
+```c
+pfn_RDDI_Close(hd);
+hd = 0;
+```
+
+### 3.3 `RDDI_GetLastError`
+
+```c
+int RDDI_GetLastError(int *pError, char *pDetails, size_t detailsLen);
+```
+
+取最近一个上下文的错误码与描述文本（**无 handle 参数**）。
+
+```c
+int err = 0;
+char detail[256] = {0};
+if (pfn_RDDI_GetLastError(&err, detail, sizeof(detail)) == RDDI_SUCCESS) {
+    printf("last error = %d (%s)\n", err, detail);
+}
+```
+
+---
+
+## 4. DAP 基础与寄存器
+
+寄存器 ID 用头文件里的 `DAP_REG_*` 宏，例如：
+
+| 宏 | 含义 |
+|----|------|
+| `DAP_REG_DP_IDCODE` | DP IDCODE（读） |
+| `DAP_REG_DP_CTRL_STAT` | DP CTRL/STAT |
+| `DAP_REG_DP_SELECT` | DP SELECT（AP bank 选择） |
+| `DAP_REG_DP_RDBUFF` | DP RDBUFF |
+| `DAP_REG_AP_CSW` | AP CSW（带 `DAP_REG_RnW`） |
+| `DAP_REG_AP_TAR` | AP TAR |
+| `DAP_REG_AP_DRW` | AP DRW |
+| `DAP_REG_AP_IDR` | AP IDR |
+
+### 4.1 `DAP_GetInterfaceVersion`
+
+```c
+int DAP_GetInterfaceVersion(RDDIHandle handle, int *version);  // -> 1 (RDDI v1)
+```
+
+```c
+int ver = 0;
+pfn_DAP_GetInterfaceVersion(hd, &ver);   // ver == 1
+```
+
+### 4.2 `DAP_Configure`
+
+```c
+int DAP_Configure(RDDIHandle handle, const char *configFileName);
+```
+
+CMSIS-DAP 下 `configFileName` 通常传 `NULL` 或 `"SWD"`。
+
+```c
+pfn_DAP_Configure(hd, "SWD");
+```
+
+### 4.3 `DAP_Connect`
+
+```c
+int DAP_Connect(RDDIHandle handle, RDDI_DAP_CONN_DETAILS *pConnDetails);
+```
+
+填充实现者信息（`implementorName` / `connectionDescription`，各 160 字节）。`pConnDetails` 可传 `NULL`。
+
+```c
+RDDI_DAP_CONN_DETAILS det;
+if (pfn_DAP_Connect(hd, &det) == RDDI_SUCCESS) {
+    printf("%s / %s\n", det.implementorName, det.connectionDescription);
+}
+```
+
+### 4.4 `DAP_GetNumberOfDAPs`
+
+```c
+int DAP_GetNumberOfDAPs(RDDIHandle handle, int *noOfDAPs);
+```
+
+在 `DAP_Connect` **之前**调用，且**不与目标通信**。ORBTrace 单 DAP，恒返回 `1`。
+
+```c
+int n = 0;
+pfn_DAP_GetNumberOfDAPs(hd, &n);   // n == 1
+```
+
+### 4.5 `DAP_GetDAPIDList`
+
+```c
+int DAP_GetDAPIDList(RDDIHandle handle, int *DAP_ID_Array, size_t sizeOfArray);
+```
+
+返回 DAP **索引**（不是 IDCODE），`DAP_ID_Array[0] = 0`。
+`sizeOfArray` 按字节数或元素个数解释都能接受。
+
+```c
+int ids[8] = {0};
+pfn_DAP_GetDAPIDList(hd, ids, sizeof(ids));   // ids[0] == 0
+```
+
+### 4.6 `DAP_Disconnect`
+
+```c
+int DAP_Disconnect(RDDIHandle handle);
+```
+
+释放目标连接（幂等）。
+
+```c
+pfn_DAP_Disconnect(hd);
+```
+
+### 4.7 `DAP_ReadReg` / `DAP_WriteReg`
+
+```c
+int DAP_ReadReg (RDDIHandle handle, int DAP_ID, int regID, int *value);
+int DAP_WriteReg(RDDIHandle handle, int DAP_ID, int regID, int value);
+```
+
+`DAP_ID` 传 DAP 索引（单 DAP 用 `0`）。AP bank 由调用方通过写 `DP_SELECT` 管理。
+
+```c
+int idcode = 0, ctrl = 0;
+pfn_DAP_ReadReg(hd, 0, DAP_REG_DP_IDCODE, &idcode);       // e.g. 0x2BA01477
+pfn_DAP_ReadReg(hd, 0, DAP_REG_DP_CTRL_STAT, &ctrl);
+
+// 使能调试电源（CDBGPWRUPREQ|CSYSPWRUPREQ）
+pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_CTRL_STAT, 0x50000000);
+pfn_DAP_ReadReg (hd, 0, DAP_REG_DP_RDBUFF, &ctrl);         // 读回清 sticky
+
+// 选 AP0 bank0
+pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_SELECT, 0x00000000);
+pfn_DAP_ReadReg (hd, 0, DAP_REG_AP_IDR, &ctrl);            // e.g. 0x24770011
+```
+
+> 读回 `Transfer Response` 为 FAULT/WAIT/NO_ACK 时，函数返回
+> `RDDI_DAP_DP_STICKY_ERR`(0x100F) / `RDDI_DAP_OPERATION_TIMEOUT`(0x100E)，
+> AGDI 会自行清 sticky / 写 ABORT 重试。
+
+### 4.8 `DAP_RegAccessBlock`
+
+```c
+int DAP_RegAccessBlock(RDDIHandle handle, int DAP_ID, int numRegs,
+                       const int *regIDArray, int *dataArray);
+```
+
+一次传**多个不同寄存器号**，元素 `i` 读写 `regIDArray[i]`。
+虚拟寄存器 `id==16`(MATCH_MASK) / `id==17`(MATCH_RETRY) 只更新本地设置、不产生总线访问。
+
+```c
+int regs[3] = { DAP_REG_DP_CTRL_STAT, DAP_REG_AP_CSW, DAP_REG_AP_DRW };
+int data[3] = { 0x50000000, 0x23000052, 0 };
+pfn_DAP_RegAccessBlock(hd, 0, 3, regs, data);   // data[] 回填读取值（对 RnW 位为读的项）
+```
+
+### 4.9 `DAP_RegReadBlock` / `DAP_RegWriteBlock`
+
+```c
+int DAP_RegReadBlock (RDDIHandle handle, int DAP_ID, int numRegs,
+                      const int *regIDArray, int *dataArray);
+int DAP_RegWriteBlock(RDDIHandle handle, int DAP_ID, int numRegs,
+                      const int *regIDArray, const int *dataArray);
+```
+
+与 `DAP_RegAccessBlock` 同构：一次多个**独立 regID**。
+
+```c
+int ids [4] = { DAP_REG_AP_DRW, DAP_REG_AP_DRW, DAP_REG_AP_DRW, DAP_REG_AP_DRW };
+int wdat[4] = { 0x12345678, 0x9ABCDEF0, 0x11111111, 0x22222222 };
+int rdat[4] = { 0 };
+
+pfn_DAP_WriteReg(hd, 0, DAP_REG_AP_CSW, 0x23000052);   // 32-bit word + auto-inc
+pfn_DAP_WriteReg(hd, 0, DAP_REG_AP_TAR, 0x20000000);   // STM32F1 SRAM 起点
+pfn_DAP_RegWriteBlock(hd, 0, 4, ids, wdat);
+
+pfn_DAP_WriteReg(hd, 0, DAP_REG_AP_TAR, 0x20000000);   // TAR 已自增，复位
+pfn_DAP_RegReadBlock (hd, 0, 4, ids, rdat);
+```
+
+### 4.10 `DAP_RegWriteRepeat` / `DAP_RegReadRepeat`
+
+```c
+int DAP_RegWriteRepeat(RDDIHandle handle, int DAP_ID, int numRepeats,
+                       int regID, const int *dataArray);
+int DAP_RegReadRepeat (RDDIHandle handle, int DAP_ID, int numRepeats,
+                       int regID, int *dataArray);
+```
+
+**同一个 regID 重复 N 次**（区别于上面的“多个不同 regID”）。
+
+```c
+int wdat[4] = { 0xAAAAAAAA, 0x55555555, 0xAAAAAAAA, 0x55555555 };
+int rdat[4] = { 0 };
+
+pfn_DAP_WriteReg(hd, 0, DAP_REG_AP_TAR, 0x20000000);
+pfn_DAP_RegWriteRepeat(hd, 0, 4, DAP_REG_AP_DRW, wdat);
+
+pfn_DAP_WriteReg(hd, 0, DAP_REG_AP_TAR, 0x20000000);
+pfn_DAP_RegReadRepeat (hd, 0, 4, DAP_REG_AP_DRW, rdat);
+```
+
+### 4.11 `DAP_RegReadWaitForValue`
+
+```c
+int DAP_RegReadWaitForValue(RDDIHandle handle, int DAP_ID, int numRepeats,
+                            int regID, const int *mask, const int *requiredValue);
+```
+
+轮询读取直到 `(value & *mask) == *requiredValue`，最多 `numRepeats` 次（<=0 视为 1 次）。成功返回 `RDDI_SUCCESS`，超时返回 `RDDI_DAP_OPERATION_TIMEOUT` 一类错误。
+
+```c
+int mask = 0x00030000, want = 0x00030000;   // 等 DHCSR 的 S_HALT/HALTED 位
+pfn_DAP_RegReadWaitForValue(hd, 0, 100, DAP_REG_AP_DRW, &mask, &want);
+```
+
+### 4.12 `DAP_DefineSequence` / `DAP_RunSequence`
+
+```c
+int DAP_DefineSequence(RDDIHandle handle, int seqID, void *seqDef);
+int DAP_RunSequence  (RDDIHandle handle, int seqID, void *seqInData, void *seqOutData);
+```
+
+当前为占位实现，返回 `RDDI_DAP_LEVEL1_NOT_IMPL` (0x1006)。可安全调用探测。
+
+```c
+int rc = pfn_DAP_DefineSequence(hd, 1, NULL);   // rc == RDDI_DAP_LEVEL1_NOT_IMPL
+```
+
+### 4.13 `DAP_HostStatus`
+
+```c
+int DAP_HostStatus(RDDIHandle handle, int hostStatus, int state);
+```
+
+`hostStatus`：`0`=halted，`1`=running；`state`：`0`=off，`1`=on。用于驱动状态 LED。
+
+```c
+pfn_DAP_HostStatus(hd, 1, 1);   // running 指示灯亮
+pfn_DAP_HostStatus(hd, 1, 0);   // 灭
+```
+
+### 4.14 `DAP_GetSupportedOptimisationLevel`
+
+```c
+int DAP_GetSupportedOptimisationLevel(RDDIHandle handle, int *level);
+```
+
+```c
+int lvl = 0;
+pfn_DAP_GetSupportedOptimisationLevel(hd, &lvl);
+```
+
+### 4.15 `DAP_SetCommTimeout`
+
+```c
+int DAP_SetCommTimeout(RDDIHandle handle, int timeoutMs);
+```
+
+```c
+pfn_DAP_SetCommTimeout(hd, 5000);   // 5 秒
+```
+
+### 4.16 `DAP_GetSupportedHostStatusIDs`
+
+```c
+int DAP_GetSupportedHostStatusIDs(RDDIHandle handle, int *count, int *statusIDs);
+```
+
+返回支持的主机状态类型，当前为 `{0x00, 0x01}`，`*count = 2`。
+
+```c
+int cnt = 0, ids[8] = {0};
+pfn_DAP_GetSupportedHostStatusIDs(hd, &cnt, ids);   // cnt == 2
+```
+
+### 4.17 `DAP_Target`
+
+```c
+int DAP_Target(RDDIHandle handle, const char *request_str, char *resp_str, int resp_len);
+```
+
+文本命令协议，多条以 `;` 分隔：
+- `"signal_avail"` → `"sys_reset;sys_power"`
+- `"<signal>.on"` / `.off` / `.read` → `"<signal>.<state>"`，状态取 `on/off/unknown/err`
+
+```c
+char resp[64] = {0};
+pfn_DAP_Target(hd, "sys_reset.on", resp, sizeof(resp));   // 拉低 nRESET
+
+pfn_DAP_Target(hd, "signal_avail", resp, sizeof(resp));
+printf("signals: %s\n", resp);                            // sys_reset;sys_power
+```
+
+---
+
+## 5. CMSIS-DAP 接口
+
+### 5.1 `CMSIS_DAP_Detect`
+
+```c
+int CMSIS_DAP_Detect(RDDIHandle handle, int *noOfIFs);
+```
+
+返回可用接口数（**恒 >= 1**）：`0` = CMSIS-DAP v2 (Bulk)，`1` = CMSIS-DAP v1 (HID)。
+
+```c
+int n = 0;
+pfn_CMSIS_DAP_Detect(hd, &n);   // >= 1
+```
+
+### 5.2 `CMSIS_DAP_Identify`
+
+```c
+int CMSIS_DAP_Identify(RDDIHandle handle, int ifNo, int idNo, char *str, int len);
+```
+
+`idNo`：`1`=Vendor，`2`=Product（对话框显示名），`3`=Serial，`4`=Firmware Version。
+
+```c
+char vendor[64] = {0}, product[64] = {0}, serial[64] = {0}, fw[64] = {0};
+pfn_CMSIS_DAP_Identify(hd, 0, 1, vendor,  sizeof(vendor));
+pfn_CMSIS_DAP_Identify(hd, 0, 2, product, sizeof(product));   // "CMSIS-DAP v2"
+pfn_CMSIS_DAP_Identify(hd, 0, 3, serial,  sizeof(serial));
+pfn_CMSIS_DAP_Identify(hd, 0, 4, fw,      sizeof(fw));
+```
+
+### 5.3 `CMSIS_DAP_ConfigureInterface`
+
+```c
+int CMSIS_DAP_ConfigureInterface(RDDIHandle handle, int ifNo, char *str);
+```
+
+**锁定传输层**：`ifNo=0` 用 V2(Bulk)，`ifNo=1` 用 V1(HID)。选中的通道打不开时**直接返回错误**，绝不静默切换。
+
+```c
+if (pfn_CMSIS_DAP_ConfigureInterface(hd, 0, NULL) != RDDI_SUCCESS) {
+    /* 选中的接口不可用，按错误处理 */
+}
+```
+
+### 5.4 `CMSIS_DAP_DetectNumberOfDAPs` / `CMSIS_DAP_DetectDAPIDList`
+
+```c
+int CMSIS_DAP_DetectNumberOfDAPs(RDDIHandle handle, int *noOfDAPs);
+int CMSIS_DAP_DetectDAPIDList  (RDDIHandle handle, int *DAP_ID_Array, size_t sizeOfArray);
+```
+
+这两个是 **Keil 扩展**，返回的是**目标 IDCODE**（与 `DAP_GetNumberOfDAPs`/`DAP_GetDAPIDList` 的“索引”语义不同）。
+`CMSIS_DAP_DetectDAPIDList` 的 `sizeOfArray` 是**元素个数**。
+
+```c
+int n = 0, idcodes[8] = {0};
+pfn_CMSIS_DAP_DetectNumberOfDAPs(hd, &n);
+pfn_CMSIS_DAP_DetectDAPIDList(hd, idcodes, 8);
+printf("IDCODE: 0x%08X\n", idcodes[0]);
+```
+
+### 5.5 `CMSIS_DAP_Commands`
+
+```c
+int CMSIS_DAP_Commands(RDDIHandle handle, int num,
+                       unsigned char **request, int *req_len,
+                       unsigned char **response, int *resp_len);
+```
+
+当前仅支持 `num==1 && req_len==1 && resp_len==1` 且命令为 `ID_DAP_RESET_TARGET`(0x0A)。
+
+```c
+unsigned char cmdBuf[1] = { 0x0A };         // ID_DAP_RESET_TARGET
+unsigned char respBuf[1] = { 0 };
+unsigned char *req[1] = { cmdBuf };
+unsigned char *rsp[1] = { respBuf };
+int reqLen = 1, respLen = 1;
+pfn_CMSIS_DAP_Commands(hd, 1, req, &reqLen, rsp, &respLen);
+```
+
+### 5.6 `CMSIS_DAP_ConfigureDAP`
+
+```c
+int CMSIS_DAP_ConfigureDAP(RDDIHandle handle, const char *str);
+```
+
+解析配置串（如 `"SWJSwitch=0xE79E"`）；`NULL` 直接成功返回。
+
+```c
+pfn_CMSIS_DAP_ConfigureDAP(hd, "SWJSwitch=0xE79E");
+```
+
+### 5.7 `CMSIS_DAP_Capabilities`
+
+```c
+int CMSIS_DAP_Capabilities(RDDIHandle handle, int ifNo, int *cap_info);
+```
+
+位定义见头文件 `INFO_CAPS_*`（`SWD`/`JTAG`/`SWO_UART`/`ATOMIC_CMDS` …）。
+
+```c
+int caps = 0;
+pfn_CMSIS_DAP_Capabilities(hd, 0, &caps);
+printf("SWD=%d JTAG=%d ATOMIC=%d\n",
+       !!(caps & INFO_CAPS_SWD), !!(caps & INFO_CAPS_JTAG), !!(caps & INFO_CAPS_ATOMIC_CMDS));
+```
+
+### 5.8 `CMSIS_DAP_SWJ_Sequence`
+
+```c
+int CMSIS_DAP_SWJ_Sequence(RDDIHandle handle, int num, unsigned char *request);
+```
+
+`num` 是**位数**（不是字节数）。标准 JTAG-to-SWD 切换序列：
+
+```c
+unsigned char lineReset[7] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };  // 56 位 1
+unsigned char jtagToSwd[2] = { 0x9E, 0xE7 };                          // 0xE79E, LSB first
+unsigned char idle[1]      = { 0x00 };
+
+pfn_CMSIS_DAP_SWJ_Sequence(hd, 56, lineReset);
+pfn_CMSIS_DAP_SWJ_Sequence(hd, 16, jtagToSwd);
+pfn_CMSIS_DAP_SWJ_Sequence(hd, 56, lineReset);
+pfn_CMSIS_DAP_SWJ_Sequence(hd, 8,  idle);
+```
+
+### 5.9 `CMSIS_DAP_SWJ_Pins`
+
+```c
+int CMSIS_DAP_SWJ_Pins(RDDIHandle handle, unsigned char pinselect,
+                       unsigned char pinout, int *res, int wait);
+```
+
+`pinselect`/`pinout` 位定义见 `DAP_PIN_*`（`nRESET` = bit7，`1`=释放，`0`=拉低）。`wait` 单位 us。
+
+```c
+int pins = 0;
+pfn_CMSIS_DAP_SWJ_Pins(hd, DAP_PIN_nRESET, 0x00, &pins, 0);   // 拉低复位
+pfn_CMSIS_DAP_SWJ_Pins(hd, DAP_PIN_nRESET, 0x80, &pins, 0);   // 释放
+```
+
+### 5.10 `CMSIS_DAP_SWJ_Clock`
+
+```c
+int CMSIS_DAP_SWJ_Clock(RDDIHandle handle, unsigned int clock);   // Hz
+```
+
+```c
+pfn_CMSIS_DAP_SWJ_Clock(hd, 1000000);   // 1 MHz
+```
+
+### 5.11 `CMSIS_DAP_WriteABORT`
+
+```c
+int CMSIS_DAP_WriteABORT(RDDIHandle handle, int dap_id, unsigned int abort);
+```
+
+写 DP ABORT 寄存器（清 sticky 错误位等），位定义见 `ABORT_*`。
+
+```c
+pfn_CMSIS_DAP_WriteABORT(hd, 0, ABORT_STKERRCLR | ABORT_WDERRCLR);   // 0x06
+```
+
+### 5.12 `CMSIS_DAP_Delay`
+
+```c
+int CMSIS_DAP_Delay(RDDIHandle handle, int delay_us);
+```
+
+```c
+pfn_CMSIS_DAP_Delay(hd, 1000);   // 1 ms
+```
+
+### 5.13 `CMSIS_DAP_ResetTarget`
+
+```c
+int CMSIS_DAP_ResetTarget(RDDIHandle handle);
+```
+
+```c
+pfn_CMSIS_DAP_ResetTarget(hd);
+pfn_CMSIS_DAP_Delay(hd, 10000);   // 等目标复位稳定
+```
+
+### 5.14 `CMSIS_DAP_SWD_Configure`
+
+```c
+int CMSIS_DAP_SWD_Configure(RDDIHandle handle, uint8_t cfg);   // 0 = 默认
+```
+
+```c
+pfn_CMSIS_DAP_SWD_Configure(hd, 0);
+```
+
+### 5.15 `CMSIS_DAP_SWD_Sequence`
+
+```c
+int CMSIS_DAP_SWD_Sequence(RDDIHandle handle, int num, unsigned char *request);
+```
+
+`num` 为位数（0..255），命令 `0x1D`。
+
+```c
+unsigned char seq[2] = { 0x00, 0x00 };
+pfn_CMSIS_DAP_SWD_Sequence(hd, 16, seq);
+```
+
+### 5.16 `CMSIS_DAP_GetGUID`
+
+```c
+int CMSIS_DAP_GetGUID(RDDIHandle handle, int ifNo, char *guid, int len);
+```
+
+CMSIS-DAP 无真实 GUID，本实现返回 `"ORBTrace-<序列号>"`。
+
+```c
+char guid[64] = {0};
+pfn_CMSIS_DAP_GetGUID(hd, 0, guid, sizeof(guid));
+```
+
+### 5.17 `CMSIS_DAP_GetInterfaceVersion`
+
+```c
+int CMSIS_DAP_GetInterfaceVersion(RDDIHandle handle, int *version);
+```
+
+版本号是 **int**（`bits[31:24]`=major，`[23:16]`=minor，`[15:0]`=build），不是字符串。当前 `0x00020000`。
+
+```c
+int v = 0;
+pfn_CMSIS_DAP_GetInterfaceVersion(hd, &v);
+printf("%d.%d.%d\n", (v >> 24) & 0xFF, (v >> 16) & 0xFF, v & 0xFFFF);
+```
+
+### 5.18 `CMSIS_DAP_GetNumberOfDevices` / `CMSIS_DAP_DetectNumberOfDevices`
+
+```c
+int CMSIS_DAP_GetNumberOfDevices     (RDDIHandle handle, int *count);
+int CMSIS_DAP_DetectNumberOfDevices  (RDDIHandle handle, int *count);
+```
+
+返回**目标上**扫描到的设备数（`dapIdList` 为空时会主动探测）。目标不在时返回 `0`。
+
+```c
+int count = 0;
+pfn_CMSIS_DAP_GetNumberOfDevices(hd, &count);
+```
+
+### 5.19 `CMSIS_DAP_GetDeviceIDList`
+
+```c
+int CMSIS_DAP_GetDeviceIDList(RDDIHandle handle, int *idArray, size_t sizeOfArray);
+```
+
+`sizeOfArray` 是**字节数**，写入的是 **IDCODE**。
+
+```c
+int idcodes[8] = {0};
+pfn_CMSIS_DAP_GetDeviceIDList(hd, idcodes, sizeof(idcodes));
+```
+
+### 5.20 `CMSIS_DAP_Connect`
+
+```c
+int CMSIS_DAP_Connect(RDDIHandle handle, int *connectedInterface);
+```
+
+连接目标；内部完成 JTAG-to-SWD 切换序列 + DPIDR 读 + 清 sticky。
+**仅当 `connectedInterface` 指向可写内存时才写**（AGDI 会传选中项索引），输出 `1`=SWD / `2`=JTAG。
+
+```c
+int iface = 0;
+pfn_CMSIS_DAP_Connect(hd, &iface);
+printf("connected: %s\n", iface == 1 ? "SWD" : "JTAG");
+```
+
+### 5.21 `CMSIS_DAP_Disconnect` / `CMSIS_DAP_ResetDAP`
+
+```c
+int CMSIS_DAP_Disconnect(RDDIHandle handle);   // 幂等断开 + 熄灭 LED
+int CMSIS_DAP_ResetDAP  (RDDIHandle handle);   // 重连 + 切换序列 + 复位目标
+```
+
+```c
+pfn_CMSIS_DAP_ResetDAP(hd);
+pfn_CMSIS_DAP_Disconnect(hd);
+```
+
+### 5.22 `CMSIS_DAP_ConfigureDebugger`
+
+```c
+int CMSIS_DAP_ConfigureDebugger(RDDIHandle handle, const char *config);
+```
+
+```c
+pfn_CMSIS_DAP_ConfigureDebugger(hd, "config-string");
+```
+
+### 5.23 `CMSIS_DAP_Atomic_Control` / `CMSIS_DAP_Atomic_Result`
+
+```c
+int CMSIS_DAP_Atomic_Control(RDDIHandle handle, int reserved);                       // 2 参
+int CMSIS_DAP_Atomic_Result (RDDIHandle handle, int a2,int a3,int a4,int a5,int a6);  // 6 参
+```
+
+当前未实现，返回 `RDDI_DAP_LEVEL1_NOT_IMPL`。参数个数须与官方一致，否则会因参数错位崩溃。
+
+```c
+int rc = pfn_CMSIS_DAP_Atomic_Control(hd, 0);   // rc == RDDI_DAP_LEVEL1_NOT_IMPL
+```
+
+---
+
+## 6. SWO 接口
+
+### 6.1 `CMSIS_DAP_SWO_Control`
+
+```c
+int CMSIS_DAP_SWO_Control(RDDIHandle handle, int control);   // 0=Stop, 1=Start
+```
+
+```c
+pfn_CMSIS_DAP_SWO_Baudrate(hd, 115200);
+pfn_CMSIS_DAP_SWO_Control (hd, 1);   // 启动
+```
+
+### 6.2 `CMSIS_DAP_SWO_Baudrate`
+
+```c
+int CMSIS_DAP_SWO_Baudrate(RDDIHandle handle, int baudrate);
+```
+
+```c
+pfn_CMSIS_DAP_SWO_Baudrate(hd, 921600);
+```
+
+### 6.3 `CMSIS_DAP_SWO_Status`
+
+```c
+int CMSIS_DAP_SWO_Status(RDDIHandle handle, int *count, int *status);
+```
+
+`count` = 待读字节数；`status`：bit0 采集活动，bit6 流错误，bit7 缓冲溢出。
+
+```c
+int count = 0, status = 0;
+pfn_CMSIS_DAP_SWO_Status(hd, &count, &status);
+printf("swo count=%d status=0x%02X\n", count, status);
+```
+
+### 6.4 `CMSIS_DAP_SWO_Data`
+
+```c
+int CMSIS_DAP_SWO_Data(RDDIHandle handle, int *num_written, void *buffer, int *status);
+```
+
+`*num_written` 兼作 in/out：入参为 `buffer` 容量，出参为实际字节数。
+
+```c
+uint8_t buf[1024];
+int n = sizeof(buf), st = 0;
+if (pfn_CMSIS_DAP_SWO_Data(hd, &n, buf, &st) == RDDI_SUCCESS && n > 0) {
+    fwrite(buf, 1, n, stdout);   // n 已被改写为实际长度
+}
+```
+
+---
+
+## 7. JTAG 接口
+
+### 7.1 `CMSIS_DAP_JTAG_Configure`
+
+```c
+int CMSIS_DAP_JTAG_Configure(RDDIHandle handle, int count, uint8_t *ir_len);
+```
+
+`ir_len` 为各器件 IR 长度数组，`count` 为器件数。
+
+```c
+uint8_t irLen[1] = { 4 };
+pfn_CMSIS_DAP_JTAG_Configure(hd, 1, irLen);
+```
+
+### 7.2 `CMSIS_DAP_JTAG_Sequence`
+
+```c
+int CMSIS_DAP_JTAG_Sequence(RDDIHandle handle, int num, uint8_t *info,
+                            uint8_t *tdi, uint8_t *tdo, uint8_t mask);
+```
+
+```c
+uint8_t info[4] = { 0, 0, 0, 0 };
+uint8_t tdi [4] = { 0 };
+uint8_t tdo [4] = { 0 };
+pfn_CMSIS_DAP_JTAG_Sequence(hd, 1, info, tdi, tdo, 0);
+```
+
+### 7.3 `CMSIS_DAP_JTAG_GetIDCODEs`
+
+```c
+int CMSIS_DAP_JTAG_GetIDCODEs(RDDIHandle handle, int *count, uint32_t *idcodes);
+```
+
+```c
+int cnt = 0; uint32_t codes[8] = {0};
+pfn_CMSIS_DAP_JTAG_GetIDCODEs(hd, &cnt, codes);
+```
+
+### 7.4 `CMSIS_DAP_JTAG_GetIRLengths`
+
+```c
+int CMSIS_DAP_JTAG_GetIRLengths(RDDIHandle handle, int *count, uint8_t *lengths);
+```
+
+```c
+int cnt = 0; uint8_t lens[8] = {0};
+pfn_CMSIS_DAP_JTAG_GetIRLengths(hd, &cnt, lens);
+```
+
+---
+
+## 8. PC 采样接口
+
+### 8.1 `CMSIS_DAP_PC_Capture`
+
+```c
+int CMSIS_DAP_PC_Capture(RDDIHandle handle, uint8_t control);
+```
+
+`control` bit0：`1` 启动采样（清空缓存、初始化 ITM 解码器），`0` 停止。
+
+```c
+pfn_CMSIS_DAP_PC_Capture(hd, 0x01);   // 启动
+/* ... 运行一段时间 ... */
+pfn_CMSIS_DAP_PC_Capture(hd, 0x00);   // 停止
+```
+
+### 8.2 `CMSIS_DAP_PC_GetNumberOfChannels`
+
+```c
+int CMSIS_DAP_PC_GetNumberOfChannels(RDDIHandle handle, int *count);
+```
+
+```c
+int ch = 0;
+pfn_CMSIS_DAP_PC_GetNumberOfChannels(hd, &ch);
+```
+
+### 8.3 `CMSIS_DAP_PC_GetChannelInfos`
+
+```c
+int CMSIS_DAP_PC_GetChannelInfos(RDDIHandle handle, int *count, void *infos);
+```
+
+`infos` 传 `NULL` 时只回填通道数；否则按 `*count` 个填充 `{type, capacity, width}`（每项 12 字节）。
+
+```c
+struct { uint32_t type, capacity, width; } infos[8];
+int ch = 8;
+pfn_CMSIS_DAP_PC_GetChannelInfos(hd, &ch, infos);
+```
+
+### 8.4 `CMSIS_DAP_PC_GetCommonFrequency`
+
+```c
+int CMSIS_DAP_PC_GetCommonFrequency(RDDIHandle handle, uint32_t *frequency);
+```
+
+```c
+uint32_t freq = 0;
+pfn_CMSIS_DAP_PC_GetCommonFrequency(hd, &freq);   // 默认 10 MHz
+```
+
+### 8.5 `CMSIS_DAP_PC_GetData` / `CMSIS_DAP_PC_GetValues`
+
+```c
+int CMSIS_DAP_PC_GetData  (RDDIHandle handle, int *count, uint8_t *data);    // *count 是字节数
+int CMSIS_DAP_PC_GetValues(RDDIHandle handle, int *count, uint32_t *values); // *count 是元素个数
+```
+
+读取已缓存的 PC 采样值（读后从缓存移除）。
+
+```c
+uint32_t vals[256];
+int n = 256;
+if (pfn_CMSIS_DAP_PC_GetValues(hd, &n, vals) == RDDI_SUCCESS) {
+    for (int i = 0; i < n; i++) printf("PC[%d] = 0x%08X\n", i, vals[i]);
+}
+
+uint8_t raw[1024];
+int m = sizeof(raw);                 // GetData 用字节数
+pfn_CMSIS_DAP_PC_GetData(hd, &m, raw);
+```
+
+---
+
+## 9. StreamingTrace 接口
+
+`Connect` 的 `mode`：`0`=none，`1`=SWO，`2`=ETM。
+
+### 9.1 `StreamingTrace_Attach` / `StreamingTrace_Detach`
+
+```c
+int StreamingTrace_Attach(RDDIHandle handle, const char *sinkName);
+int StreamingTrace_Detach(RDDIHandle handle);
+```
+
+```c
+pfn_StreamingTrace_Attach(hd, "swo");   // 初始化 trace 子系统
+/* ... */
+pfn_StreamingTrace_Detach(hd);
+```
+
+### 9.2 `StreamingTrace_Connect` / `StreamingTrace_Disconnect`
+
+```c
+int StreamingTrace_Connect(RDDIHandle handle, const char *sinkName, int mode);
+int StreamingTrace_Disconnect(RDDIHandle handle);
+```
+
+```c
+pfn_StreamingTrace_Connect(hd, "swo", 1);   // mode=1 SWO
+pfn_StreamingTrace_Disconnect(hd);
+```
+
+### 9.3 `StreamingTrace_Start` / `StreamingTrace_Stop` / `StreamingTrace_Flush`
+
+```c
+int StreamingTrace_Start(RDDIHandle handle);   // 需先 Connect
+int StreamingTrace_Stop (RDDIHandle handle);
+int StreamingTrace_Flush(RDDIHandle handle);   // 清空内部缓冲
+```
+
+```c
+pfn_StreamingTrace_Attach(hd, "swo");
+pfn_StreamingTrace_Connect(hd, "swo", 1);
+pfn_StreamingTrace_Start(hd);
+/* ... 采集 ... */
+pfn_StreamingTrace_Stop(hd);
+pfn_StreamingTrace_Flush(hd);
+pfn_StreamingTrace_Disconnect(hd);
+pfn_StreamingTrace_Detach(hd);
+```
+
+### 9.4 `StreamingTrace_WaitForEvent`
+
+```c
+int StreamingTrace_WaitForEvent(RDDIHandle handle, int timeoutMs, int *eventType);
+```
+
+轮询等待，超时返回 `RDDI_SUCCESS` 且 `*eventType = 0`；有数据时 `*eventType = 1`。
+
+```c
+int ev = 0;
+pfn_StreamingTrace_WaitForEvent(hd, 1000, &ev);
+if (ev == 1) { /* 有 trace 数据可读 */ }
+```
+
+### 9.5 `StreamingTrace_SubmitEventBuffer`
+
+```c
+int StreamingTrace_SubmitEventBuffer(RDDIHandle handle, uint8_t *buffer, int bufferSize);
+```
+
+```c
+uint8_t tb[4096] = {0};
+pfn_StreamingTrace_SubmitEventBuffer(hd, tb, sizeof(tb));
+```
+
+### 9.6 `StreamingTrace_GetSinkCount`
+
+```c
+int StreamingTrace_GetSinkCount(RDDIHandle handle, int *count);
+```
+
+```c
+int sinks = 0;
+pfn_StreamingTrace_GetSinkCount(hd, &sinks);   // 2 (SWO + ETM)
+```
+
+### 9.7 `StreamingTrace_GetSinkDetails`
+
+```c
+int StreamingTrace_GetSinkDetails(RDDIHandle handle, int reserved1, int reserved2);
+```
+
+Keil 扩展，3 参且不写调用方缓冲区；当前返回 `RDDI_DAP_LEVEL1_NOT_IMPL`。
+
+```c
+int rc = pfn_StreamingTrace_GetSinkDetails(hd, 0, 0);
+```
+
+### 9.8 `StreamingTrace_GetConfigItem` / `StreamingTrace_SetConfigItem`
+
+```c
+int StreamingTrace_GetConfigItem(RDDIHandle handle, int item, int *value);
+int StreamingTrace_SetConfigItem(RDDIHandle handle, int item, int value);
+```
+
+`item`：`0`=波特率，`1`=缓冲大小，`2`=模式。
+
+```c
+int baud = 0;
+pfn_StreamingTrace_GetConfigItem(hd, 0, &baud);        // 默认 115200
+pfn_StreamingTrace_SetConfigItem(hd, 0, 921600);       // 改波特率
+pfn_StreamingTrace_SetConfigItem(hd, 2, 1);            // mode = SWO
+```
+
+---
+
+## 10. 日志回调
+
+### 10.1 `RDDI_SetLogCallback`
+
+```c
+void RDDI_SetLogCallback(RDDIHandle handle, RDDILogCallback pfn, void *context, int maxLogLevel);
+```
+
+回调签名（注意顺序是 `context, msg, logLevel`）：
+
+```c
+typedef void (*RDDILogCallback)(void *context, const char *const msg, const int logLevel);
+```
+
+日志级别：`RDDI_LOGLEVEL_FATAL`=0 … `RDDI_LOGLEVEL_TRACE`=5。
+
+```c
+static void on_log(void *ctx, const char *msg, int level)
+{
+    const char *lv[] = { "FATAL","ERROR","WARN","INFO","DEBUG","TRACE" };
+    printf("[%s] %s\n", (level >= 0 && level <= 5) ? lv[level] : "?", msg);
+}
+
+/* 注册（maxLogLevel 调小可减少转发量） */
+pfn_RDDI_SetLogCallback(hd, on_log, NULL, RDDI_LOGLEVEL_INFO);
+
+/* 取消：传 NULL */
+pfn_RDDI_SetLogCallback(hd, NULL, NULL, 0);
+```
+
+> 回调在**锁外**调用，可以在回调里安全地调用其他函数。
+> 运行期还可用 `%TEMP%\ORBMDK_LOG_LEVEL` 文件调整阈值（0=DEBUG…3=ERROR），无需重启进程。
+
+---
+
+## 11. 错误码速查
+
+通用错误码（`RDDI_SUCCESS` = 0 表示成功）：
+
+| 宏 | 值 | 说明 |
+|----|-----|------|
+| `RDDI_SUCCESS` | 0x0000 | 成功 |
+| `RDDI_BADARG` | 0x0001 | 参数非法 |
+| `RDDI_INVHANDLE` | 0x0002 | 句柄无效 |
+| `RDDI_FAILED` | 0x0003 | 一般失败 |
+| `RDDI_BUFFER_OVERFLOW` | 0x0005 | 缓冲区溢出 |
+
+DAP 错误码（0x1000 段，AGDI 按数值识别并做恢复）：
+
+| 宏 | 值 | 说明 |
+|----|-----|------|
+| `RDDI_DAP_OPERATION_TIMEOUT` | 0x100E | 超时（AGDI 会写 ABORT 重试） |
+| `RDDI_DAP_DP_STICKY_ERR` | 0x100F | DP 粘滞错误（AGDI 会清 sticky 重试） |
+| `RDDI_DAP_LEVEL1_NOT_IMPL` | 0x1006 | 该功能未实现 |
+| `RDDI_DAP_BAD_REGISTER_ID` | 0x1011 | 寄存器 ID 不支持 |
+
+Keil 扩展错误码（0x2000 段）：`RDDI_DAP_ERROR`(0x2000)、`RDDI_DAP_ERROR_MEMORY`(0x2005) 等。
+
+---
+
+## 12. 注意事项（易踩的坑）
+
+1. **输出参数总是先写**：所有带标量出参的接口，即使句柄无效也会先把出参写成 `0`/空串再返回错误。
+   调用方应**先看输出值、再看返回值**（AGDI 就是只看输出值）。
+
+2. **`sizeOfArray` 的单位不统一**：
+   - `DAP_GetDAPIDList` / `CMSIS_DAP_GetDeviceIDList`：**字节数**（也兼容元素个数）。
+   - `CMSIS_DAP_DetectDAPIDList`：**元素个数**。
+   - `CMSIS_DAP_PC_GetData` 的 `*count`：字节数；`CMSIS_DAP_PC_GetValues` 的 `*count`：元素个数。
+
+3. **`CMSIS_DAP_SWJ_Sequence` 的 `num` 是位数**，不是字节数；不要用 `sizeof()`。
+
+4. **Block 与 Repeat 语义不同**：
+   - `DAP_Reg*Block`：数组里是**多个不同 regID**。
+   - `DAP_Reg*Repeat`：**同一 regID 重复 N 次**。
+
+5. **`CMSIS_DAP_Connect` 的第 2 参不一定是有效指针**：AGDI 会把它当作“选中项索引”传入，
+   DLL 内部已做可写性校验；自己调用时应传真实 `int*`。
+
+6. **未实现的接口返回 `RDDI_DAP_LEVEL1_NOT_IMPL`**（0x1006），不会崩溃，可用于探测：
+   `DAP_DefineSequence`、`DAP_RunSequence`、`StreamingTrace_GetSinkDetails`、
+   `CMSIS_DAP_Atomic_Control`、`CMSIS_DAP_Atomic_Result`。
+
+7. **接口选择必须显式**：`CMSIS_DAP_ConfigureInterface(ifNo)` 一旦选定，通道打不开会**报错**，
+   不会静默回退；因此调用前建议先 `CMSIS_DAP_Detect` 确认接口数。
+
+8. **32 位 DLL**：Keil µVision 是 32 位进程，必须用 x86 构建的 `ORBMDK_RDDI.dll`；
+   覆盖 DLL 前需结束整个 `UV4.exe`（µVision 会把 DLL 常驻内存）。

@@ -170,6 +170,7 @@ function Compile-Source {
 $Sources = @(
     @{Name="pch.cpp"; Obj="$ObjDir\pch.obj"},
     @{Name="ORBMDK_DLL.cpp"; Obj="$ObjDir\ORBMDK_DLL.obj"},
+    @{Name="ORBMDK_Log.cpp"; Obj="$ObjDir\ORBMDK_Log.obj"},
     @{Name="ORBMDK_HID.cpp"; Obj="$ObjDir\ORBMDK_HID.obj"},
     @{Name="ORBMDK_RDDI.cpp"; Obj="$ObjDir\ORBMDK_RDDI.obj"},
     @{Name="ORBMDK_USB_Bulk.cpp"; Obj="$ObjDir\ORBMDK_USB_Bulk.obj"},

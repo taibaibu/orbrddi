@@ -10,6 +10,7 @@
 #include "ORBMDK_USB_Bulk.h"
 #include "ORBMDK_HID.h"
 #include "ORBMDK_DAPV2.h"
+#include "ORBMDK_Log.h"
 
 #include <chrono>
 #include <thread>
@@ -112,34 +113,16 @@ static const GUID USB_GUID_DEVINTERFACE =
     {0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED}};
 
 // ---------------------------------------------------------------------------
-// 诊断日志
+// 诊断日志（统一实现见 src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）
 //
-// 本文件此前完全没有日志（见 COMPAT_ANALYSIS.md §8.1），V2 打不开时无从排查。
-// 这里只记关键路径（枚举到的接口、被拒绝的原因、最终选中的端点），
-// 不记逐次传输。写入与 RDDI 层相同的日志文件。
+// 本文件此前完全没有日志（见 §8.1），V2 打不开时无从排查；后来补了 BulkTrace，
+// 但它绕过级别、绕过 ORBMDK_LOG_FILE、且手写前缀（§8.2(2)(3)）。
+// 现在走统一入口：**仍然不受级别控制、仍然只落盘**，但会遵循 ORBMDK_LOG_FILE，
+// 并带上时间戳与进程/线程号。
+// 只记关键路径（枚举到的接口、被拒绝的原因、最终选中的端点），不记逐次传输。
 // ---------------------------------------------------------------------------
-static void BulkTrace(const char* fmt, ...)
-{
-    char path[MAX_PATH] = {0};
-    char tmp[MAX_PATH] = {0};
-    if (GetTempPathA(MAX_PATH, tmp) == 0 || tmp[0] == '\0') {
-        return;
-    }
-    _snprintf_s(path, sizeof(path), _TRUNCATE, "%sORBMDK_RDDI.log", tmp);
-
-    char msg[512] = {0};
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
-    va_end(ap);
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") != 0) {
-        return;
-    }
-    fprintf(f, "[ORBMDK][INFO][BULK] %s\n", msg);
-    fclose(f);
-}
+#define ORBMDK_LOG_MODULE "BULK"
+#define BulkTrace(...) ORBMDK_LOG_TRACE(__VA_ARGS__)
 
 // V2 接口的产品名（来自接口字符串描述符，通常是 "CMSIS-DAP v2"）
 static char g_bulkProductName[128] = {0};

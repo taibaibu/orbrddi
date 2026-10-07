@@ -20,8 +20,12 @@
 | 目标识别 | ✅ DP IDCODE `0x2BA01477`、AP IDR `0x24770011`（STM32F1） |
 | Keil 联调 | ✅ 官方 AGDI v1.33.24 下对话框正确显示 `IDCODE 0x2BA01477` / `ARM CoreSight SW-DP`（见 4.7） |
 | Flash 下载 | ✅ 烧录与调试均验证通过（擦除失败根因见 4.8） |
-| 烧录速率 | 🔧 块传输优化已实施（§9.8）；**orbtrace 确认支持 `ID_DAP_TRANSFER_BLOCK`**（§13.7 更正），探测已改到连上目标时执行，待实测提速幅度 |
-| 传输模式 | ✅ V1(HID) / V2(Bulk) 两种在 Keil 适配器列表里**都显示、可选可切换**（§14） |
+| 烧录速率 | 🔧 块传输已接入且**能力探测通过**（日志 `Block transfer probe OK`，§13.7 更正）；`test/ORBMDK_BlockTransferTest.exe` 的越界/提速验证**待目标在线时补跑**（§9.9 的验证要求） |
+| 传输模式 | ✅ V1(HID) / V2(Bulk) 两条在 Keil 适配器列表里都可选可切换（§14），**V2 已实机可用**：完整调试 + 下载（§17.3 / §17.5 B 臂） |
+| V2 通道真因 | ✅ 句柄泄漏导致 WinUSB 接口被**永久**独占（§17.1）+ 出包长度必须用设备自报的 508、**绝不发整包**（§17.2） |
+| 传输层选择 | ✅ 只认对话框里选中的那条接口；**已删除全部隐藏开关**（`ORBMDK_TRANSPORT` / `ORBMDK_FWVER` / `ORBMDK_BULK_PAD` / `ORBMDK_SERIAL`），选中通道打不开就如实报错（§17.4） |
+| 固件版本门 | ✅ AGDI 用 `"%lu.%lu.%lu"` 解析 `Identify(idNo=4)` 并 `cmp eax,2`，主版本 ≥ 2 切另一套驱动逻辑（§17.6 反汇编）；本层钉 `1.0.0`（§17.5 单变量 A/B） |
+| 日志 | ✅ 单一实现 `src/ORBMDK_Log.cpp`（§8.5）：多 Sink（文件 / stdout / DebugView / 宿主回调）、`%TEMP%\ORBMDK_LOG_LEVEL` 热更新、线程安全；`RDDI_SetLogCallback` 已接通 Keil 日志窗口 |
 
 **导出符号分类（78 个）**
 
@@ -197,7 +201,8 @@ orbtrace 固件 `RESP_Transfer_Process` 的响应字节为 `Cat(dbgif.ack, dbgif
 
 | 项 | 约定 |
 |----|------|
-| 默认级别 | **ERROR**（`ORBMDK_RDDI.cpp` 的 `ORBMDK_LogLevel()`、`ORBMDK_HID.cpp` 的 `HID_LogLevel()`） |
+| 实现位置 | **`src/ORBMDK_Log.cpp`（唯一实现）+ `include/ORBMDK_Log.h`（宏）**。2026-09-30 之前是 `ORBMDK_RDDI.cpp` 的 `ORBMDK_Log` 与 `ORBMDK_HID.cpp` 的 `HID_Log` 两套实现（见 §8.5） |
+| 默认级别 | **ERROR** |
 | 阈值适用范围 | **控制台 / DebugView 与文件日志共用同一阈值**。文件日志曾写死 `level >= INFO` 而绕过阈值，已修正（见 4.10 #21） |
 | 过滤时机 | 在构造日志字符串**之前**判断级别，被过滤时零格式化开销 |
 | 行格式 | `[ORBMDK][HH:MM:SS.mmm][级别][模块][PID:TID] 消息` |
@@ -455,9 +460,13 @@ const int effectiveMask = matchMaskSet ? matchMask : expected;
 `[ORBMDK][%02u:%02u:%02u.%03u][%s][%s][%lu:%lu]`。
 默认（ERROR）阈值下，一次正常调试的日志文件应只剩 0～数行 WARN/ERROR。
 
-**尚未处理（按 §8 统一方案单独一轮）**：模块名统一（当前 `LOG_*` 写死 `"RDDI"`）、
-HID 层 `HID_Log` 与 RDDI 层格式/能力不一致、`g_logEnabled` 死变量、
-`RDDI_SetLogCallback` 通道未接通、会话分隔标记。
+**✅ 2026-09-30 已处理**（§8 统一方案落地，记录见 §8.5）：模块名统一
+（宏移到头文件，各 .cpp 只定义 `ORBMDK_LOG_MODULE`）、HID 层 `HID_Log` 与 RDDI 层
+合并为同一实现、`g_logEnabled` 死变量删除、`RDDI_SetLogCallback` 通道接通
+（CallbackSink + 级别映射）、HID/Bulk 两处"命令级直写文件"并回统一入口
+（并补上它们原本没有的时间戳）。
+
+> 唯一遗留小项：**会话分隔标记**（跨会话追加的日志里加一条醒目分隔行）—— 见 §18.3。
 
 ### 4.11 设备拔出时显示伪 IDCODE `0x4A57533B`（输出参数未写入）
 
@@ -668,7 +677,10 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 
 1. **ULINK+ 专有接口**：`ULINKPLUS_*` 属 Keil 独有，ORBMDK/ORBTrace 无需支持。
 2. **ETM v4 深度**：`FuncReturn` / `ExceptionReturn` / `Prefix` 需结合具体 ETM 配置与实机 trace 数据完善。
-3. **V2 Bulk 路径实机验证**：当前实机联调走 V1 HID（ORBTrace 仅支持 V1），Bulk 路径尚未实机验证。
+3. ~~**V2 Bulk 路径实机验证**：当前实机联调走 V1 HID（ORBTrace 仅支持 V1），Bulk 路径尚未实机验证。~~
+   → ✅ **2026-09-30 已完成**：V2 实机跑通完整调试与下载（§17.3 命令行、§17.5 B 臂 Keil）。
+   注：原文"ORBTrace 仅支持 V1"也不准确 —— orbtrace 的 MI_05 就是 CMSIS-DAP v2
+   （EP 0x03/0x85，设备自报包长 508）。
 
 ---
 
@@ -774,7 +786,8 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 ## 八、日志模块现状分析与统一方案
 
 > 分析日期：2026-09-30。范围：`ORBMDK/` 全目录（`src/`、`include/`、`deprecated/`）。
-> 本节为**设计文档**，尚未落地代码；落地前各调用点行为保持不变。
+> **✅ 已落地（2026-09-30）**：§8.1~§8.4 是设计时的现状与方案（保留作历史依据），
+> 落地结果、差异与验证见 §8.5。
 
 ### 8.1 现状分布图
 
@@ -981,6 +994,39 @@ ORBMDK_LogWrite(level, module, fmt, ...)
 | 静默模块 | 7+ | 可统一接入 |
 | 排障信息 | 无时间 / TID | 含时间戳 + TID |
 
+### 8.5 落地结果（2026-09-30）
+
+**新增**：`include/ORBMDK_Log.h`（级别 / API / 宏）、`src/ORBMDK_Log.cpp`（唯一实现，
+已加入 `build.ps1` 源列表）。
+
+**删除**（§8.2 的六类问题逐条闭环）：
+
+| §8.2 问题 | 处理 |
+|-----------|------|
+| 两套并行实现 | 删除 `ORBMDK_RDDI.cpp` 的 `ORBMDK_Log` / `ORBMDK_LogLevel` / `ORBMDK_LogWriteFile`，以及 `ORBMDK_HID.cpp` 的 `HID_Log` / `HID_LogLevel` |
+| 宏写在 .cpp 里（死代码） | 宏移入头文件；RDDI 里那组"模块级宏"（`LOG_HID_*` / `LOG_BULK_*` / `LOG_TRACE_*`）按 §8.3(8) 第 4 步删除 |
+| 格式 / 能力不一致 | 统一为 `[ORBMDK][时间][级别][模块][pid:tid] 消息`；HID 现在也落盘、也支持 `%TEMP%\ORBMDK_LOG_LEVEL` 热更新 |
+| `RDDI_SetLogCallback` 未接通 | 接为 CallbackSink（`HostLogBridge`）：内部级别 → RDDI 级别映射 + `maxLogLevel` 过滤 |
+| 无锁 / 无时间戳 | 单 `std::mutex` 保护格式化与文件写入；宿主回调在**锁外**调用（回调里再打日志不会自锁） |
+| `g_logEnabled` 死变量 | 删除 |
+| 两处"命令级直写文件"（`HidTrace` / `BulkTrace`）绕过级别、绕过 `ORBMDK_LOG_FILE`、无时间戳 | 并入 `ORBMDK_LogTrace()`：仍**不受级别控制**、仍只落盘，但走同一路径与格式（**顺带补上时间戳 / 进程线程号**） |
+
+**与设计的两处取舍**：
+
+1. 级别枚举与便捷宏**同名**（`ORBMDK_LOG_INFO` 既是枚举又是函数式宏）—— 函数式宏只在
+   后面紧跟 `(` 时展开，所以 `ORBMDK_LOG_INFO,` 这种裸用仍取枚举值，二者可共存
+   （实现里就是这么用的：`_format(..., ORBMDK_LOG_INFO, ...)`）。
+2. 日志文件仍是**写后即关**、不用常驻 `FILE*`：宿主 µVision 会独占该文件，
+   外部诊断工具必须能随时读 —— 这比省几次 `fopen` 重要。
+
+**验证**：
+
+- 构建：无 error、无 warning；
+- V2 通路（`bin\orbprobe3.exe`）：功能全通过；日志统一格式；`[BULK]` 命令级日志
+  **首次带上时间戳**；
+- HID 通路（`bin\v1probe.exe`，`ifNo=1`）：`transport = CMSIS-DAP v1 (HID)`、
+  `idcode=0x2BA01477`、`[HID] DAPCommand` 行同样带时间戳。
+
 ---
 
 ## 九、烧录速率优化分析（待实施）
@@ -1094,6 +1140,27 @@ OUT + IN 各一轮 → 保守按 **1–2 ms / 往返** 估算：
 
 **待实测**：烧录耗时对比（预期 30–60 s → 3–5 s）。
 
+> ✅ **2026-09-30 实测完成**（`bin\ORBMDK_BlockTransferTest.exe 0x20000000`）：
+
+```
+cases passed 12, failed 0            <- 1/13/14/15/28/64 字边界 + 两侧各 8 字哨兵
+serial total 301779.1 us
+block  total  38372.7 us
+speedup       7.86x                  <- 单例 n=64：serial 147.5 ms -> block 16.3 ms (≈9x)
+```
+
+- **哨兵零损坏** → §9.9 的越界写（Keil 崩溃根因 #35）确认已修好，块传输可以放心启用；
+- 加速比低于理论 14×：V2(Bulk) 下单次往返开销本来就小，固定开销占比上升
+  （HID 通路会更接近 14×）；
+- 走查过程中顺带修好了这个"验证程序"本身（它此前根本跑不通，四步都是缺的）：
+  1. 只调低层 `DAP_Connect` —— 那是个**纯桩**（只填 implementor 字符串，不做 SWJ 切换）
+     → 补上 `CMSIS_DAP_Connect`（Keil 实际走的入口，本层负责 SWJ/SWD 收尾，§4.4）；
+  2. 顺序按 ARM `rddi_dap.h`：`DAP_Connect` → `CMSIS_DAP_Connect`
+     （反过来会把刚建好的 SWD 链路弄断，随后第一条 AP 访问即 NO_ACK）；
+  3. 缺 **DP/AP 上电**（CTRLSTAT = 0x50000000，等 READOK + CDBGPWRUPACK）→ AP 访问必 FAULT；
+  4. 目标**运行时** 0x20000000 是其程序在用的 RAM（读回 `0x0100xxxx` 运行期数据）→
+     加"先停核"再测，否则 12 个用例全部数据不符（属测试环境问题，不是块传输问题）。
+
 - 若日志出现 `block transfer failed ... falling back to single transfers`，
   说明固件不支持 `ID_DAP_TRANSFER_BLOCK`，速度不会改善，需转向 P3（Bulk）。
 - 若提速符合预期，再评估 P3（Bulk，约再 9×）与 P4（提高 Max Clock）。
@@ -1148,7 +1215,8 @@ OUT + IN 各一轮 → 保守按 **1–2 ms / 往返** 估算：
 **保留的有效修复**：§9.5 的 HID 长度校验（纯加固、无副作用）、`DAP_TransferBlock`
 的两处修复（函数正确性）。
 
-**重新启用前的验证要求**（避免再次把 Keil 拖崩）—— 已提供验证程序：
+**重新启用前的验证要求**（避免再次把 Keil 拖崩）—— ✅ **2026-09-30 已满足**，
+结果与过程见 §9.8（12/12 通过、哨兵零损坏、加速比 7.86×）。验证程序：
 
 ```bat
 :: 目标板接好、已上电后直接跑（程序内部自己切换两种模式并对比耗时）
@@ -1604,6 +1672,12 @@ RDDI_Open: transport = CMSIS-DAP v2 (USB Bulk)     ← 成功
 ```
 
 #### 11.1.5 残留问题：同一会话内反复 Open/Close 会退化到 V1
+
+> ✅ **2026-09-30 已彻底解决 —— 真因不是"句柄释放延迟"，见 §17.1。**
+> 本层 `_closeWinUSB()` 没有取消挂起的 overlapped IRP 就 `WinUsb_Free` +
+> `CloseHandle`，内核一直持有 file object 引用 → 该 WinUSB 接口被**永久**独占，
+> 此后任何进程 `CreateFile` 都是 `err=5`。下面的 #47 重试只是缓解，
+> 真正修的是**关闭路径**（`CancelIoEx` → `WinUsb_AbortPipe/ResetPipe` → 才释放）。
 
 实测 7 次 `RDDI_Open` 中只有第 1 次走 V2，其余 6 次全变成 V1。日志给出的直接原因：
 
@@ -2238,14 +2312,16 @@ AGDI 有两条与"设备数量"有关的判断，触发条件都不在我们手�
 
 ### 16.4 待实测
 
-1. 结束整个 `UV4.exe` → `.\deploy.ps1` → 重开 Keil → Debug Settings；
-   期望：SW Device 显示 `IDCODE 0x2BA01477 / ARM CoreSight SW-DP`，下拉框仍是两条。
-2. `%TEMP%\ORBMDK_RDDI.log` 搜 `DAP_GetDAPIDList: sizeOfArray`、
-   `from target scan`、`V2 firmware version`、`serial filter`；
-   `Init: entered ... serial='...'` 应显示被钉住的序列号。
+> ✅ 三项均已于 2026-09-30 闭环（见 §17）：① 两条接口 + SW Device 正常（§17.5 B 臂）；
+> ② 日志核对完成；③ 序列号开关已删除（§17.4）。
+
+1. ✅ 结束整个 `UV4.exe` → `.\deploy.ps1` → 重开 Keil → Debug Settings；
+   SW Device 显示 `IDCODE 0x2BA01477 / ARM CoreSight SW-DP`，下拉框两条（§17.5 B 臂）。
+2. ✅ `%TEMP%\ORBMDK_RDDI.log` 核对完成：`V2 Bulk mode OK`、`outPacket=508 verified`、
+   `GetDeviceIDList: id[0]=0x2BA01477`、`ConfigureDebugger` 全在。
 3. ~~多调试器：`echo 29B4E080E2289E06 > %TEMP%\ORBMDK_SERIAL` 指定具体设备~~
    —— 该开关已于 2026-09-30 移除（见 §17.4）。AGDI 的 `pDetails` 恒为 NULL，
-   本层按枚举顺序取第一台。
+   本层按枚举顺序取第一台（**多台同时插入时的选择问题仍未解决**，见 §18.1）。
 
 ---
 
@@ -2400,6 +2476,109 @@ transport = CMSIS-DAP v2 (USB Bulk)   idcode=0x2BA01477
 主版本 ≥ 2 时切到它自己的另一套驱动逻辑（换函数指针表 + 置标志位）。本环境下那套
 逻辑走不通（A 臂：跳过全部设备枚举、`Connect` 后立刻 Close），所以这一栏必须钉在
 `1.0.0`。这也正是 §17.5"只改这一个字符串、行为就翻转"的代码级解释。
+
+---
+
+## 十八、剩余工作清单（2026-09-30 复核）
+
+> 从全文"待实测 / 待定 / 尚未落地"里逐条筛出，按"是否影响当前 Keil 调试链路"排序。
+> ✅ 已完成 · 🔴 待做（有价值）· 🟡 可选 · ⛔ 不需要
+
+### 18.1 🔴 多台调试器同时插入时**无法指定用哪一台**
+
+**现状**：`CMSIS_DAP_Detect` 固定返回 2（= 两种传输），`Identify` 只报名字/序列号，
+`ConfigureInterface(ifNo)` 仅用于切传输层。AGDI 的 `rddi_Open(pDetails)` 恒为 NULL
+（§2.1 实测），**它没有任何"用哪台设备"的信息可传**。两台 orbtrace 同时插入时本层
+只能取枚举顺序第一台 —— 界面上两条目完全相同，用户无法选择（原 `ORBMDK_SERIAL`
+开关已按"不留隐藏开关"原则删除，§17.4）。
+
+**可行方案**（改动集中在 `CMSIS_DAP_Detect/Identify/ConfigureInterface` + 设备枚举）：
+
+1. 枚举所有同型号调试器（各带序列号）；
+2. `CMSIS_DAP_Detect` 返回 `N × 2`：每台设备两条（`CMSIS-DAP v2 (SN)` /
+   `CMSIS-DAP v1 (SN)`）；`Identify(idNo=2/3)` 按 `ifNo` 给出带序列号的名字；
+3. `ConfigureInterface(ifNo)` 反解出"第几台设备 + 哪种传输"，切到那台并记住；
+4. 已连接同一台时复用，避免反复 Open/Close。
+
+风险点：AGDI 遍历适配器条目的上限（`0x10022084 cmp esi,0x10` → 16 项），
+以及**条目顺序必须稳定**（否则工程里保存的选择会串位）。
+
+### 18.2 ✅ 块传输提速验证 —— 2026-09-30 完成
+
+`bin\ORBMDK_BlockTransferTest.exe 0x20000000`：**12/12 通过、哨兵零损坏、加速比 7.86×**
+（§9.8 有完整数据）。过程中修好了验证程序本身缺的四步（低层 `DAP_Connect` 是纯桩、
+调用顺序、DP/AP 上电、目标运行时要先停核）。
+
+> 遗留观察（非阻塞）：测试里的 `DHCSR` 回读为 `0x00000000`（正常应有 bit0/1 置位），
+> 说明那次"停核"很可能没真正生效 —— 这次数据能对上是目标已处于停机态。
+> 下次跑之前建议先确认目标处于 halt 状态（或把停核步骤改成经 `CMSIS_DAP_Target`）。
+
+### 18.3 ✅ 日志模块统一（§8）—— 2026-09-30 已完成
+
+单实现 `src/ORBMDK_Log.cpp` + 头文件宏；两套旧实现、四处"直写文件"全部并入；
+`RDDI_SetLogCallback` 通道接通；HID/BULK 命令级日志补上时间戳。落地记录见 **§8.5**。
+
+仍待办的小项：**会话分隔标记** —— ✅ 同日一并完成：`RDDI_Open` 入口打一条
+INFO 级分隔行（`================ 会话 #N 开始 (pid=...) ================`），
+便于在"跨进程/跨会话追加"的日志里快速定位（§4.10 的遗留项）。
+
+### 18.4 🟡 状态 LED 实机确认（§11.2）
+
+`SetHostLed` / `TrackApTarWrite` 已实现但**未在实机核对**：接上目标后 Connect LED 常亮，
+烧录/运行时 Running LED 亮、停机灭。
+
+### 18.5 🟡 简化实现（§5.1~§5.3，均不影响 Keil 链路）
+
+`DAP_DefineSequence` / `DAP_RunSequence`、`CMSIS_DAP_Commands`（除 `RESET_TARGET`）、
+`CMSIS_DAP_JTAG_GetIRLengths`、`CMSIS_DAP_Atomic_Result`、`CMSIS_DAP_GetGUID`（拼串非真
+GUID）、`DAP_Target` 的 Halt/Resume/Step、Trace 适配层 3 个空函数、ETM v4 的
+`FuncReturn`/`ExceptionReturn`/`Prefix`。只有真要跑 trace / sequencer 时才需要补。
+
+### 18.6 🟡 `Firmware Version` 一栏的显示（§17.5 附注）
+
+现固定 `1.0.0`（设备真实值 `2.1.0` 会触发 AGDI 的另一套逻辑）。若想让界面贴近真实值，
+可改成"只把主版本归一化为 1"（`2.1.0` → `1.1.0`）；纯显示偏好，改完需一次 A/B 复验。
+
+### 18.7 ⛔ 不需要做
+
+- ULINK+ 专有接口（`ULINKPLUS_*`）：Keil 独有，ORBTrace 用不到。
+- §7.3 符号搜索路径：属设计内 fallback，保持现状。
+
+### 18.9 🔴 JTAG 通路**未实现**（Keil 选 JTAG → "Cannot enter Debug Mode"）
+
+**现象**（2026-09-30 实测）：Debug 设置里把 Port 由 SW 改成 **JTAG** 后，Keil 报
+`Cannot enter Debug Mode`。日志与之吻合：`SWD link recovery failed: target still not
+responding` 与 `DAP_WriteReg: WAIT/NO_ACK, regId=0x00000001` 反复出现，最后
+`CMSIS_DAP_Disconnect` 收场；设备对 `cmd=0x02`(Connect) 回的是 **`01` = SWD 模式**。
+
+**结论：不是"坏了"，是这条通路从来没实现过。** 六处证据：
+
+| 位置 | 现状 |
+|------|------|
+| `CMSIS_DAP_ConfigureInterface` | `Port=` 只记 `ctx->isSWD = (value=="SW")`，**不切模式**（`isSWD` 也无处读取） |
+| `DAP_ConnectTarget()`（`ORBMDK_HID.cpp:561`） | 恒调 `DAP_ConnectSWD()`，即 `ID_DAP_CONNECT port=1`；无 JTAG(port=2) 分支 |
+| `CMSIS_DAP_Connect`（`ORBMDK_RDDI.cpp:1813`） | 硬编码 "starting SWD connection sequence"；仅 `mode==1` 时补 JTAG-to-SWD 切换 |
+| `SwdLinkRecover()` | 恢复序列强制 SWD（线复位 + JTAG-to-SWD + `DAP_ConnectTarget()`），JTAG 下每次恢复都把链路拉回 SWD |
+| `CMSIS_DAP_Capabilities` | `INFO_CAPS_SWD \| INFO_CAPS_ATOMIC_CMDS`，**无 JTAG 位**（Keil 的 Port 下拉框并不按能力位限制，所以仍能选 JTAG） |
+| `CMSIS_DAP_JTAG_GetIRLengths` | 桩：`*count = 0`（§5.1）；`JTAG_GetIDCODEs` 复用的是 SWD 扫描出的 `dapIdList` |
+
+**要做（若确实需要 JTAG）**：
+
+1. `INFO_CAPS_JTAG` 能力位（**只在真正实现后才加**，否则等于骗宿主）；
+2. `DAP_ConnectTarget(port)` 支持 port=2；`CMSIS_DAP_Connect` 分岔出 JTAG 建链
+   （`JTAG_Configure` 下发 IR 长度 + `JTAG_Sequence` 复位/Idle + `ID_DAP_JTAG_IDCODE` 扫描）；
+3. `CMSIS_DAP_JTAG_GetIRLengths` 用扫描结果填充（链上单 TAP 时 IR 长度由 IDCODE 反查或由固件返回）；
+4. 链路恢复按当前模式走（SWD 序列 vs JTAG 复位）；
+5. 验证：需要**目标板物理接了 TDI/TDO/TRST**（很多板子只引 SWDIO/SWCLK，那样 JTAG 无论如何都不通）。
+
+**当前处置**：`CMSIS_DAP_ConfigureInterface` 遇到非 `SW` 的 `Port` 值会打 **WARN** 明确说明
+"本层仅实现 SWD"，避免下次再从命令级日志反推（2026-09-30 加）。日常调试请选 **SWD**。
+
+### 18.8 ✅ 2026-09-30 已闭环
+
+V2 真因与修复（§17.1 / §17.2）、四个隐藏开关删除（§17.4）、版本门单变量 A/B +
+反汇编证据（§17.5 / §17.6）、§5.4 的"V2 实机验证"、§11.1.5 的"退化到 V1"、
+§16.4 的三项待实测。
 
 
 

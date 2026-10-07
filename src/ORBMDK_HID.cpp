@@ -6,6 +6,7 @@
 #include "pch.h"
 #include "ORBMDK_RDDI.h"
 #include "ORBMDK_HID.h"
+#include "ORBMDK_Log.h"
 
 #include <hidsdi.h>
 #include <setupapi.h>
@@ -16,86 +17,30 @@
 #pragma comment(lib, "setupapi.lib")
 
 // ============================================================================
-// Local Logging
+// 日志（统一实现见 src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）
+//
+// ★ 2026-09-30：删除了本文件自己的 HID_LogLevel / HID_Log 与那套宏 ——
+//   它原来只走 stdout/DebugView、**不落盘**，级别也只认环境变量（启动固定），
+//   与 RDDI 那套重复且能力不对等。现在两者完全一致：
+//   落盘 + %TEMP%\ORBMDK_LOG_LEVEL 热更新 + 统一格式（时间戳/进程线程号）。
 // ============================================================================
-// 日志级别: 0=DEBUG 1=INFO 2=WARN 3=ERROR
-//
-// 默认阈值 ERROR：作为被 Keil/AGDI 加载的 DLL，逐条寄存器/传输日志会造成
-// 巨量噪声（每次 DAP_Transfer 一条十六进制转储）。仅在排障时调低阈值。
-//
-// 排障时可用环境变量临时恢复（0=DEBUG 1=INFO 2=WARN 3=ERROR），无需重新编译：
-//     set ORBMDK_LOG_LEVEL=0
-static int HID_LogLevel(void)
-{
-    static const int level = []() -> int {
-        const char* env = getenv("ORBMDK_LOG_LEVEL");
-        if (env && *env) {
-            int lvl = atoi(env);
-            if (lvl >= 0 && lvl <= 3) {
-                return lvl;
-            }
-        }
-        return 3;  // 默认: 仅输出 ERROR
-    }();
-    return level;
-}
-
-static void HID_Log(int level, const char* module, const char* fmt, ...) {
-    if (level < HID_LogLevel()) {
-        return;  // 被过滤时不构造字符串，避免无谓开销
-    }
-
-    char buffer[512] = {};
-    int offset = snprintf(buffer, sizeof(buffer), "[ORBMDK][%s] ", module);
-    if (offset < 0 || offset >= (int)sizeof(buffer)) {
-        return;
-    }
-
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(buffer + offset, sizeof(buffer) - offset, fmt, args);
-    va_end(args);
-
-    printf("%s\n", buffer);
-    OutputDebugStringA(buffer);
-}
-
-#define LOG_HID_DEBUG(fmt, ...) HID_Log(0, "HID", fmt, ##__VA_ARGS__)
-#define LOG_HID_INFO(fmt, ...)  HID_Log(1, "HID", fmt, ##__VA_ARGS__)
-#define LOG_HID_WARN(fmt, ...)  HID_Log(2, "HID", fmt, ##__VA_ARGS__)
-#define LOG_HID_ERROR(fmt, ...) HID_Log(3, "HID", fmt, ##__VA_ARGS__)
+#define ORBMDK_LOG_MODULE "HID"
+#define LOG_HID_DEBUG(...) ORBMDK_LOG_DEBUG(__VA_ARGS__)
+#define LOG_HID_INFO(...)  ORBMDK_LOG_INFO(__VA_ARGS__)
+#define LOG_HID_WARN(...)  ORBMDK_LOG_WARN(__VA_ARGS__)
+#define LOG_HID_ERROR(...) ORBMDK_LOG_ERROR(__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// 命令级日志：**直写 %TEMP%\ORBMDK_RDDI.log、不受级别控制**（与
-// ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
+// 命令级日志：**不受级别控制**，总是落盘（与 ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
 //
-// 为什么必须有：V1(HID) 路径下的 DAP 命令原本**完全不可见** —— HID_Log 走
-// stdout/DebugView 且默认阈值 ERROR，不落文件。实测排障时表现为
-// "AGDI 在 CMSIS_DAP_Connect 之后什么都不做就断开"，而 HID 命令其实可能一直在发。
-// 传输层的排障线索不允许依赖日志级别。
+// 为什么必须有：V1(HID) 路径下的 DAP 命令原本**完全不可见**（默认阈值 ERROR 且
+// 当时 HID 根本不落文件）。实测排障时表现为"AGDI 在 CMSIS_DAP_Connect 之后什么都
+// 不做就断开"，而 HID 命令其实一直在发。传输层的排障线索不允许依赖日志级别。
+//
+// 迁移到统一实现后：仍然不受级别控制、仍然只落盘，但会遵循 ORBMDK_LOG_FILE，
+// 并带上时间戳与进程/线程号（原来是手写的 "[ORBMDK][INFO][HID]" 前缀）。
 // ---------------------------------------------------------------------------
-static void HidTrace(const char* fmt, ...)
-{
-    char path[MAX_PATH] = {0};
-    const DWORD n = GetTempPathA((DWORD)sizeof(path), path);
-    if (n == 0 || n >= sizeof(path)) {
-        return;
-    }
-    strncat_s(path, sizeof(path), "ORBMDK_RDDI.log", _TRUNCATE);
-
-    char msg[512] = {0};
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, args);
-    va_end(args);
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") != 0 || !f) {
-        return;
-    }
-    fprintf(f, "[ORBMDK][INFO][HID] %s\n", msg);
-    fclose(f);
-}
+#define HidTrace(...) ORBMDK_LOG_TRACE(__VA_ARGS__)
 
 // ============================================================================
 // Constants

@@ -12,6 +12,7 @@
 #include "ORBMDK_USB_Bulk.h"
 #include "ORBMDK_ITM_Decoder.h"
 #include "ORBMDK_Trace.h"
+#include "ORBMDK_Log.h"
 
 using namespace ORBMDK;
 
@@ -23,192 +24,30 @@ using namespace ORBMDK;
 #include <cstring>
 
 // ============================================================================
-// 日志模块 - 使用 OutputDebugString + DebugView
+// 日志
+//
+// ★ 2026-09-30：改为统一实现（src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）。
+//   本文件只定义模块名和一组薄宏，**全部既有调用点保持不变**；
+//   原来的 ORBMDK_LogLevel / ORBMDK_LogWriteFile / ORBMDK_Log 已删除
+//   —— 它们与 ORBMDK_HID.cpp 的 HID_Log 是两套逻辑重复的实现（§8.2）。
+//
+// 排障开关（对所有模块一致，免重启、免命令行）：
+//   %TEMP%\ORBMDK_LOG_LEVEL   0=DEBUG 1=INFO 2=WARN 3=ERROR（最多 1 秒生效）
+//   环境变量 ORBMDK_LOG_LEVEL / ORBMDK_LOG_FILE（进程启动读一次，文件优先）
 // ============================================================================
+#define ORBMDK_LOG_MODULE "RDDI"
 
-// 日志级别
-enum LogLevel {
-    LOG_LEVEL_DEBUG = 0,
-    LOG_LEVEL_INFO  = 1,
-    LOG_LEVEL_WARN  = 2,
-    LOG_LEVEL_ERROR = 3,
-};
 
-// 日志输出开关
-static bool g_logEnabled = true;
 
-// 日志级别名称
-static const char* g_logLevelNames[] = { "DEBUG", "INFO", "WARN", "ERROR" };
-
-// 当前日志级别阈值
+// 日志宏：既有调用点（LOG_DEBUG/INFO/WARN/ERROR，全项目数百处）保持不变，
+// 只是转发到统一实现（src/ORBMDK_Log.cpp）。模块名 "RDDI" 由 ORBMDK_LOG_MODULE 提供。
 //
-// 默认 ERROR：本 DLL 由 Keil/AGDI 加载，INFO/DEBUG 级日志（每次寄存器读写、
-// 每次连接步骤）在生产使用中只会产生噪声，默认全部过滤。
-//
-// 排障时打开详细日志，**不需要开命令行、也不需要重启 µVision**：
-//
-//     在 %TEMP% 下建一个纯文本文件 ORBMDK_LOG_LEVEL，内容只写一个数字：
-//
-//         0 = DEBUG   1 = INFO   2 = WARN   3 = ERROR
-//
-//     运行中的 µVision 最多 1 秒后自动生效；**删掉该文件即恢复默认(ERROR)**，
-//     同样不用重启。级别 0 时单次调试可达数百行，用完记得删。
-//
-// 环境变量 ORBMDK_LOG_LEVEL 仍然支持（文件名优先），但它只在进程启动时
-// 读一次，改了要重启 µVision —— 所以推荐用上面的文件方式。
-static int ORBMDK_LogLevel(void)
-{
-    static int cachedLevel = LOG_LEVEL_ERROR;
-    static ULONGLONG lastCheck = 0;
-
-    // 每条日志都查文件太贵，1 秒最多查一次；因此改动最多延迟 1 秒生效。
-    const ULONGLONG now = GetTickCount64();
-    if (now - lastCheck < 1000) {
-        return cachedLevel;
-    }
-    lastCheck = now;
-
-    // 1) %TEMP%\ORBMDK_LOG_LEVEL（可热更新，优先）
-    char tmp[MAX_PATH] = {0};
-    if (GetTempPathA(MAX_PATH, tmp) > 0 && tmp[0] != '\0') {
-        char path[MAX_PATH] = {0};
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%sORBMDK_LOG_LEVEL", tmp);
-
-        FILE* f = nullptr;
-        if (fopen_s(&f, path, "r") == 0) {
-            int lvl = -1;
-            const bool ok = (fscanf_s(f, "%d", &lvl) == 1) &&
-                            lvl >= LOG_LEVEL_DEBUG && lvl <= LOG_LEVEL_ERROR;
-            fclose(f);
-            cachedLevel = ok ? lvl : LOG_LEVEL_ERROR;
-            return cachedLevel;
-        }
-    }
-
-    // 2) 环境变量（启动时固定）
-    const char* env = getenv("ORBMDK_LOG_LEVEL");
-    if (env && *env) {
-        const int lvl = atoi(env);
-        if (lvl >= LOG_LEVEL_DEBUG && lvl <= LOG_LEVEL_ERROR) {
-            cachedLevel = lvl;
-            return cachedLevel;
-        }
-    }
-
-    cachedLevel = LOG_LEVEL_ERROR;  // 默认: 仅输出 ERROR
-    return cachedLevel;
-}
-
-// ---------------------------------------------------------------------------
-// 文件日志（临时诊断用）
-//
-// µVision 这类 GUI 进程的 printf / OutputDebugString 默认看不到，因此把
-// INFO 及以上的日志追加写入文件。路径可用环境变量 ORBMDK_LOG_FILE 覆盖，
-// 未设置时写到 %TEMP%\ORBMDK_RDDI.log。
-//
-// 每次写入后立即关闭文件：否则进程会一直持有句柄，诊断时外部无法读取
-// （实测 UV4.exe 会独占该文件）。
-// 只记录 INFO 及以上，避免每次寄存器访问都落盘导致文件爆炸。
-// ---------------------------------------------------------------------------
-static void ORBMDK_LogWriteFile(const char* line)
-{
-    char path[MAX_PATH] = {0};
-    const char* env = getenv("ORBMDK_LOG_FILE");
-    if (env && *env) {
-        strncpy_s(path, sizeof(path), env, _TRUNCATE);
-    } else {
-        char tmp[MAX_PATH] = {0};
-        DWORD n = GetTempPathA(MAX_PATH, tmp);
-        if (n == 0 || n >= MAX_PATH) {
-            return;
-        }
-        _snprintf_s(path, sizeof(path), _TRUNCATE, "%sORBMDK_RDDI.log", tmp);
-    }
-
-    // AGDI 是多线程的（对话框线程 + 调试线程），并发 fputs 会让行与行交错，
-    // 因此这里串行化写入。句柄仍按行开关（UV4 会独占文件，外部诊断需要能读）。
-    static std::mutex fileMutex;
-    std::lock_guard<std::mutex> lock(fileMutex);
-
-    FILE* f = nullptr;
-    if (fopen_s(&f, path, "a") != 0) {
-        return;
-    }
-    fputs(line, f);
-    fputc('\n', f);
-    fclose(f);
-}
-
-// 内部日志函数
-static void ORBMDK_Log(LogLevel level, const char* module, const char* fmt, ...) {
-    // 文件与调试器输出共用同一阈值。
-    // 历史问题：文件日志曾写死 `level >= LOG_LEVEL_INFO`，完全绕过 ORBMDK_LogLevel()，
-    // 默认阈值明明是 ERROR，例行流程的 INFO 仍会全部落盘 —— 实测一次调试产生 230+ 行，
-    // 其中 224 行是噪声（RDDI_Open / CMSIS_DAP_Detect / ConfigureInterface 各约 50 次）。
-    const bool enabled = (g_logEnabled && level >= ORBMDK_LogLevel());
-
-    if (!enabled) {
-        return;  // 被过滤时不构造字符串，避免无谓开销
-    }
-
-    // 时间戳 + 进程/线程 ID：日志跨进程追加（每次 Keil 会话一个新进程），
-    // 且 AGDI 多线程调用。没有这两项时，多次运行混在一起会出现
-    // "RDDI_Open 返回的 handle 全是 1" 这类现象，极易误判为句柄泄漏。
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    char buffer[1024];
-    int offset = snprintf(buffer, sizeof(buffer),
-                          "[ORBMDK][%02u:%02u:%02u.%03u][%s][%s][%lu:%lu] ",
-                          st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                          g_logLevelNames[level], module ? module : "-",
-                          (unsigned long)GetCurrentProcessId(),
-                          (unsigned long)GetCurrentThreadId());
-    if (offset < 0) {
-        return;
-    }
-    if (offset >= (int)sizeof(buffer)) {
-        offset = (int)sizeof(buffer) - 1;
-    }
-
-    // 添加用户消息
-    if (fmt && offset < (int)sizeof(buffer) - 1) {
-        va_list args;
-        va_start(args, fmt);
-        const int n = vsnprintf(buffer + offset, sizeof(buffer) - offset, fmt, args);
-        va_end(args);
-        if (n < 0) {
-            buffer[offset] = '\0';
-        } else if (offset + n >= (int)sizeof(buffer) - 1) {
-            // 明确标记截断：静默截断会让日志"看起来完整"却少了后半段
-            const int tail = (int)sizeof(buffer) - 5;
-            if (tail > offset) {
-                memcpy(buffer + tail, "...\0", 4);
-            }
-        }
-    }
-
-    ORBMDK_LogWriteFile(buffer);
-
-    printf("%s\n", buffer);
-    OutputDebugStringA(buffer);
-}
-
-// 日志宏
-#define LOG_DEBUG(fmt, ...) ORBMDK_Log(LOG_LEVEL_DEBUG, "RDDI", fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  ORBMDK_Log(LOG_LEVEL_INFO,  "RDDI", fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  ORBMDK_Log(LOG_LEVEL_WARN,  "RDDI", fmt, ##__VA_ARGS__)
-#define LOG_ERROR(fmt, ...) ORBMDK_Log(LOG_LEVEL_ERROR, "RDDI", fmt, ##__VA_ARGS__)
-
-// 模块级日志宏 (可在其他模块使用)
-#define LOG_HID_DEBUG(fmt, ...)   ORBMDK_Log(LOG_LEVEL_DEBUG, "HID", fmt, ##__VA_ARGS__)
-#define LOG_HID_INFO(fmt, ...)    ORBMDK_Log(LOG_LEVEL_INFO,  "HID", fmt, ##__VA_ARGS__)
-#define LOG_HID_ERROR(fmt, ...)   ORBMDK_Log(LOG_LEVEL_ERROR, "HID", fmt, ##__VA_ARGS__)
-#define LOG_BULK_DEBUG(fmt, ...)  ORBMDK_Log(LOG_LEVEL_DEBUG, "BULK", fmt, ##__VA_ARGS__)
-#define LOG_BULK_INFO(fmt, ...)   ORBMDK_Log(LOG_LEVEL_INFO,  "BULK", fmt, ##__VA_ARGS__)
-#define LOG_BULK_ERROR(fmt, ...)  ORBMDK_Log(LOG_LEVEL_ERROR, "BULK", fmt, ##__VA_ARGS__)
-#define LOG_TRACE_DEBUG(fmt, ...) ORBMDK_Log(LOG_LEVEL_DEBUG, "TRACE", fmt, ##__VA_ARGS__)
-#define LOG_TRACE_INFO(fmt, ...) ORBMDK_Log(LOG_LEVEL_INFO,  "TRACE", fmt, ##__VA_ARGS__)
+// 旧的"模块级宏"（LOG_HID_* / LOG_BULK_* / LOG_TRACE_*）是死代码 ——
+// 它们写在本 .cpp 里，别的编译单元看不到（§8.2(2)），已按 §8.3 迁移第 4 步删除。
+#define LOG_DEBUG(...) ORBMDK_LOG_DEBUG(__VA_ARGS__)
+#define LOG_INFO(...)  ORBMDK_LOG_INFO(__VA_ARGS__)
+#define LOG_WARN(...)  ORBMDK_LOG_WARN(__VA_ARGS__)
+#define LOG_ERROR(...) ORBMDK_LOG_ERROR(__VA_ARGS__)
 
 // ============================================================================
 // Constants
@@ -555,8 +394,37 @@ static void EnsureBlockTransferProbed(RDDIContext* ctx, int dapId)
 // RDDI Core Functions
 // ============================================================================
 
+// 进程级递增的"第几次打开"计数器。
+//
+// 不能用普通 static：**AGDI 在两次 rddi_Open 之间会卸载并重新加载本 DLL**
+// （实测日志里重载后全局状态归零），static 每次都从 1 开始 —— 于是日志里
+// 满屏"会话 #1"，分隔标记就失去了区分能力（2026-09-30 实测）。
+// 命名共享内存（Local\ 作用域 = 当前会话）能跨重载保留，DLL 卸载后视图仍在
+// 进程里存活，所以重载后重新映射拿到的还是同一个计数器。
+static unsigned _nextOpenSeq(void)
+{
+    static volatile LONG* slot = nullptr;
+
+    if (!slot) {
+        HANDLE map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                                        0, sizeof(LONG), "Local\\ORBMDK_OpenSeq");
+        if (map) {
+            void* view = MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LONG));
+            if (view) {
+                slot = (volatile LONG*)view;
+            }
+        }
+    }
+    return slot ? (unsigned)InterlockedIncrement(slot) : 1u;
+}
+
 RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
 {
+    // 会话分隔标记：日志是**跨进程、跨会话追加**的（每次 Keil 会话一个新 UV4 进程，
+    // 同一进程里 AGDI 又会反复 Open 约 7 次）。没有醒目分隔行时，排查要靠时间戳
+    // 反推"这一段属于哪次会话" —— 实测非常费时。用 INFO 级，正常排障就能看到。
+    LOG_INFO("================ 会话 #%u 开始 (pid=%lu) ================",
+             _nextOpenSeq(), (unsigned long)GetCurrentProcessId());
     LOG_DEBUG("RDDI_Open called, pDetails=%p", pDetails);
 
     if (!pHandle) {
@@ -1564,6 +1432,18 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
 
         if (keyStr == "Port") {
             ctx->isSWD = (valueStr == "SW");
+            if (!ctx->isSWD) {
+                // ⚠️ 本层**尚未实现 JTAG**（见 COMPAT_ANALYSIS §18.9）：连接路径
+                // （DAP_ConnectTarget 恒按 SWD）、链路恢复序列、能力位
+                // （CMSIS_DAP_Capabilities 无 JTAG 位）、JTAG_GetIRLengths（桩）
+                // 全都只支持 SWD。宿主一旦选 JTAG，我们仍按 SWD 建链 →
+                // 目标进不了 JTAG 模式 → Keil 报 "Cannot enter Debug Mode"。
+                // 这里显式告警：下次不用再靠翻命令级日志反推。
+                LOG_WARN("CMSIS_DAP_ConfigureInterface: Port='%s' 不受支持"
+                         "（本层仅实现 SWD，见 COMPAT_ANALYSIS §18.9）"
+                         " —— 请在 Keil 的 Debug 设置里把 Port 选回 SWD",
+                         valueStr.c_str());
+            }
         } else if (keyStr == "Clock") {
             try {
                 const unsigned long hz = std::stoul(valueStr);
@@ -3238,8 +3118,46 @@ RDDI_FUNC int StreamingTrace_SetConfigItem(const RDDIHandle handle, int item, in
 }
 
 // ============================================================================
-// RDDI 日志回调
+// RDDI 日志回调（宿主日志通道）
 // ============================================================================
+
+// 宿主回调的当前注册值。历史上 RDDI_SetLogCallback 只把回调存进 ctx、
+// **从未被调用**（§8.2(4)：Keil 的日志窗口什么都收不到）。
+// 现在把它接到统一日志的 CallbackSink 上（§8.3(6)）。
+static RDDILogCallback g_hostLogPfn      = nullptr;
+static void*           g_hostLogContext  = nullptr;
+static int             g_hostLogMaxLevel = RDDI_LOGLEVEL_TRACE;
+
+// 内部级别 → RDDI 级别（ARM rddi.h：数值越小越严重）
+static int _toRddiLevel(int internalLevel)
+{
+    switch (internalLevel) {
+        case ORBMDK_LOG_ERROR: return RDDI_LOGLEVEL_ERROR;    // 1
+        case ORBMDK_LOG_WARN:  return RDDI_LOGLEVEL_WARNING;  // 2
+        case ORBMDK_LOG_INFO:  return RDDI_LOGLEVEL_INFO;     // 3
+        default:               return RDDI_LOGLEVEL_DEBUG;    // 4
+    }
+}
+
+// CallbackSink：把一条统一日志转成宿主回调（锁外调用，见 ORBMDK_LogWrite）
+static void HostLogBridge(void* /*context*/, const char* msg, int level)
+{
+    RDDILogCallback pfn = g_hostLogPfn;
+    if (!pfn || !msg) {
+        return;
+    }
+
+    const int rddiLevel = _toRddiLevel(level);
+
+    // maxLogLevel 语义：只上报"不比自己更啰嗦"的消息（RDDI 数值 ≤ maxLogLevel）。
+    // 例如 maxLogLevel = INFO(3) 时，DEBUG(4)/TRACE(5) 级别的消息不回传。
+    if (g_hostLogMaxLevel >= RDDI_LOGLEVEL_FATAL && rddiLevel > g_hostLogMaxLevel) {
+        return;
+    }
+
+    // 注意形参顺序：ARM 是 (context, msg, logLevel)，不可写反
+    pfn(g_hostLogContext, msg, rddiLevel);
+}
 
 // ARM rddi.h: void RDDI_SetLogCallback(RDDIHandle, RDDILogCallback, void *context, int maxLogLevel)
 // 注意返回值为 void，且回调形参顺序是 (context, msg, logLevel)。
@@ -3254,6 +3172,19 @@ RDDI_FUNC void RDDI_SetLogCallback(const RDDIHandle handle, RDDILogCallback pfn,
     ctx->logCallback         = pfn;
     ctx->logCallbackContext  = context;
     ctx->logCallbackMaxLevel = maxLogLevel;
+
+    // 接通统一日志 → 宿主（AGDI/Keil 的日志窗口）。回调的生命周期由宿主保证：
+    // 本层在 RDDI_Close 时**不**清除它（AGDI 一次会话里会反复 Open/Close，
+    // 清除会让日志通道在中途断掉）；DllMain(DETACH) 时统一清空。
+    g_hostLogPfn      = pfn;
+    g_hostLogContext  = context;
+    g_hostLogMaxLevel = maxLogLevel;
+    ORBMDK_LogSetCallback(pfn ? HostLogBridge : nullptr, nullptr);
+
+    if (pfn) {
+        // 这条消息本身就会经上面的通道回到宿主，正好验证链路是否接通
+        LOG_INFO("RDDI_SetLogCallback: 宿主日志通道已接通 (maxLogLevel=%d)", maxLogLevel);
+    }
 }
 
 // ============================================================================

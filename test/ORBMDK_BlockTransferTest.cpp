@@ -63,6 +63,7 @@
 typedef int (*PFN_RDDI_Open)(RDDIHandle*, const void*);
 typedef int (*PFN_RDDI_Close)(RDDIHandle);
 typedef int (*PFN_CMSIS_DAP_ConfigureInterface)(RDDIHandle, int, char*);
+typedef int (*PFN_CMSIS_DAP_Connect)(RDDIHandle, int*);
 typedef int (*PFN_DAP_Connect)(RDDIHandle, RDDI_DAP_CONN_DETAILS*);
 typedef int (*PFN_DAP_ReadReg)(RDDIHandle, int, int, int*);
 typedef int (*PFN_DAP_WriteReg)(RDDIHandle, int, int, int);
@@ -82,6 +83,7 @@ typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
  * convention of GetRegId() in ORBMDK_RDDI.cpp. This test passes the official
  * ARM IDs.
  * -------------------------------------------------------------------------- */
+#define RID_DP_CTRLSTAT 1
 #define RID_DP_SELECT   2
 #define RID_AP_CSW      4
 #define RID_AP_TAR      5
@@ -113,6 +115,7 @@ struct Api {
     PFN_RDDI_Open                      Open;
     PFN_RDDI_Close                     Close;
     PFN_CMSIS_DAP_ConfigureInterface   ConfigureInterface;
+    PFN_CMSIS_DAP_Connect              CmsisConnect;
     PFN_DAP_Connect                    Connect;
     PFN_DAP_ReadReg                    ReadReg;
     PFN_DAP_WriteReg                   WriteReg;
@@ -134,6 +137,7 @@ static bool ApiLoad(Api* a)
     BIND(Open, RDDI_Open)
     BIND(Close, RDDI_Close)
     BIND(ConfigureInterface, CMSIS_DAP_ConfigureInterface)
+    BIND(CmsisConnect, CMSIS_DAP_Connect)
     BIND(Connect, DAP_Connect)
     BIND(ReadReg, DAP_ReadReg)
     BIND(WriteReg, DAP_WriteReg)
@@ -297,13 +301,57 @@ static double RunRound(const char* tag, bool blockMode, uint32_t addr,
     const int cst = a.ConfigureInterface(h, 0, cfg);
     printf("  ConfigureInterface -> %d\n", cst);
 
+    /* 顺序必须按 ARM rddi_dap.h 的规范：
+     *     ConfigureInterface -> DAP_Connect -> CMSIS_DAP_Connect
+     *   * 低层 DAP_Connect **不做** SWJ/SWD 切换（只连调试单元）；
+     *   * 本驱动按 §4.4 的设计把"链路收尾（SWJ 切换 + 复位 + DPIDR 读 + ABORT）"
+     *     放在 CMSIS_DAP_Connect 里 —— 这也是 Keil 实际走的入口；
+     *   * 反过来先 CMSIS_DAP_Connect 再 DAP_Connect 会把已建立好的 SWD 链路弄断
+     *     （2026-09-30 实测：随后第一条 AP 访问就是 NO_ACK / target not responding）。 */
     RDDI_DAP_CONN_DETAILS cd;
     memset(&cd, 0, sizeof(cd));
     const int conn = a.Connect(h, &cd);
     printf("  DAP_Connect -> %d  implementor='%s'\n", conn, cd.implementorName);
 
+    int mode = 0;
+    const int cconn = a.CmsisConnect(h, &mode);
+    printf("  CMSIS_DAP_Connect -> %d (mode=%d)\n", cconn, mode);
+
+    /* SWD 必须先给 DP/AP 上电（Cortex-M 标准步骤）：写 CTRLSTAT 的
+     * CDBGPWRUPREQ|CSYSPWRUPREQ(0x50000000)，等 READOK + CDBGPWRUPACK。
+     * 缺这一步时 AP 访问必然 FAULT —— 实测表现就是 "CSW read failed" 外加
+     * "SWD link recovery failed: target still not responding"（2026-09-30）。 */
+    int ctrl = 0;
+    a.WriteReg(h, 0, RID_DP_CTRLSTAT, (int)0x50000000);
+    for (int i = 0; i < 50; ++i) {
+        if (a.ReadReg(h, 0, RID_DP_CTRLSTAT | REG_RNW, &ctrl) == RDDI_SUCCESS &&
+            (ctrl & 0xA0000000) == 0xA0000000) {
+            break;
+        }
+        Sleep(10);
+    }
+    const bool powered = ((ctrl & 0xA0000000) == 0xA0000000);
+    printf("  DP CTRLSTAT -> 0x%08X %s\n", (unsigned)ctrl,
+           powered ? "[powered up]" : "[NO POWER]");
+
+    /* 关键：先把核**停下**再做 RAM 读写测试。
+     * 目标在运行时，它自己的程序会用 0x20000000 附近的 RAM（实测读回的是
+     * 0x0100xxxx 这类运行期数据，与写入值不符）—— 那是测试环境问题，不是
+     * 块传输的问题。停核后 RAM 内容稳定，才能判断"写入值是否原样读回"。
+     *     DHCSR(0xE000EDF0) = DBGKEY(0xA05F<<16) | C_DEBUGEN | C_HALT */
+    if (powered) {
+        PrepareAP(a, h, addr, false);
+        a.WriteReg(h, 0, RID_AP_TAR, (int)0xE000EDF0);
+        a.WriteReg(h, 0, RID_AP_DRW, (int)0xA05F0003);   /* halt */
+        Sleep(20);
+        int dhcsr = 0;
+        a.ReadReg(h, 0, RID_AP_DRW | REG_RNW, &dhcsr);
+        printf("  DHCSR -> 0x%08X %s\n", (unsigned)dhcsr,
+               (dhcsr & 0x00020000) ? "[halted]" : "[NOT halted]");
+    }
+
     double total = 0.0;
-    bool ok = (cst == RDDI_SUCCESS && conn == RDDI_SUCCESS);
+    bool ok = (cst == RDDI_SUCCESS && cconn == RDDI_SUCCESS && conn == RDDI_SUCCESS && powered);
 
     if (ok) {
         for (int i = 0; i < nSizes; i++) {

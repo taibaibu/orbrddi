@@ -247,15 +247,22 @@ DAP_SWJ_Sequence(56, {0xFF×7}) → (16, {0x9E,0xE7}) → (56, {0xFF×7}) → (8
 
 ### 日志策略
 
+统一实现在 **`src/ORBMDK_Log.cpp`**（接口 `include/ORBMDK_Log.h`）—— 所有模块
+（RDDI / HID / BULK / …）共用一套，排障只看一个文件（设计见 `COMPAT_ANALYSIS.md` §8）。
+
 | 项 | 约定 |
 |----|------|
-| 默认级别 | **ERROR**（`ORBMDK_RDDI.cpp` / `ORBMDK_HID.cpp`） |
+| 默认级别 | **ERROR** |
+| 行格式 | `[ORBMDK][HH:MM:SS.mmm][级别][模块][PID:TID] 消息` |
 | 过滤时机 | 在构造日志字符串**之前**判断级别，被过滤时零开销 |
-| 临时恢复 | 环境变量 `ORBMDK_LOG_LEVEL`：`0=DEBUG 1=INFO 2=WARN 3=ERROR`，无需重新编译 |
+| 临时恢复（推荐） | 文件 **`%TEMP%\ORBMDK_LOG_LEVEL`**，内容 `0=DEBUG 1=INFO 2=WARN 3=ERROR`；µVision 运行中改**最多 1 秒生效**，删掉文件即恢复默认，**不用重启 IDE** |
+| 环境变量 | `ORBMDK_LOG_LEVEL`（0–3）、`ORBMDK_LOG_FILE`（日志路径，默认 `%TEMP%\ORBMDK_RDDI.log`）；只在进程启动读一次 |
+| 命令级日志 | V1/V2 每条 DAP 命令往返**不受级别控制**、始终落盘（排障线索不允许依赖阈值），并带时间戳 |
+| 宿主通道 | `RDDI_SetLogCallback` 已接通：日志会转发给 AGDI/Keil 的日志窗口（级别自动映射） |
 | 禁止 | 逐寄存器 / 逐次传输的 INFO 日志、响应十六进制转储 |
 
 ```bat
-set ORBMDK_LOG_LEVEL=0
+echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 ```
 
 ---
