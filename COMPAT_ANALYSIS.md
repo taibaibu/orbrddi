@@ -63,6 +63,49 @@
 
 > `ORBMDK_USB_Bulk.cpp` 中的 `ORBMDK_USB_Bulk_*` / `CMSIS_DAP_V2_*` / `ORBMDK_Bulk_*` 使用 `ORBMDK_INTERNAL`（构建 DLL 时为空宏），**不导出**，属内部接口。
 
+| 项 | 探测方式 |
+|----|----------|
+| Visual Studio | `vswhere.exe` → 回退常见安装目录（VS 2022 / 2019 / 2017） |
+| VC 工具集 | `VC\Tools\MSVC` 下版本号最大者 |
+| Windows SDK | 注册表 `KitsRoot10` → 回退 `D:\Windows Kits\10` / `C:\Program Files (x86)\Windows Kits\10`，取同时具备 `Include\<ver>` 与 `Lib\<ver>\ucrt\x86` 的最高版本 |
+
+> 当前环境实测：VS2022 Community（MSVC `14.44.35207`）+ Windows SDK `10.0.26100.0`。
+
+### 编辑器 / IntelliSense
+
+`.vscode/c_cpp_properties.json` 供 VS Code 的 C/C++ 扩展（cpptools）使用，参数与 `build.ps1` 一一对应：
+
+| 配置项 | 值 | build.ps1 |
+|--------|----|-----------|
+| `compilerPath` | `…\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\cl.exe` | `:92` 的 `Hostx86\x86`（32 位，Keil 是 32 位进程） |
+| `includePath` | `src` / `include` / MSVC `include` / SDK `ucrt,shared,um,winrt` | `:146-151` 的 `/I` |
+| `defines` | `_WINDOWS`、`_USRDLL`、`ORBMDK_EXPORTS`、`WIN32`、`_WINDLL`、`NOMINMAX`、`WIN32_LEAN_AND_MEAN`、`_CRT_SECURE_NO_WARNINGS` + `pch.h` 的 `COBJMACROS` / `INITGUID` 等 | `:143-145` + `src/pch.h` |
+| `cppStandard` | `c++17` | `:142` 的 `/std:c++17` |
+| `intelliSenseMode` | `windows-msvc-x86` | 由 `compilerPath` 推导 |
+
+> ⚠️ **`compilerPath` 必须显式写**。省略时 cpptools 会去系统 `PATH` 自动探测一个编译器；若 `PATH` 上存在交叉工具链
+> （如 MounRiver 的 `arm-none-eabi-gcc.exe`），会被它选中并把模式改成 **`windows-gcc-arm`**，于是 `"pch.h"`、
+> `<Windows.h>` 全部解析失败（C/C++ 输出窗口会打印"IntelliSenseMode 已根据编译器参数和查询 compilerPath 从
+> windows-msvc-x86 更改为 windows-gcc-arm"）。本项目是 Windows x86 DLL，与 ARM GCC 无关。
+>
+> VS 大版本升级或换盘符后需同步这一行 —— **只影响 IntelliSense**，`build.ps1` 始终自己探测工具链，互不依赖。
+
+### ⚠️ 必须用 `/MT`（静态链接 CRT），不要改回 `/MD`
+
+Keil 的 `ARM\ARMCLANG\bin\` 下自带一个**旧的** `MSVCP140.dll`（14.29），而 UV4 加载的是它。
+MSVC 运行时**只保证向前兼容**：用 VS2022(14.4x) 编译的模块跑在 14.29 上是不受支持的组合，
+会直接崩在 `MSVCP140.dll`（`0xc0000005`）。
+
+`/MT` 让本 DLL 不再依赖 `MSVCP140` / `VCRUNTIME140` / UCRT：
+
+```
+Dependents: KERNEL32 / SETUPAPI / WINUSB / HID / SHLWAPI
+```
+
+RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指针），静态 CRT 是安全的。
+详细分析见 [COMPAT_ANALYSIS.md 第十二节](COMPAT_ANALYSIS.md)。
+
+
 ---
 
 ## 二、AGDI 层调用的 RDDI 函数清单

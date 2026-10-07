@@ -1,12 +1,6 @@
 # ORBMDK - ORBTrace CMSIS-DAP RDDI 驱动层
 
-> **版本 `0.5.0`**（2026-10-03）· 驱动自身发版号，定义于 `include/ORBMDK.h`（`ORBMDK_VERSION_STRING`），
-> 经 `ORBMDK_GetVersionString()` / `ORBMDK_GetVersion()` 暴露。
-> ⚠️ **与上报给 Keil 的协议版本串是两回事**：后者 = 设备 `DAP_Info(0x04)`，主版本经归一化**抬到 ≥ 2**
-> （2026-10-01 放开 SWO 流式门控，见"USB 传输实现 → WinUSB Bulk 模式"与 `COMPAT_ANALYSIS.md` §17.5），
-> **不要**与本版本号联动。发版历史见文末[版本记录](#版本记录)。
-
-ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，使 ORBTrace 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
+ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，兼容 CMSIS—DAP 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
 
 ## 架构
 
@@ -95,7 +89,7 @@ ORBMDK/
 │   └── c_cpp_properties.json   # IntelliSense 配置（参数与 build.ps1 一致）
 ├── build.ps1                    # PowerShell 构建 / 部署脚本
 ├── README.md                    # 本文档
-├── COMPAT_ANALYSIS.md           # AGDI 逆向分析 · ABI 兼容性结论 · 实现状态
+├── COMPAT_ANALYSIS.md           # ABI 兼容性结论 · 实现状态
 ├── bug.md                       # 实现细节 · 缺陷定性 · 排查笔记（JTAG 相关见 B9 / B11.8）
 ├── Todo.md                      # 未完成项（只列待办，不写实现细节）
 ├── PATCH_orbtrace-1.4.3_JTAG_fixes.txt  # 固件侧 JTAG 可选修复补丁（基于 orbtrace 1.4.3，含完整代码）
@@ -108,14 +102,11 @@ ORBMDK/
 | 文档 | 收什么 | 什么时候看 |
 |------|--------|------------|
 | `README.md` | 构建 / 安装 / 验证 / 不可破坏的实现约束 | 上手、改代码前 |
-| `COMPAT_ANALYSIS.md` | AGDI 逆向分析、ABI 兼容性结论、历史现场记录 | 需要"为什么这么写"的依据 |
+| `COMPAT_ANALYSIS.md` | ABI 兼容性结论、历史现场记录 | 需要"为什么这么写"的依据 |
 | `bug.md` | 实现细节、缺陷定性、排查笔记（JTAG 相关见 B9 / B11.8） | 复现某现象、查根因 |
 | `Todo.md` | **只有未完成项** | 想知道还差什么 |
 | `Usage.md.bak` | 驱动的 API 使用手册（快速开始 + 各导出函数调用示例） | 想集成、或直接调本层 DLL 时 |
 | `PATCH_orbtrace-1.4.3_JTAG_fixes.txt` | 探针固件（orbtrace 门级 Verilog + Amaranth）侧的可选改动 | 想让固件侧 JTAG 通路更完备时 |
-
-> 约定（勿混）：AGDI 逆向与 ABI 结论只进 `COMPAT_ANALYSIS.md`；实现细节与排查过程只进 `bug.md`；
-> `Todo.md` 只列未完成项。固件补丁因为是**另一个仓库**的改动，单独成文件，不写进上面三份。
 
 ## 构建
 
@@ -129,48 +120,6 @@ ORBMDK/
 
 构建脚本会自动探测工具链，无需手改路径：
 
-| 项 | 探测方式 |
-|----|----------|
-| Visual Studio | `vswhere.exe` → 回退常见安装目录（VS 2022 / 2019 / 2017） |
-| VC 工具集 | `VC\Tools\MSVC` 下版本号最大者 |
-| Windows SDK | 注册表 `KitsRoot10` → 回退 `D:\Windows Kits\10` / `C:\Program Files (x86)\Windows Kits\10`，取同时具备 `Include\<ver>` 与 `Lib\<ver>\ucrt\x86` 的最高版本 |
-
-> 当前环境实测：VS2022 Community（MSVC `14.44.35207`）+ Windows SDK `10.0.26100.0`。
-
-### 编辑器 / IntelliSense
-
-`.vscode/c_cpp_properties.json` 供 VS Code 的 C/C++ 扩展（cpptools）使用，参数与 `build.ps1` 一一对应：
-
-| 配置项 | 值 | build.ps1 |
-|--------|----|-----------|
-| `compilerPath` | `…\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\cl.exe` | `:92` 的 `Hostx86\x86`（32 位，Keil 是 32 位进程） |
-| `includePath` | `src` / `include` / MSVC `include` / SDK `ucrt,shared,um,winrt` | `:146-151` 的 `/I` |
-| `defines` | `_WINDOWS`、`_USRDLL`、`ORBMDK_EXPORTS`、`WIN32`、`_WINDLL`、`NOMINMAX`、`WIN32_LEAN_AND_MEAN`、`_CRT_SECURE_NO_WARNINGS` + `pch.h` 的 `COBJMACROS` / `INITGUID` 等 | `:143-145` + `src/pch.h` |
-| `cppStandard` | `c++17` | `:142` 的 `/std:c++17` |
-| `intelliSenseMode` | `windows-msvc-x86` | 由 `compilerPath` 推导 |
-
-> ⚠️ **`compilerPath` 必须显式写**。省略时 cpptools 会去系统 `PATH` 自动探测一个编译器；若 `PATH` 上存在交叉工具链
-> （如 MounRiver 的 `arm-none-eabi-gcc.exe`），会被它选中并把模式改成 **`windows-gcc-arm`**，于是 `"pch.h"`、
-> `<Windows.h>` 全部解析失败（C/C++ 输出窗口会打印"IntelliSenseMode 已根据编译器参数和查询 compilerPath 从
-> windows-msvc-x86 更改为 windows-gcc-arm"）。本项目是 Windows x86 DLL，与 ARM GCC 无关。
->
-> VS 大版本升级或换盘符后需同步这一行 —— **只影响 IntelliSense**，`build.ps1` 始终自己探测工具链，互不依赖。
-
-### ⚠️ 必须用 `/MT`（静态链接 CRT），不要改回 `/MD`
-
-Keil 的 `ARM\ARMCLANG\bin\` 下自带一个**旧的** `MSVCP140.dll`（14.29），而 UV4 加载的是它。
-MSVC 运行时**只保证向前兼容**：用 VS2022(14.4x) 编译的模块跑在 14.29 上是不受支持的组合，
-会直接崩在 `MSVCP140.dll`（`0xc0000005`）。
-
-`/MT` 让本 DLL 不再依赖 `MSVCP140` / `VCRUNTIME140` / UCRT：
-
-```
-Dependents: KERNEL32 / SETUPAPI / WINUSB / HID / SHLWAPI
-```
-
-RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指针），静态 CRT 是安全的。
-详细分析见 [COMPAT_ANALYSIS.md 第十二节](COMPAT_ANALYSIS.md)。
-
 ## 安装
 
 ```powershell
@@ -180,19 +129,14 @@ RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指�
 ```
 
 脚本会把 `bin\ORBMDK_RDDI.dll` 复制为 Keil 的 `CMSIS_DAP.dll`，并在首次覆盖前把官方原件备份为 `CMSIS_DAP.dll.bak`
-（部署逻辑已并入 `build.ps1`，原 `deploy.ps1` 已删除）。部署前请关闭 µVision —— 它会把 DLL 常驻内存。
 
 手动方式：
 
 1. 编译得到 `bin\ORBMDK_RDDI.dll`
-
-2. 配合 elaphureLinkAGDI（Keil 的 "CMSIS-DAP Debugger"）使用：
-   - 安装 [elaphureLinkAGDI](https://github.com/fly2046/elaphureLinkAGDI)
    - **将 `ORBMDK_RDDI.dll` 重命名为 `CMSIS_DAP.dll`**，放到 Keil 的 `ARM\BIN\` 目录（如 `D:\Keil_v5\ARM\BIN\`）
    - 必须是 **32 位 (x86)** 构建（`build.ps1` 已默认 x86）；Keil µVision 是 32 位进程，无法加载 64 位 DLL
-   - **覆盖前先结束整个 `UV4.exe` 进程**：µVision 会把 DLL 常驻内存，只关调试会话无效
 
-3. 在 Keil 项目中配置调试器：
+2. 在 Keil 项目中配置调试器：
    - 打开 "Project" → "Options for Target" → "Debug"
    - 选择 "ORBMDK" 或对应的 elaphureLinkAGDI 驱动
    - 配置 SWD 接口和时钟频率
@@ -657,4 +601,4 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 
 ## 许可证
 
-基于 BSD-2-Clause 许可证（参考 elaphureLink）
+基于 BSD-2-Clause 许可证
