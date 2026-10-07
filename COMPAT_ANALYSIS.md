@@ -1,7 +1,7 @@
 # ORBMDK 兼容性分析与实现状态
 
 > 分析日期：2026-09-29
-> 实机联调：2026-09-30（ORBTrace 调试器 + STM32F1 目标）
+> 实机联调：2026-09-30（ORBTrace 调试器 + STM32F4 目标）
 >
 > 本文档只保留**当前仍然有效**的结论。已过时或被后续实测推翻的内容（导出符号数量快照、"已实现/缺失函数"
 > 逐条清单、编译阻塞排查过程、逐项代码对比、各轮修改文件清单、未落地的方案设计稿，以及已被更正的错误结论
@@ -15,6 +15,7 @@
 |----|------|
 | 编译 | ✅ `build.ps1` 全量编译通过，**无 error、无 warning** |
 | 运行库 | ✅ **静态 CRT（`/MT`）**，产物不依赖 `MSVCP140`/`VCRUNTIME140`/UCRT（原因见第十二节） |
+| 编译器依赖 | ⚠️ **与 MSVC / UCRT 强绑定**（Annex K 安全 CRT、`#pragma comment(lib)`）：`clang-cl` 理论可行，MinGW-w64 GCC 与 VS2013 及更早不支持 —— 静态审查见 **§19** |
 | 输出 | `bin/ORBMDK_RDDI.dll` |
 | 导出符号 | `ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **78 个** |
 | 实机验证 | ⚠️ `ORBMDK_RDDI_FullTest.exe` 原 **40/40 全部通过**；后因测试自身 `DAP_REG_*` 常量陈旧（§13.5）变为 `PASSED 22 / FAILED 20` → 修复项见 **`Todo.md` §18.11** |
@@ -712,7 +713,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 **其它**：AGDI 从不调用 `signal_avail`（DLL 内无该串），故 `"sys_reset;sys_power"`
 与官方 `"sys_reset;run_led;"` 的差异对 Keil 无影响。
 
-**验证**：待实机 —— 关 µVision → `deploy.ps1` → Reset 方式选 HW RESET；同时看日志里的
+**验证**：待实机 —— 关 µVision → `build.ps1 -DeployOnly` → Reset 方式选 HW RESET；同时看日志里的
 `pins=0x..` 回读（若恒为 `0xFF`，说明固件并未真正驱动 nRESET）。
 
 ---
@@ -743,8 +744,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 | `src/ORBMDK_ETM_Decoder.cpp` | ETM 解码器 |
 | `src/ORBMDK_TPIU_Decoder.cpp` | TPIU 解码器 |
 | `src/ORBMDK_COBS.cpp` | COBS 解码 |
-| `build.ps1` | 编译脚本（自动探测 VS2017+/MSVC/SDK，固定 **x86**，Keil 为 32 位进程，必须 x86） |
-| `deploy.ps1` | 部署脚本（复制 `bin\ORBMDK_RDDI.dll` 覆盖 Keil 的 `CMSIS_DAP.dll`，自动定位 `ARM\BIN` 并备份原件） |
+| `build.ps1` | 编译脚本（自动探测 VS2017+/MSVC/SDK，固定 **x86**，Keil 为 32 位进程，必须 x86）；`-Deploy` / `-DeployOnly` 兼做部署（复制 `bin\ORBMDK_RDDI.dll` 覆盖 Keil 的 `CMSIS_DAP.dll`，自动定位 `ARM\BIN` 并备份原件），原 `deploy.ps1` 已并入 |
 | `test/build_test.ps1` | 测试构建脚本（同为 x86） |
 | `test/ORBMDK_RDDI_FullTest.cpp` | 实机功能测试（40 项） |
 | `tools/pe_re.py` | 逆向分析工具（exports / imports / names / dis / xref / slots 六个子命令），用法与结论见 §十 |
@@ -818,7 +818,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 | Windows SDK | `D:\Windows Kits\10\...\10.0.17763.0` | **`D:\Windows Kits\10\...\10.0.26100.0`** |
 
 - 受影响的文件：`build.ps1`、`test/build_test.ps1`、`deploy.ps1`、`test/*.cpp`（DLL 路径）、`src/ORBMDK_Symbols.cpp`。
-- `deploy.ps1` 的目标路径已改为 `D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll`，并支持 `-KeilArmBin` 显式指定与多候选自动探测。
+- 部署脚本的目标路径已改为 `D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll`，并支持 `-KeilArmBin` 显式指定与多候选自动探测（该脚本 2026-10-02 已并入 `build.ps1` 的 `-Deploy`）。
 
 ---
 
@@ -1826,12 +1826,12 @@ loop:
 | 接口序号 | 传输 | `CMSIS_DAP_Identify(idNo=2)` 返回 |
 |----------|------|-----------------------------------|
 | `ifNo=0` | CMSIS-DAP v2 (USB Bulk) | `CMSIS-DAP v2`（Bulk 接口字符串描述符） |
-| `ifNo=1` | CMSIS-DAP v1 (HID) | `CMSIS-DAP v1` |
+| `ifNo=1` | CMSIS-DAP v1 (HID) | `CMSIS-DAP v1`；总线上无 v1 候选时 `CMSIS-DAP v1 (未检测到)`（见 Todo 续 7） |
 
 | 函数 | 改动 |
 |------|------|
 | `CMSIS_DAP_Detect` | 由 `1` 改为 `kTransportInterfaceCount = 2`（**绝不返回 0**，否则 AGDI 直接 EU02） |
-| `CMSIS_DAP_Identify` | `idNo=2` 按 `ifNo` 返回不同名字（`ORBMDK_USB_Bulk_GetInterfaceName`）；序列号两个接口相同（同一物理设备） |
+| `CMSIS_DAP_Identify` | `idNo=2` 按 `ifNo` 返回不同名字（`ORBMDK_USB_Bulk_GetInterfaceName`）；序列号两个接口相同（同一物理设备），但 `ifNo=1` 且无 v1 候选时回 `Unknown`（不给幽灵 v1 背书，见 Todo 续 7） |
 | `CMSIS_DAP_ConfigureInterface` | 入口按 `ifNo` 调 `ORBMDK_USB_Bulk_SelectInterface(ifNo)`，**现场切换传输层**（必须发生在 `DAP_Configure`/`Connect` 之前） |
 
 `SelectInterface` 把选择写进 `g_forcedPref`，其优先级**高于** `%TEMP%\ORBMDK_TRANSPORT`
@@ -2417,3 +2417,84 @@ DP/AP 访问由本层用 `JTAG_Sequence` 自己实现（IR=0xA/0xB + 35 位 DR +
 **教训**：对"会改变探针固件运行状态"的命令，**不能**用"先试一下、失败再退"的策略 ——
 必须先单独确认固件支持，再放开；尤其要警惕"会挂死设备、需人工插拔"这一类失败模式，
 它的代价是整条调试链路而不是一次操作。
+
+---
+
+## 十九、编译器兼容性审查（仅限 Windows，2026-10-03）
+
+> **审查方式**：**纯静态审查** —— 未改动任何源码，也未引入第二编译器做实测编译。
+> **范围限定 Windows**：考察对象 = MSVC `cl.exe`（现状）、`clang-cl`、MinGW-w64 GCC、MSVC 旧版本。
+> 本节只回答"代码对编译器/编译开关的依赖面"，不涉及运行时行为与逻辑缺陷。
+
+### 19.1 结论
+
+| 编译器 | 结论 | 主要障碍 |
+|--------|------|----------|
+| MSVC `cl.exe` 2017+（x86） | ✅ 唯一受支持组合（现状） | — |
+| `clang-cl` | ⚠️ 理论可行（同样用 MSVC CRT / SDK / `__declspec`），**未实测** | §19.2 C3 / C4 |
+| MSVC ≤ VS2013 | ❌ | §19.3 V1–V3（`snprintf` / `%zu` / `%llu` 需 UCRT） |
+| MinGW-w64 GCC | ❌ | §19.2 C1 / C2 / C4 |
+| 其它平台编译器 | ❌（超出本文范围） | `__declspec`、`<Windows.h>` 等 |
+
+一句话：**本层与 MSVC / UCRT 强绑定**（Annex K 安全 CRT + `#pragma comment(lib)`）。这在"只跑 Keil、只用 `build.ps1`"的前提下不是缺陷；换编译器时的改造点见 §19.7。
+
+### 19.2 MSVC 锁定项（换 Windows 编译器即编译失败）
+
+| # | 级别 | 位置 | 内容 | 影响 |
+|---|------|------|------|------|
+| C1 | 🔴 | `include/ORBMDK.h:14-17, 75, 77, 84` | **公共 C ABI 头的 `static inline` 里直接调 `sscanf_s` / `strncpy_s` / `sprintf_s` / `_TRUNCATE`** | 把整个项目绑死在 UCRT：非 MSVC 的 Windows 编译器一包含此头就报未声明标识符 |
+| C2 | 🟡 | 48 处：`ORBMDK_HID.cpp:561,568,734,735,742,766,2190,2197`；`ORBMDK_USB_Bulk.cpp:308,314,320,322,381,513,533,1816,1842`；`ORBMDK_RDDI.cpp:808,866,868,1960,2039,2050,2061,2065,2069,2079,2087,2089,3586,3588,3590,3608,3610`；`ORBMDK_Symbols.cpp:1100,1110`；`ORBMDK_Log.cpp:83`；`test/*` | `*_s` 安全 CRT + `_stricmp` / `_strnicmp` + `fopen_s` | MinGW-w64 不提供 Annex K → 编译失败 |
+| C3 | 🟡 | `src/pch.h:20-22` | `INITGUID` / `COBJMACROS` / `UMDF_USING_IOCTL_DEFINE_GUIDS` 全局开启 | `INITGUID` 使每个 TU 实例化 GUID，靠 MSVC `__declspec(selectany)` 去重；GCC 侧 `selectany` 语义不一致 |
+| C4 | 🟡 | `src/ORBMDK_HID.cpp:20-21`、`src/ORBMDK_USB_Bulk.cpp:24,30,36`、`src/ORBMDK_Symbols.cpp:876`、`test/{v2rawprobe,jtagrawprobe,ifacedump}.cpp` | `#pragma comment(lib, …)` ×6 | GCC 只警告"忽略"→ 需手工 `-lsetupapi -lwinusb -lhid -luuid -lshlwapi`；clang-cl 有效 |
+| C5 | 🟡 | `include/ORBMDK.h:19-20`、`include/ORBMDK_RDDI.h:17-19` | `__declspec(dllexport/dllimport)` 无 `_MSC_VER` 兜底 | Windows 各家都支持 `__declspec`，风险低；属"无条件使用扩展"的写法 |
+| C6 | 🟡 | `src/pch.h:17` | `_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS` | MSVC 专有宏，其它编译器忽略（无害） |
+
+### 19.3 工具集版本门槛（同一编译器、不同版本）
+
+| # | 位置 | 依赖 | 最低要求 |
+|---|------|------|----------|
+| V1 | `src/ORBMDK_Log.cpp:60, 174, 191` | `snprintf` / `vsnprintf`（C99） | VS2015+（VS2013 无） |
+| V2 | `src/ORBMDK_HID.cpp:270,278,279,329,360,369,444,1025,1081,1092,1106,1121,1453`、`src/ORBMDK_USB_Bulk.cpp:1334` | `%zu` | UCRT，VS2015+ |
+| V3 | `src/ORBMDK_RDDI.cpp:787,898,906,2460,2469,3464,3471,3476`、`src/ORBMDK_Coverage.cpp:648-915`、`test/` 5 个文件 | `%llu`（**均配 `(unsigned long long)` 转换，类型正确**） | VS2015+ |
+| V4 | `src/pch.h`（`<shared_mutex>`/`<thread>`/`<atomic>`）、`ORBMDK_HID.cpp:122,1924`、`ORBMDK_USB_Bulk.cpp:107,1719` | `std::shared_mutex` / `std::thread` | VS2015 Update 2+ |
+| V5 | `include/ORBMDK_ITM_Decoder.h:10-11`、`ORBMDK_ETM_Decoder.h:10-11`、`ORBMDK_TPIU_Decoder.h:10-11` | `<cstdbool>` | C++17 已弃用、**C++20 被移除**；现 `/std:c++17` 安全，改 `c++20` 需先换掉 |
+
+> 两个构建脚本都声明 VS2017+，V1–V4 全部满足。真正的风险点是 **V5**：把 `/std:c++17` 改成 `c++20` 会先在这里爆。
+
+### 19.4 构建开关依赖（不加也能编，但结果不对或刷警告）
+
+| # | 开关 | 位置 | 不加会怎样 |
+|---|------|------|-----------|
+| F1 | `/utf-8` | `build.ps1:142`、`test/build_test.ps1:146` | 源码含大量中文注释/字符串；中文代码页下 MSVC 报 **C4819** 且日志串乱码 —— 最容易被"换个 IDE / 换个脚本"弄丢的开关 |
+| F2 | `/D_CRT_SECURE_NO_WARNINGS` | 仅在 `build.ps1:145`；**源码内未定义** | `fopen`/`strcpy`/`strcat`/`sscanf`（`ORBMDK_Symbols.cpp:212,410,805,806,955`、`ORBMDK_Coverage.cpp:636,701,805`）报 C4996；若再加 `/WX` 直接失败 |
+| F3 | `/EHsc` | 两个脚本 | 异常语义不定 |
+| F4 | `/MD`（测试 exe）vs `/MT`（DLL） | `build_test.ps1:146` vs `build.ps1:142` | 当前安全（纯 C ABI、缓冲区由调用方给）；**不可跨边界传堆指针/STL 对象** |
+
+### 19.5 低危项（当前不触发，改动后才触发）
+
+- `test/*.cpp` 均直接 `#include <windows.h>`（`swdprobe:25`、`hidprobe:8`、`v2rawprobe:14`、`jtagprobe:19`、`jtagrawprobe:22`、`ifacedump:12`、`ORBMDK_RDDI_FullTest:6`、`ORBMDK_BlockTransferTest:50`），但 **test 目录 0 处 `NOMINMAX`**。当前未用 `std::min/max`，故无事；一旦引入 `<algorithm>` 就会撞 Windows 的 `min/max` 宏。
+- `src/ORBMDK_Symbols.cpp:874` 在文件中途再 `#include <windows.h>`（pch 已引过）—— 冗余但无害。
+
+### 19.6 已核对"无坑"项（可放心）
+
+- **无模板定义** → MSVC 宽松模式与 `/permissive-` 的两阶段名字查找差异**无从触发**（最大的一项好消息）。
+- **无 `__cplusplus` 数值判断**（只有 `#ifdef __cplusplus`，13 个头 ×2）→ 不依赖 `/Zc:__cplusplus`，MSVC 报 `199711L` 也无影响。
+- 无 `__int64` / `__pragma` / `for each` / `typeof` / `__attribute__` / VLA / 匿名 struct 等 MSVC/GNU 专有语法。
+- 14 个 `src/*.cpp` **全部**以 `#include "pch.h"` 开头（逐个核对）。
+- `include/*.h` 中无 STL（`std::` 命中 0 处）→ 公共头保持纯 C ABI；`ORBMDK_Log.h` 零 include 亦自洽（只用 `int` / `char*` / `void*`）。
+- 无非 const 字符串字面量赋值（4 处命中全是 `const char*`）→ `/Zc:strictStrings`、`-Wwrite-strings` 安全。
+- 无指针截断式强转（唯一 `(int)` 命中 `ORBMDK_RDDI.cpp:2636` 是显式 `(int)(intptr_t)` 用于打印）→ 将来编 x64 也不截断。
+- 无 POSIX 头（`unistd.h` / `sys/*`）与 `_open` / `_access` 系列。
+- 无 `#pragma warning(disable)` → 没有靠压制警告掩盖问题。
+
+### 19.7 若将来要支持其它 Windows 编译器
+
+改造点集中在 **C1 / C2**（约 50 处调用，可收敛到一层 `*_s` → 标准函数 + 边界检查的适配头）与 **C4**（`#pragma comment(lib)` 换成链接器参数，两个脚本本就在命令行传 lib）。V5 在切到 C++20 时需先替换 `<cstdbool>`。以上均为**结论性定位**，未实施。
+
+### 19.8 可选的进一步验证（本次未做）
+
+| 手段 | 能验证什么 | 代价 |
+|------|-----------|------|
+| 加 `/permissive-` 试编一遍（只加开关、产物丢临时目录） | 标准符合性（预期零错误，因为无模板） | 一次编译 |
+| 用 `clang-cl` 试编 | MSVC 宽松模式差异 + GNU 语法差异（Windows 下最现实的第二编译器） | 需装 LLVM |
+| 在 MinGW 下试编 | 验证 §19.2 的 C1/C2 判断 | 需装 MinGW-w64 |

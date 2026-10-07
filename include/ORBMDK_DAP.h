@@ -62,18 +62,21 @@ enum ORBMDK_DAP_Response {
 // ============================================================================
 // DAP Info IDs (for DAP_INFO command)
 // ============================================================================
+// ★ 与 CMSIS-DAP v2.1.2 规范逐条对照（DAP_Info 的请求 ID）：
+//   0x01 厂商名 / 0x02 产品名 / 0x03 序列号（字符串，Len 含结尾 \0；Len=0 时主机改用 USB 描述符）
+//   0x04 **CMSIS-DAP 协议版本**（值必须是 "2.1.0" 这类）
+//   0x05..0x08 目标器件/目标板的 厂商名与名称（只有 On-Board 探针才有串）
+//   0x09 **产品固件版本**（字符串，厂商自定义格式）
+//   0xF0 能力位(BYTE) / 0xF1 Test Domain Timer(Len=8) / 0xFB-0xFD UART-RX、UART-TX、SWO 缓冲(WORD)
+//   0xFE 最大包数(BYTE) / 0xFF 最大包长(SHORT)
+//   未识别的 ID 回 Len=0（≠ 空串 Len=1）；未实现的**命令**回 0xFF 而不是回显命令字节。
 enum ORBMDK_DAP_Info {
-    DAP_INFO_VENDOR          = 1,
-    DAP_INFO_PRODUCT         = 2,
-    DAP_INFO_SERIAL          = 3,
-    DAP_INFO_FIRMWARE        = 4,
-    DAP_INFO_CAPS            = 5,     // Capabilities
-    DAP_INFO_PACKET_COUNT    = 6,     // Max packet count
-    DAP_INFO_PACKET_SIZE     = 7,     // Max packet size
-    DAP_INFO_SWO_TRACE_BUF   = 8,     // SWO trace buffer size
-    DAP_INFO_SWO_TRACE_CNT   = 9,     // SWO trace count
-    DAP_INFO_SWO_FLUSH_CNT   = 10,    // SWO flush count
-    DAP_INFO_CAP_COUNT       = 11,    // Capability count
+    DAP_INFO_VENDOR           = 0x01,
+    DAP_INFO_PRODUCT          = 0x02,
+    DAP_INFO_SERIAL           = 0x03,
+    DAP_INFO_PROTOCOL_VERSION = 0x04, // spec：CMSIS-DAP 协议版本（"2.1.0"）
+    DAP_INFO_FW_VERSION       = 0x09, // spec：产品固件版本（厂商自定义格式）
+    DAP_INFO_CAPABILITIES     = 0xF0, // Capabilities（DAP_GetCapabilities 用这个）
 };
 
 // ============================================================================

@@ -76,6 +76,8 @@ ORBMDK/
 │   └── build_test.ps1           # 测试构建脚本（-All 重建全部）
 ├── bin/                         # 编译输出
 │   └── ORBMDK_RDDI.dll         # RDDI 驱动 DLL
+├── .vscode/
+│   └── c_cpp_properties.json   # IntelliSense 配置（参数与 build.ps1 一致）
 ├── build.ps1                    # PowerShell 构建脚本
 ├── README.md                    # 本文档
 └── COMPAT_ANALYSIS.md           # 兼容性分析与实现状态
@@ -101,6 +103,25 @@ ORBMDK/
 
 > 当前环境实测：VS2022 Community（MSVC `14.44.35207`）+ Windows SDK `10.0.26100.0`。
 
+### 编辑器 / IntelliSense
+
+`.vscode/c_cpp_properties.json` 供 VS Code 的 C/C++ 扩展（cpptools）使用，参数与 `build.ps1` 一一对应：
+
+| 配置项 | 值 | build.ps1 |
+|--------|----|-----------|
+| `compilerPath` | `…\VC\Tools\MSVC\14.44.35207\bin\Hostx86\x86\cl.exe` | `:92` 的 `Hostx86\x86`（32 位，Keil 是 32 位进程） |
+| `includePath` | `src` / `include` / MSVC `include` / SDK `ucrt,shared,um,winrt` | `:146-151` 的 `/I` |
+| `defines` | `_WINDOWS`、`_USRDLL`、`ORBMDK_EXPORTS`、`WIN32`、`_WINDLL`、`NOMINMAX`、`WIN32_LEAN_AND_MEAN`、`_CRT_SECURE_NO_WARNINGS` + `pch.h` 的 `COBJMACROS` / `INITGUID` 等 | `:143-145` + `src/pch.h` |
+| `cppStandard` | `c++17` | `:142` 的 `/std:c++17` |
+| `intelliSenseMode` | `windows-msvc-x86` | 由 `compilerPath` 推导 |
+
+> ⚠️ **`compilerPath` 必须显式写**。省略时 cpptools 会去系统 `PATH` 自动探测一个编译器；若 `PATH` 上存在交叉工具链
+> （如 MounRiver 的 `arm-none-eabi-gcc.exe`），会被它选中并把模式改成 **`windows-gcc-arm`**，于是 `"pch.h"`、
+> `<Windows.h>` 全部解析失败（C/C++ 输出窗口会打印"IntelliSenseMode 已根据编译器参数和查询 compilerPath 从
+> windows-msvc-x86 更改为 windows-gcc-arm"）。本项目是 Windows x86 DLL，与 ARM GCC 无关。
+>
+> VS 大版本升级或换盘符后需同步这一行 —— **只影响 IntelliSense**，`build.ps1` 始终自己探测工具链，互不依赖。
+
 ### ⚠️ 必须用 `/MT`（静态链接 CRT），不要改回 `/MD`
 
 Keil 的 `ARM\ARMCLANG\bin\` 下自带一个**旧的** `MSVCP140.dll`（14.29），而 UV4 加载的是它。
@@ -119,11 +140,13 @@ RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指�
 ## 安装
 
 ```powershell
-.\deploy.ps1                                  # 自动定位 Keil 的 ARM\BIN
-.\deploy.ps1 -KeilArmBin "D:\Keil_v5\ARM\BIN" # 或显式指定
+.\build.ps1 -Deploy                                  # 编译 + 一键部署（自动定位 Keil 的 ARM\BIN）
+.\build.ps1 -DeployOnly                              # 只部署，不编译
+.\build.ps1 -Deploy -KeilArmBin "D:\Keil_v5\ARM\BIN" # 或显式指定 Keil 的 ARM\BIN
 ```
 
-脚本会把 `bin\ORBMDK_RDDI.dll` 复制为 Keil 的 `CMSIS_DAP.dll`，并在首次覆盖前把官方原件备份为 `CMSIS_DAP.dll.bak`。
+脚本会把 `bin\ORBMDK_RDDI.dll` 复制为 Keil 的 `CMSIS_DAP.dll`，并在首次覆盖前把官方原件备份为 `CMSIS_DAP.dll.bak`
+（部署逻辑已并入 `build.ps1`，原 `deploy.ps1` 已删除）。部署前请关闭 µVision —— 它会把 DLL 常驻内存。
 
 手动方式：
 

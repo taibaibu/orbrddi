@@ -144,6 +144,11 @@ enum ORBMDK_DAPV2_Event {
 
 // ============================================================================
 // DAP V2 Info IDs
+//
+// ⚠️ 下面这套编号**与 CMSIS-DAP 规范的 DAP_Info ID 完全不对齐**（同样例：规范里
+//    0x03 是序列号、0x04 是协议版本、0x09 才是产品固件版本），**不要**拿它当命令参数
+//    发给设备。发 DAP_Info 一律用 ORBMDK_DAP.h 的 `DAP_INFO_*`（绕行写法见
+//    src/ORBMDK_USB_Bulk.cpp 的 CMSIS_DAP_V2_GetInfo）。这里只定义本层 API 的参数编号。
 // ============================================================================
 enum ORBMDK_DAPV2_Info {
     DAPV2_INFO_PRODUCT_NAME      = 0x01U,  // Product name string

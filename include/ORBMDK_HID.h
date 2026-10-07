@@ -21,6 +21,16 @@ int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen, char* serial, siz
 int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen, uint8_t* resp, size_t* respLen, int timeoutMs);
 
 // ---------------------------------------------------------------------------
+// DAP 命令超时（毫秒）—— ORBMDK_HID_DAPCommand / ORBMDK_USB_Bulk_DAPCommand
+// 调用点的**唯一来源**，不要在调用点直写字面量（历史上散落 30+ 处，改一处漏一处）。
+// ⚠ 熔断判据隐含依赖"普通命令 ~1 s 超时"（kDapTripAfter / kDapHalfOpenMs，见
+//   ORBMDK_HID.cpp），调这三个值时要连带复核熔断参数。
+// ---------------------------------------------------------------------------
+#define ORBMDK_TIMEOUT_CMD_MS    1000  // 普通 DAP 命令
+#define ORBMDK_TIMEOUT_RESET_MS  5000  // 目标复位、大块传输（DAP_ResetTarget / DAP_TransferBlock）
+#define ORBMDK_TIMEOUT_SHORT_MS   100  // 短命令：TransferAbort、SWO 轮询、SWD/JTAG 序列、标定探测
+
+// ---------------------------------------------------------------------------
 // HID 命令返回值（V1 路径）
 //
 // 问题：写失败曾被一律并入超时码 -3，于是"报告长度不匹配被驱动当场拒收
@@ -37,16 +47,34 @@ enum {
     HID_RC_WRITE_FAILED   = -6,   // 写立即失败（含报告长度不匹配 err=87）
     HID_RC_EMPTY_RESPONSE = -7,   // 读到 0 字节
     HID_RC_BAD_RESPONSE   = -8,   // 读到 3 个报告都不是本命令的响应（布局/配对异常）
+    HID_RC_NOT_IMPLEMENTED = -9,  // 设备明确回 0xFF = "该命令未实现"（规范约定，见
+                                  // ORBMDK_DAP.h 那条）。**协议层失败**：不是超时、
+                                  // 不参与熔断、也不该被当成"响应错乱"去丢包重读
 };
 
 // 当前 HID 设备的单条命令最大负载字节数（来自 HidP_GetCaps；0 = 未打开）
 size_t ORBMDK_HID_GetPayloadMax(void);
 
+// ---------------------------------------------------------------------------
+// 总线上是否存在 CMSIS-DAP v1 候选（1 = 存在 / 0 = 没探测到）
+//
+// 判据与枚举/打开同一套：报告可解析 + 报告负载 ≤ 64 +（首选表命中 或
+// UsagePage=0xFF00）。**不含** DAP_Info 自检（那要 1 秒超时，不能放在 Identify 里）。
+//
+// 用途：CMSIS_DAP_Detect 恒报 2 个接口（0=v2 / 1=v1），不存在的 v1 也会出现在
+// µVision 的适配器列表里。上层必须先问这一句，再决定 ifNo=1 怎么命名、要不要
+// 用当前设备的身份（序列号/固件版本）去背书它 —— 否则那条幽灵 v1 看起来就是
+// 一台真 DAP，而选中后必然在 ConfigureInterface 自检失败。
+//
+// 实现代价：一次全机 HID 扫描（静默 + 结果带 TTL 缓存；已打开 HID 时直接回 1）。
+// ---------------------------------------------------------------------------
+int ORBMDK_HID_HasV1Candidate(void);
+
 // 当前 HID 设备的 VID/PID（0 = 未打开），用于如实上报设备身份
 void ORBMDK_HID_GetIdentity(uint16_t* vid, uint16_t* pid);
 
 // ---------------------------------------------------------------------------
-// DAP 命令通道熔断（实现与完整说明见 src/ORBMDK_HID.cpp；固件侧缺陷见 bug.md B1）
+// DAP 命令通道熔断（实现与完整说明见 src/ORBMDK_HID.cpp；根因是固件侧 busy 闸死）
 //
 // 缓解的是一个**本层修不了**的固件缺陷：orbtrace 的 DAP 命令通道一次握手失败后
 // 内部 busy 永不清零，此后所有命令都不再被消费，而 USB 层照常工作 —— 现场表现
@@ -61,7 +89,16 @@ int  ORBMDK_DapFastFailCode(void);             // 熔断期间返回的码（与
 void ORBMDK_DapChannelReset(const char* why);  // 主动解除熔断（设备重新打开时）
 
 // DAP Command Helpers
+// 问设备一条 DAP_Info，返回设备回报的 Info Length（0 = 没给信息；按规范"未识别的 ID"
+// 也是这一档，本层不区分）。⚠ 只对**字符串类 ID** 有效：内部无条件按 C 串处理（拷 Len
+// 字节 + 补 '\0'），数值类 ID（0xF0/0xF1/0xFB..0xFF）的二进制值会被 0x00 截断 ——
+// 数值请走 DAP_GetCapabilities 或标定里的自解析路径。
 int DAP_GetInfo(uint8_t infoId, char* buffer, size_t bufferLen);
+// 探针自报能力位（DAP_Info 0xF0）。返回值 = 低字节 | 高字节<<8（CMSIS-DAP v2.1
+// 的固件按 2 字节报，老固件 1 字节，两者都兼容）。
+// 返回 0 = 成功；<0 = 这条命令没答上来（*caps = 0）。
+// 用途：收口 AGDI 侧能力位（SWO/流式等）——**不要替固件宣称它没有的能力**。
+int DAP_GetCapabilities(uint16_t* caps);
 int DAP_ConnectTarget(void);
 // 指定端口连接：0=默认/自动，1=SWD，2=JTAG（COMPAT_ANALYSIS §18.9）
 int DAP_ConnectTargetPort(int port);

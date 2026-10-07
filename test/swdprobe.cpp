@@ -173,11 +173,15 @@ int main(int argc, char** argv)
             printf("    Identify(ifNo=%d, idNo=%d) -> '%s'\n", i, idNo, b);
         }
     }
-    // idNo=4 是 AGDI"多 DAP 分支"的开关值（§17.5）：主版本 >= 2 会走不通那条分支
+    // idNo=4 回的是 **CMSIS-DAP 协议版本串**（DAP_Info 0x04；产品固件版本是 0x09，
+    // 多数固件不给）。本层经 ORBMDK_NormalizeProtocolVersion 把主版本统一抬到 >= 2，
+    // 供 AGDI 的 `cmp eax, 2` streaming 门控使用（§17.5 / Todo.md §18.10-C）。
+    // ⚠ 断言方向跟着口径走：旧版钉 "1" 是"多 DAP 分支"时代的残留（已废弃）。
     {
-        char fw[64] = {0};
-        pIdentify(h, 0, 4, fw, (int)sizeof(fw));
-        Check("固件版本串主版本为 1（多 DAP 分支闸门）", fw[0] == '1', fw);
+        char ver[64] = {0};
+        pIdentify(h, 0, 4, ver, (int)sizeof(ver));
+        Check("协议版本串主版本 >= 2（AGDI streaming 门控）",
+              ver[0] >= '2' && ver[0] <= '9', ver);
     }
     printf("\n");
 

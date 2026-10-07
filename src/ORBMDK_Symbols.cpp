@@ -910,6 +910,115 @@ static bool getEnvPath(const char* envName, char* buffer, size_t size) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// 本 DLL 的自身位置 —— 部署形态是 <KeilRoot>\ARM\BIN\CMSIS_DAP.dll，
+// 于是"上两级"就是 Keil 安装根，可直接拿到 <KeilRoot>\TOOLS.INI，
+// 不必再猜盘符（P1/P2 的硬路径问题的根治办法）。
+//
+// 用本文件函数的地址反查模块：既不依赖 DllMain 传参，也避开了
+// GetModuleFileNameA(NULL, ...) 返回**宿主 UV4.exe** 的坑。
+// ---------------------------------------------------------------------------
+static bool getSelfModulePath(char* out, size_t cap)
+{
+    if (!out || cap == 0) return false;
+    out[0] = 0;
+
+    HMODULE hSelf = nullptr;
+    const LPCSTR selfAddr = reinterpret_cast<LPCSTR>(&getSelfModulePath);
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            selfAddr, &hSelf) || !hSelf) {
+        return false;
+    }
+    const DWORD n = GetModuleFileNameA(hSelf, out, (DWORD)cap);
+    return n > 0 && n < (DWORD)cap;
+}
+
+// 剥掉路径里的文件名（原地）
+static void stripFileName(char* path)
+{
+    char* slash = strrchr(path, '\\');
+    if (slash) *slash = 0;
+}
+
+// 本 DLL 所在目录（<KeilRoot>\ARM\BIN）
+static bool getSelfModuleDir(char* out, size_t cap)
+{
+    if (!getSelfModulePath(out, cap)) return false;
+    stripFileName(out);
+    return out[0] != 0;
+}
+
+// 在一条 TOOLS.INI 里找 GNU 工具链的 objdump（按 PATH= 行拼 <path>\bin\arm-none-eabi-objdump.exe）
+static bool extractGnuFromToolsIni(const char* iniPath, char* out, size_t cap)
+{
+    FILE* f = fopen(iniPath, "r");
+    if (!f) return false;
+
+    bool found = false;
+    char line[512];
+    while (!found && fgets(line, sizeof(line), f)) {
+        if (strstr(line, "Arm GNU Toolchain") ||
+            strstr(line, "GNU Arm Embedded") ||
+            strstr(line, "ARMCC") == nullptr) {   // 跳过 ARMCC
+            char* eq = strchr(line, '=');
+            if (!eq) continue;
+            char* path = eq + 1;
+            while (*path == '"' || *path == ' ') path++;
+            char* end = path + strlen(path) - 1;
+            while (end > path && (*end == '"' || *end == '\n' || *end == '\r')) *end-- = 0;
+            if (*path) {
+                char toolPath[MAX_LINE_LEN];
+                snprintf(toolPath, sizeof(toolPath), "%sbin\\arm-none-eabi-objdump.exe", path);
+                for (char* p = toolPath; *p; p++) {
+                    if (*p == '/') *p = '\\';
+                }
+                if (isValidObjdump(toolPath)) {
+                    strncpy(out, toolPath, cap);
+                    out[cap - 1] = 0;
+                    found = true;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+// 在 "<root>\*" 的每个子目录里找 bin\arm-none-eabi-objdump.exe
+// （不写死版本号：工具链升级/换目录后仍能找到）
+static bool scanGnuToolchainRoot(const char* rootWildcard, char* out, size_t cap)
+{
+    char root[MAX_LINE_LEN];
+    strncpy(root, rootWildcard, sizeof(root) - 1);
+    root[sizeof(root) - 1] = 0;
+    char* star = strrchr(root, '*');
+    if (star) *star = 0;                       // 只留根目录（含尾部分隔符）
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(rootWildcard, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    bool found = false;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == '.') continue;  // . / ..
+
+        char cand[MAX_LINE_LEN];
+        snprintf(cand, sizeof(cand), "%s%s\\bin\\arm-none-eabi-objdump.exe",
+                 root, fd.cFileName);
+        if (isValidObjdump(cand)) {
+            strncpy(out, cand, cap);
+            out[cap - 1] = 0;
+            found = true;
+            break;
+        }
+    } while (FindNextFileA(h, &fd));
+
+    FindClose(h);
+    return found;
+}
+
 bool ORBMDK_FindObjdumpPath(char* buffer, size_t bufferSize) {
     if (!buffer || bufferSize < MAX_LINE_LEN) return false;
     buffer[0] = 0;
@@ -924,6 +1033,21 @@ bool ORBMDK_FindObjdumpPath(char* buffer, size_t bufferSize) {
     if (getEnvPath("ARMGCC_DIR", buffer, bufferSize)) return true;
 
     // 4. 解析 Keil TOOLS.INI 获取工具链路径
+    // 4a. **优先：由本 DLL 位置反推**（零猜测）—— DLL 部署在 <KeilRoot>\ARM\BIN，
+    //     故 <selfDir>\..\..\TOOLS.INI 就是 Keil 根的 TOOLS.INI。
+    {
+        char selfDir[MAX_PATH] = {};
+        if (getSelfModuleDir(selfDir, sizeof(selfDir))) {
+            char iniRaw[MAX_LINE_LEN];
+            snprintf(iniRaw, sizeof(iniRaw), "%s\\..\\..\\TOOLS.INI", selfDir);
+            char ini[MAX_PATH] = {};
+            if (PathCanonicalizeA(ini, iniRaw) && fileExists(ini) &&
+                extractGnuFromToolsIni(ini, buffer, bufferSize)) {
+                return true;
+            }
+        }
+    }
+    // 4b. 回退：常见安装位置（猜路径；仅在 4a 拿不到时用）
     const char* mdkPaths[] = {
         "C:\\Program Files\\Keil_v5\\TOOLS.INI",
         "C:\\Program Files (x86)\\Keil_v5\\TOOLS.INI",
@@ -932,59 +1056,39 @@ bool ORBMDK_FindObjdumpPath(char* buffer, size_t bufferSize) {
         "D:\\MDK5\\TOOLS.INI"
     };
     for (size_t i = 0; i < sizeof(mdkPaths) / sizeof(mdkPaths[0]); i++) {
-        if (fileExists(mdkPaths[i])) {
-            FILE* f = fopen(mdkPaths[i], "r");
-            if (f) {
-                char line[512];
-                while (fgets(line, sizeof(line), f)) {
-                    // 查找 PATH1= 或 PATH= 开头的 GNU 工具链路径
-                    if (strstr(line, "Arm GNU Toolchain") || 
-                        strstr(line, "GNU Arm Embedded") ||
-                        strstr(line, "ARMCC") == nullptr) {  // 跳过 ARMCC
-                        char* eq = strchr(line, '=');
-                        if (eq) {
-                            char* path = eq + 1;
-                            // 去除引号和换行
-                            while (*path == '"' || *path == ' ') path++;
-                            char* end = path + strlen(path) - 1;
-                            while (end > path && (*end == '"' || *end == '\n' || *end == '\r')) *end-- = 0;
-                            if (strlen(path) > 0) {
-                                char toolPath[MAX_LINE_LEN];
-                                snprintf(toolPath, sizeof(toolPath), "%sbin\\arm-none-eabi-objdump.exe", path);
-                                // 统一路径分隔符
-                                for (char* p = toolPath; *p; p++) {
-                                    if (*p == '/') *p = '\\';
-                                }
-                                if (isValidObjdump(toolPath)) {
-                                    strncpy(buffer, toolPath, bufferSize);
-                                    buffer[bufferSize - 1] = 0;
-                                    fclose(f);
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-                fclose(f);
-            }
+        if (fileExists(mdkPaths[i]) &&
+            extractGnuFromToolsIni(mdkPaths[i], buffer, bufferSize)) {
+            return true;
         }
     }
 
-    // 5. 检查 GNU ARM Embedded Toolchain 安装目录 (常见路径)
-    const char* gnuPaths[] = {
-        "C:\\Program Files\\GNU Arm Embedded Toolchain\\10 2021.10\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files\\GNU Arm Embedded Toolchain\\10 2021.10 (arm-none-eabi-gcc)\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files (x86)\\GNU Arm Embedded Toolchain\\10 2021.10\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files\\GNU Arm Embedded Toolchain\\9 2020-q2-update\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files\\GNU Arm Embedded Toolchain\\8 2019-q3-update\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files\\Arm\\GNU Toolchain\\12.3.rel1\\bin\\arm-none-eabi-objdump.exe",
-        "C:\\Program Files (x86)\\Arm\\GNU Toolchain\\12.3.rel1\\bin\\arm-none-eabi-objdump.exe"
-    };
-    for (size_t i = 0; i < sizeof(gnuPaths) / sizeof(gnuPaths[0]); i++) {
-        if (isValidObjdump(gnuPaths[i])) {
-            strncpy(buffer, gnuPaths[i], bufferSize);
-            buffer[bufferSize - 1] = 0;
-            return true;
+    // 5. GNU 工具链：按"根目录 + 版本通配"扫描（**不写死版本号/盘符**，升级后照旧可用）
+    {
+        char pattern[MAX_LINE_LEN];
+
+        // 5a. Keil 根下自带的位置（<KeilRoot>\ARM\ARM_GCC\* / ...\ARM\GNU Toolchain\*）
+        char selfDir[MAX_PATH] = {};
+        if (getSelfModuleDir(selfDir, sizeof(selfDir))) {
+            snprintf(pattern, sizeof(pattern), "%s\\..\\..\\ARM\\ARM_GCC\\*", selfDir);
+            if (scanGnuToolchainRoot(pattern, buffer, bufferSize)) return true;
+            snprintf(pattern, sizeof(pattern), "%s\\..\\..\\ARM\\GNU Toolchain\\*", selfDir);
+            if (scanGnuToolchainRoot(pattern, buffer, bufferSize)) return true;
+        }
+
+        // 5b. 常见安装根（用环境变量拼，不写死 "C:\Program Files"）
+        const char* roots[] = {
+            getenv("ProgramFiles"), getenv("ProgramW6432"), getenv("ProgramFiles(x86)")
+        };
+        const char* subdirs[] = {
+            "\\Arm\\GNU Toolchain\\*",
+            "\\GNU Arm Embedded Toolchain\\*",
+        };
+        for (size_t r = 0; r < sizeof(roots) / sizeof(roots[0]); ++r) {
+            if (!roots[r] || !roots[r][0]) continue;
+            for (size_t s = 0; s < sizeof(subdirs) / sizeof(subdirs[0]); ++s) {
+                snprintf(pattern, sizeof(pattern), "%s%s", roots[r], subdirs[s]);
+                if (scanGnuToolchainRoot(pattern, buffer, bufferSize)) return true;
+            }
         }
     }
 

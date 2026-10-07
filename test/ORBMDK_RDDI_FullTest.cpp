@@ -280,7 +280,11 @@ int main(int argc, char* argv[]) {
     printf("    - SWD: %s\n", (caps & 0x01) ? "YES" : "NO");
     printf("    - JTAG: %s\n", (caps & 0x02) ? "YES" : "NO");
     printf("    - SWO UART: %s\n", (caps & 0x04) ? "YES" : "NO");
+    printf("    - SWO Manchester: %s\n", (caps & 0x08) ? "YES" : "NO");
     printf("    - Atomic: %s\n", (caps & 0x10) ? "YES" : "NO");
+    // 0x40 = SWO_STREAMING_TRACE：本层按探针自报能力收口（Todo.md 续 9），
+    // 探针不报 SWO 时这两位应为 NO —— 若为 YES 说明中间层又在替固件宣称能力。
+    printf("    - SWO Streaming: %s\n", (caps & 0x40) ? "YES" : "NO");
     
     // Get interface version（2 参，版本号是 int 而不是字符串）
     int ifVersion = 0;

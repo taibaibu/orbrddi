@@ -35,16 +35,17 @@
 #define LOG_HID_ERROR(...) ORBMDK_LOG_ERROR(__VA_ARGS__)
 
 // ---------------------------------------------------------------------------
-// 命令级日志：**不受级别控制**，总是落盘（与 ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
+// 命令级日志（与 ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
 //
 // 为什么必须有：V1(HID) 路径下的 DAP 命令原本**完全不可见**（默认阈值 ERROR 且
 // 当时 HID 根本不落文件）。实测排障时表现为"AGDI 在 CMSIS_DAP_Connect 之后什么都
-// 不做就断开"，而 HID 命令其实一直在发。传输层的排障线索不允许依赖日志级别。
+// 不做就断开"，而 HID 命令其实一直在发。
 //
-// 迁移到统一实现后：仍然不受级别控制、仍然只落盘，但会遵循 ORBMDK_LOG_FILE，
-// 并带上时间戳与进程/线程号（原来是手写的 "[ORBMDK][INFO][HID]" 前缀）。
+// ⚠ 2026-10-03：按"**最底层日志统一 INFO**"的口径改为 ORBMDK_LOG_INFO ——
+// 传输/命令级日志是排障必备，阈值设为 INFO(1) 时即可见，并会送宿主（Keil）日志窗口。
+// （此前用 ORBMDK_LOG_TRACE：等级同为 INFO，但**只落文件**、不进宿主窗口。）
 // ---------------------------------------------------------------------------
-#define HidTrace(...) ORBMDK_LOG_TRACE(__VA_ARGS__)
+#define HidTrace(...) ORBMDK_LOG_INFO(__VA_ARGS__)
 
 // ============================================================================
 // Constants
@@ -58,23 +59,39 @@ static constexpr uint16_t ORBTRACE_PID = ORBMDK_ORBTRACE_PID;
 
 // 首选厂商 VID（用于"VID 在册但 PID 未知"的老式/克隆 CMSIS-DAP）。
 // ⚠ 这**不是准入条件**，只影响优先级：命中者跳过 UsagePage 校验，并在两趟
-// 扫描里排在第 1 趟。准入一律看能力（_hidDeviceAcceptable：UsagePage 0xFF00
-// 且 OUT/IN 报告都可用；再往上是 ConfigureInterface 的 DAP_Info 自检）。
+// 扫描里排在第 1 趟。准入一律看判据（_hidDeviceAcceptable：报告可解析 +
+// 报告负载 ≤ 64 +（首选命中 或 UsagePage=0xFF00）；再往上是 ConfigureInterface
+// 的 DAP_Info 自检）。注意"负载 ≤ 64"对首选设备同样生效，见该函数说明。
 // 历史问题：原先 VID 命中就打开，任何 0x0D28 的键盘/鼠标都会被当成 DAP，
 // 表现为"连接成功、命令全部写失败"。
 static constexpr uint16_t CMSIS_DAP_VIDS[] = {
-    0x0D28,  // ARM
-    0x2E03,  // ORBTrace / 用户设备
-    0x1209,  // ORBTrace (备用)
-    0xC251,  // Keil
-    0x1366,  // Segger
-    0x0483,  // ST
+// 白名单统一维护在 include/ORBMDK.h 的 ORBMDK_DEVICE_VID_LIST（避免两处各写一份）
+#define ORBMDK_VID_ENTRY(v) v,
+    ORBMDK_DEVICE_VID_LIST(ORBMDK_VID_ENTRY)
+#undef ORBMDK_VID_ENTRY
 };
 
 // 标准 CMSIS-DAP 使用报告ID = 0x00
 static constexpr uint8_t CMD_REPORT_ID = 0x00U;
 static constexpr size_t HID_MAX_PACKET_SIZE = 65;  // 64 + 1 Report ID
+// ⚠ 主机侧缓冲上限，与固件的 DAP_V2_MAX_PACKET_SIZE(508)、端点 wMaxPacketSize(512) 都无关，勿混。
 static constexpr size_t DAP_BUFFER_SIZE = 512;
+
+// ---------------------------------------------------------------------------
+// CMSIS-DAP v1 的 HID 报告负载**固定 64 字节**（规范与 DAPLink 一律如此，
+// 对应固件的 DAP_PACKET_SIZE = 64）。由此得到一条**规范级强判据**：
+//
+//     报告负载 > 64 的接口不可能是 CMSIS-DAP v1。
+//
+// 反例（实测）：0x0D28:0x0204 的 HID 接口 —— UsagePage=0xFF00、报告负载 **1023**，
+// 实际是厂商的 JSON/文本配置通道（对任何 OUT 报告都回 "parse error!\n"）。
+// 只看"UsagePage=0xFF00 + 报告可解析"会把它收成 v1，再靠 1 秒超时的 DAP_Info
+// 自检兜底；现场表现就成了"探针不响应"，而不是"这台设备没有 v1 接口"。
+//
+// 因此本判据对**所有**设备生效 —— 首选表命中的设备也不例外（0x0D28:0x0204
+// 恰恰就在首选表里，正是它踩了这个坑）。
+// ---------------------------------------------------------------------------
+static constexpr size_t CMSIS_DAP_V1_PAYLOAD_MAX = 64;
 
 // ---------------------------------------------------------------------------
 // 设备 HID 报告布局（打开时用 HidP_GetCaps 解析一次）
@@ -108,7 +125,7 @@ static uint16_t g_hidVid = 0;
 static uint16_t g_hidPid = 0;
 static char g_productName[256] = {0};
 static char g_serialNumber[256] = {0};
-static char g_firmwareVersion[64] = {0};
+static char g_protocolVersion[64] = {0};
 
 // ============================================================================
 // Forward declarations
@@ -184,7 +201,11 @@ static bool _hidReportLayout(PHIDP_PREPARSED_DATA pp, HIDP_REPORT_TYPE type,
 }
 
 // 解析设备报告布局：报告长度/报告ID/有没有 Output 报告
-static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
+//
+// quiet = 只解析、不刷日志。用于"总线上到底有没有 v1 接口"的探测
+// （见 _scanForV1Candidate）：那种扫描要挨个打开全机 HID 设备，逐条打日志会把
+// 日志刷爆，而它关心的只是"有没有"。
+static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan, bool quiet)
 {
     memset(plan, 0, sizeof(*plan));
     plan->inputLen   = (uint16_t)HID_MAX_PACKET_SIZE;
@@ -194,13 +215,13 @@ static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
 
     PHIDP_PREPARSED_DATA pp = nullptr;
     if (!HidD_GetPreparsedData(hDevice, &pp) || !pp) {
-        LOG_HID_WARN("HidD_GetPreparsedData failed, error=%lu", GetLastError());
+        if (!quiet) LOG_HID_WARN("HidD_GetPreparsedData failed, error=%lu", GetLastError());
         return false;
     }
 
     HIDP_CAPS caps = {};
     if (HidP_GetCaps(pp, &caps) != HIDP_STATUS_SUCCESS) {
-        LOG_HID_WARN("HidP_GetCaps failed");
+        if (!quiet) LOG_HID_WARN("HidP_GetCaps failed");
         HidD_FreePreparsedData(pp);
         return false;
     }
@@ -224,7 +245,7 @@ static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
         plan->writeIsFeature = true;
         declared = caps.FeatureReportByteLength;
     } else {
-        LOG_HID_WARN("设备没有 Output/Feature 报告，无法下发命令");
+        if (!quiet) LOG_HID_WARN("设备没有 Output/Feature 报告，无法下发命令");
         HidD_FreePreparsedData(pp);
         return false;
     }
@@ -245,27 +266,47 @@ static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan)
     HidD_FreePreparsedData(pp);
 
     if (plan->writeLen != declared) {
-        LOG_HID_WARN("HID 报告长度与声明不符：负载 %u + 前缀 %zu = %u，声明 %u",
-                     (unsigned)payload, plan->payloadOff, (unsigned)plan->writeLen,
-                     (unsigned)declared);
+        if (!quiet) {
+            LOG_HID_WARN("HID 报告长度与声明不符：负载 %u + 前缀 %zu = %u，声明 %u",
+                         (unsigned)payload, plan->payloadOff, (unsigned)plan->writeLen,
+                         (unsigned)declared);
+        }
     }
 
     plan->valid = true;
-    LOG_HID_INFO("HID 报告布局：UsagePage=0x%04X IN=%u OUT=%u 负载=%zu "
-                 "报告ID=0x%02X 前缀=%zu %s",
-                 (unsigned)plan->usagePage, (unsigned)plan->inputLen,
-                 (unsigned)plan->writeLen, plan->payloadMax, (unsigned)plan->reportId,
-                 plan->payloadOff, plan->writeIsFeature ? "SetFeature" : "WriteFile");
+    if (!quiet) {
+        LOG_HID_INFO("HID 报告布局：UsagePage=0x%04X IN=%u OUT=%u 负载=%zu "
+                     "报告ID=0x%02X 前缀=%zu %s",
+                     (unsigned)plan->usagePage, (unsigned)plan->inputLen,
+                     (unsigned)plan->writeLen, plan->payloadMax, (unsigned)plan->reportId,
+                     plan->payloadOff, plan->writeIsFeature ? "SetFeature" : "WriteFile");
+    }
     return true;
 }
 
-// 判定已打开的 HID 句柄是不是 DAP 设备，并给出报告布局
-//   首选（VID/PID 在首选表，或 VID 在传统 CMSIS-DAP 厂商表）-> 报告可解析即接受
-//   其它 -> 必须过**能力校验**：厂商自定义 UsagePage(0xFF00) + OUT/IN 报告都可用
+// 判定已打开的 HID 句柄是不是 CMSIS-DAP v1，并给出报告布局
+//
+// 判据（**逐条**，任一不满足即拒绝，且日志写明是哪一条）：
+//   1) 报告描述符可解析，且有可用的 Output/Feature 报告（_hidProbeReportPlan）
+//   2) 报告负载 ≤ 64 —— v1 规范固定 64 字节（CMSIS_DAP_V1_PAYLOAD_MAX）
+//   3) 首选（VID/PID 在首选表，或 VID 在传统 CMSIS-DAP 厂商表）→ 到此即可
+//      非首选 → 还要 UsagePage == 0xFF00 **且** 报告负载 == 64
+//
+// 宽严之分是有意的：首选设备走了"先收下再说"（后面有 DAP_Info 自检兜底），
+// 非首选设备是"仅凭能力猜"，猜错没有补救，所以必须严 —— 否则键盘/打印机的
+// 0xFF00 厂商集合会被当成 DAP（实测 258A:000C 键盘：0xFF00 + 负载 1）。
+//
+// ⚠ 判据 2) **不能**对首选设备豁免：0x0D28:0x0204 的 HID 接口首选表命中、
+// 报告也能解析，却是个 1023 字节的厂商配置通道 —— 豁免它就会把它收成 v1，
+// 之后只能靠 1 秒超时的 DAP_Info 自检兜底（现场表现为"探针不响应"）。
+//
+// 判据 3) 对首选设备保留宽松（跳过 UsagePage 校验）：老式/克隆 DAP 的
+// UsagePage 不一定规规矩矩；真正的把关由 ConfigureInterface 的 DAP_Info 自检补上。
 //
 // preferredOnly = 第 1 趟扫描：只认首选设备（无关设备数量大，不刷日志）。
+// quiet         = 静默模式（只回答"是不是"，不解释理由）—— 供 v1 存在性探测用。
 static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
-                                 HidReportPlan* plan, bool preferredOnly)
+                                 HidReportPlan* plan, bool preferredOnly, bool quiet)
 {
     const bool preferred = ORBMDK_IsPreferredDevice(attr.VendorID, attr.ProductID) ||
                            IsCMSISDAPDevice(attr.VendorID);
@@ -274,9 +315,22 @@ static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
     }
 
     HidReportPlan probe = {};
-    if (!_hidProbeReportPlan(hDevice, &probe)) {
-        LOG_HID_WARN("skip VID_%04X&PID_%04X: 无法解析 HID 报告描述符",
-                     attr.VendorID, attr.ProductID);
+    if (!_hidProbeReportPlan(hDevice, &probe, quiet)) {
+        if (!quiet) {
+            LOG_HID_WARN("skip VID_%04X&PID_%04X: 无法解析 HID 报告描述符",
+                         attr.VendorID, attr.ProductID);
+        }
+        return false;
+    }
+
+    // ★ 规范级强判据（对所有设备生效，首选设备也不例外）
+    if (probe.payloadMax > CMSIS_DAP_V1_PAYLOAD_MAX) {
+        if (!quiet) {
+            LOG_HID_WARN("skip VID_%04X&PID_%04X: 报告负载 %zu > %zu —— 不是 CMSIS-DAP v1"
+                         "（v1 规范固定 64 字节；超限者多为厂商配置/文本通道）",
+                         attr.VendorID, attr.ProductID, probe.payloadMax,
+                         CMSIS_DAP_V1_PAYLOAD_MAX);
+        }
         return false;
     }
 
@@ -285,19 +339,148 @@ static bool _hidDeviceAcceptable(HANDLE hDevice, const HIDD_ATTRIBUTES& attr,
         return true;
     }
 
-    // 能力准入：**不再**要求 VID 在册。CMSIS-DAP 的 HID 接口必是厂商自定义
-    // Usage Page(0xFF00)，且 OUT/IN 报告都可用（_hidProbeReportPlan 已保证）。
+    // 能力准入：**不再**要求 VID 在册，但证据必须够硬 —— 因为"仅凭能力猜"
+    // 错了没有任何补救（pass 1 是最后一道）。
+    //   a) UsagePage 必须 == 0xFF00（厂商自定义；CMSIS-DAP v1 规范如此）
+    //   b) 报告负载必须**恰好** == 64 —— v1 规范值。
+    //      ⚠ 只写"≤ 64"是不够的：实测本机 258A:000C 电竞键盘的 RGB 配置集合
+    //      就是 UsagePage=0xFF00、有 Output 报告、**负载=1**，会被误收成
+    //      "兼容设备"（日志里已复现）。负载恰恰 64 才是 v1 的强证据。
+    // 首选设备（pass 0）不受 a)/b) 约束：老式/克隆 DAP 的用法页与报告尺寸
+    // 不一定规矩，宁可先收下再由 DAP_Info 自检淘汰。
     if (probe.usagePage != 0xFF00U) {
-        LOG_HID_WARN("skip VID_%04X&PID_%04X: UsagePage=0x%04X 非厂商自定义(0xFF00)",
-                     attr.VendorID, attr.ProductID, (unsigned)probe.usagePage);
+        if (!quiet) {
+            LOG_HID_WARN("skip VID_%04X&PID_%04X: UsagePage=0x%04X 非厂商自定义(0xFF00)",
+                         attr.VendorID, attr.ProductID, (unsigned)probe.usagePage);
+        }
         return false;
     }
-    LOG_HID_WARN("兼容设备 VID_%04X&PID_%04X（不在首选表，按能力匹配："
-                 "UsagePage=0xFF00, IN=%u, 负载=%zu）",
-                 attr.VendorID, attr.ProductID,
-                 (unsigned)probe.inputLen, probe.payloadMax);
+    if (probe.payloadMax != CMSIS_DAP_V1_PAYLOAD_MAX) {
+        if (!quiet) {
+            LOG_HID_WARN("skip VID_%04X&PID_%04X: UsagePage=0xFF00 但报告负载 %zu != %zu"
+                         "（v1 规范值）—— 多为厂商配置/文本集合，不是 DAP",
+                         attr.VendorID, attr.ProductID, probe.payloadMax,
+                         CMSIS_DAP_V1_PAYLOAD_MAX);
+        }
+        return false;
+    }
+    if (!quiet) {
+        LOG_HID_WARN("兼容设备 VID_%04X&PID_%04X（不在首选表，按能力匹配："
+                     "UsagePage=0xFF00, IN=%u, 负载=%zu）",
+                     attr.VendorID, attr.ProductID,
+                     (unsigned)probe.inputLen, probe.payloadMax);
+    }
     *plan = probe;
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 「总线上到底有没有 CMSIS-DAP v1 接口」
+//
+// 为什么要问这一句：CMSIS_DAP_Detect 恒报 2 个接口（0=v2 / 1=v1，见
+// ORBMDK_RDDI.cpp 里 EU02 的说明），于是**并不存在**的 v1 也会出现在 µVision 的
+// 适配器列表里。若再给它配上设备身份（序列号/固件版本），那条幽灵条目看起来就是
+// 一台真 DAP，用户没有理由不选它 —— 选中后 ConfigureInterface 的 DAP_Info 自检
+// 必然失败（还会白等 1 秒超时）。所以上层必须先问得出这一句，再决定怎么命名。
+//
+// 判据与枚举/打开**完全同一套**（_hidDeviceAcceptable，含它"非首选要求负载
+// 恰好 64"的严格分支）—— 所以键盘/打印机那类 0xFF00 厂商集合不会被算成候选
+// （实测 258A:000C 键盘曾因"负载 1 ≤ 64"被误判成 v1 候选）。**不含** DAP_Info
+// 自检 —— 那要 1 秒超时，不适合放在 Identify 里；这里只回答"像不像 v1"。
+//
+// 代价与抑制：一次全机 HID 扫描（本机常有几十个 HID 设备，要逐个 CreateFile +
+// HidP 解析），所以 ① 静默（quiet=true，不刷候选日志）② 结果带 TTL 缓存
+// ③ 已经打开着 HID 设备时直接回 true（那台设备本身就过了判据）。
+// ---------------------------------------------------------------------------
+static constexpr DWORD kV1ProbeTtlMs = 5000;
+
+static std::mutex g_v1ProbeMutex;      // 独立于 g_hidMutex：探测不持有设备锁
+static DWORD      g_v1ProbeTick   = 0;
+static int        g_v1ProbeResult = -1;   // -1 = 尚未探测
+static bool       g_v1ProbeLogged = false;  // "未发现"只报一次，免得长会话里刷屏
+
+static bool _scanForV1Candidate(void)
+{
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+
+    HDEVINFO deviceInfo = SetupDiGetClassDevs(&hidGuid, nullptr, nullptr,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (deviceInfo == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    bool found = false;
+    SP_DEVICE_INTERFACE_DATA interfaceData = {};
+    interfaceData.cbSize = sizeof(interfaceData);
+
+    for (DWORD i = 0;
+         !found && SetupDiEnumDeviceInterfaces(deviceInfo, nullptr, &hidGuid, i, &interfaceData);
+         ++i) {
+        DWORD detailSize = 0;
+        SetupDiGetDeviceInterfaceDetail(deviceInfo, &interfaceData, nullptr, 0, &detailSize, nullptr);
+        if (detailSize == 0) continue;
+
+        std::vector<uint8_t> detailBuffer(detailSize);
+        auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA*>(detailBuffer.data());
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        if (!SetupDiGetDeviceInterfaceDetail(deviceInfo, &interfaceData, detail, detailSize,
+                                             nullptr, nullptr)) {
+            continue;
+        }
+
+        HANDLE hDevice = CreateFile(detail->DevicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (hDevice == INVALID_HANDLE_VALUE) continue;
+
+        HIDD_ATTRIBUTES attributes = {};
+        attributes.Size = sizeof(attributes);
+        HidReportPlan plan = {};
+        if (HidD_GetAttributes(hDevice, &attributes) &&
+            _hidDeviceAcceptable(hDevice, attributes, &plan, false, true)) {
+            found = true;
+            LOG_HID_INFO("v1 候选：VID_%04X&PID_%04X 报告负载=%zu",
+                         attributes.VendorID, attributes.ProductID, plan.payloadMax);
+        }
+        CloseHandle(hDevice);
+    }
+
+    SetupDiDestroyDeviceInfoList(deviceInfo);
+    return found;
+}
+
+int ORBMDK_HID_HasV1Candidate(void)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_hidMutex);
+        if (g_isConnected) {
+            return 1;      // 已打开的设备本身就过了判据，无需再扫
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_v1ProbeMutex);
+    const DWORD now = GetTickCount();
+    if (g_v1ProbeResult >= 0 && (DWORD)(now - g_v1ProbeTick) < kV1ProbeTtlMs) {
+        return g_v1ProbeResult;
+    }
+
+    g_v1ProbeResult = _scanForV1Candidate() ? 1 : 0;
+    g_v1ProbeTick   = now;
+
+    if (g_v1ProbeResult == 0) {
+        // 只在"从未发现"变"仍然没发现"的第一次打日志（TTL 到点会重扫，别刷屏）
+        if (!g_v1ProbeLogged) {
+            LOG_HID_WARN("总线上未发现 CMSIS-DAP v1 候选（无首选表命中，也无"
+                         "UsagePage=0xFF00 且负载恰好 64 的接口）—— ifNo=1 将如实"
+                         "标注为未检测到");
+            g_v1ProbeLogged = true;
+        }
+    } else {
+        g_v1ProbeLogged = false;
+    }
+    return g_v1ProbeResult;
 }
 
 static bool EnumerateDevices(std::vector<std::string>& serials)
@@ -353,7 +536,7 @@ static bool EnumerateDevices(std::vector<std::string>& serials)
         if (HidD_GetAttributes(hDevice, &attributes)) {
             // 只收"支持列表精确匹配"或"过能力校验的兼容设备"，见 _hidDeviceAcceptable
             HidReportPlan plan = {};
-            if (_hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0)) {
+            if (_hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0, false)) {
                 wchar_t serialBuffer[256] = {};
                 if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
                     char serial[256] = {};
@@ -385,10 +568,11 @@ static bool ReadDeviceInfo(HANDLE hDevice)
         strcpy_s(g_serialNumber, "Unknown");
     }
 
-    // 固件版本**不在这里取**：HidD_GetAttributes 的 VersionNumber（= 设备描述符的
-    // bcdDevice）是 USB 栈写的，与固件真实版本无关，已弃用。
-    // 版本一律**问设备**（CMSIS-DAP DAP_Info / idNo=4），见 ORBMDK_HID_GetDeviceInfo。
-    g_firmwareVersion[0] = '\0';
+    // 版本**不在这里取**：HidD_GetAttributes 的 VersionNumber（= 设备描述符的
+    // bcdDevice）是 USB 栈写的，与版本无关，已弃用。
+    // 版本一律**问设备**（CMSIS-DAP DAP_Info / idNo=0x04，即协议版本），
+    // 见 ORBMDK_HID_GetDeviceInfo。
+    g_protocolVersion[0] = '\0';
     return true;
 }
 
@@ -458,7 +642,7 @@ int ORBMDK_HID_OpenDevice(const char* serial)
 
         plan = HidReportPlan{};
         if (HidD_GetAttributes(hDevice, &attributes) &&
-            _hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0)) {
+            _hidDeviceAcceptable(hDevice, attributes, &plan, pass == 0, false)) {
 
             wchar_t serialBuffer[256] = {};
             if (HidD_GetSerialNumberString(hDevice, serialBuffer, sizeof(serialBuffer))) {
@@ -502,7 +686,7 @@ int ORBMDK_HID_OpenDevice(const char* serial)
     g_hidPid = foundPid;
     g_isConnected = true;
 
-    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态（bug.md B1）。
+    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态。
     // "探针已重新上电"这条恢复路径不能被熔断挡住；真的是哑机的话，随后的
     // DAP_Info 会立刻把它重新熔断（代价只有一两条命令）。
     ORBMDK_DapChannelReset("HID 设备已重新打开");
@@ -554,18 +738,24 @@ int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen,
         if (!version || versionLen == 0) {
             return 0;                        // 没要版本，收工
         }
-        if (g_firmwareVersion[0] != '\0') {  // 有缓存就直接回（避免多余的 USB 往返）
-            strncpy_s(version, versionLen, g_firmwareVersion, versionLen - 1);
+        if (g_protocolVersion[0] != '\0') {  // 有缓存就直接回（避免多余的 USB 往返）
+            strncpy_s(version, versionLen, g_protocolVersion, versionLen - 1);
             return 0;
         }
     }
 
-    // 版本必须**问设备**（CMSIS-DAP DAP_Info / idNo=4）—— 描述符里的版本字段
-    // （HidD_GetAttributes 的 VersionNumber）与固件版本无关，已弃用。
+    // 版本必须**问设备**（CMSIS-DAP DAP_Info / idNo=**0x04**）—— 描述符里的版本字段
+    // （HidD_GetAttributes 的 VersionNumber）与版本无关，已弃用。
+    //
+    // ⚠ 0x04 按 CMSIS-DAP v2.1.2 是 **CMSIS-DAP 协议版本**（"2.1.0" 形态），不是产品
+    //   固件版本（那是 0x09）：AGDI 的 `cmp eax, 2` 门控要的正是协议版本，故问 0x04 对。
+    //
+    // 现状：`RDDI_Open` 是唯一调用点，且只取产品名/序列号（version 传 nullptr），所以
+    // 下面这段当前走不到；`RDDI_Open` 自己去问 0x04 并缓存（那边还要做版本归一化）。
     //
     // ⚠ 这次调用**必须**在 g_hidMutex 释放之后：V1 路径的 DAP_Info 内部自己会加
     // 这把锁（std::mutex 非递归），放在上面那个 lock_guard 作用域里会自死锁。
-    const int got = DAP_GetInfo(DAP_INFO_FIRMWARE, version, versionLen);
+    const int got = DAP_GetInfo(DAP_INFO_PROTOCOL_VERSION, version, versionLen);
     if (got <= 0) {
         version[0] = '\0';
         LOG_HID_WARN("GetDeviceInfo: DAP_Info(0x04) failed (rc=%d)", got);
@@ -573,14 +763,14 @@ int ORBMDK_HID_GetDeviceInfo(char* product, size_t productLen,
     }
 
     std::lock_guard<std::mutex> lock(g_hidMutex);
-    strncpy_s(g_firmwareVersion, sizeof(g_firmwareVersion), version, _TRUNCATE);
+    strncpy_s(g_protocolVersion, sizeof(g_protocolVersion), version, _TRUNCATE);
     return 0;
 }
 
 #include "ORBMDK_USB_Bulk.h"   // V2 Bulk 传输（本函数是两层共用的分发点）
 
 // ============================================================================
-// DAP 命令通道熔断（缓解；固件侧缺陷见 bug.md B1）
+// DAP 命令通道熔断（缓解；根因是固件侧 busy 闸死的已知缺陷）
 //
 // 背景（本层改不了，要改的是固件 RTL）：
 //   orbtrace 固件的 DAP 命令通道**没有任何超时兜底** —— 一次握手失败后内部 busy
@@ -691,7 +881,7 @@ bool ORBMDK_DapChannelUsable(void)
         if ((DWORD)(now - (DWORD)h->lastNotice) >= kDapNoticeMinMs) {
             InterlockedExchange(&h->lastNotice, (LONG)now);
             LOG_HID_WARN("DAP 通道处于熔断状态，命令被立即拒绝（累计 %ld 条）。"
-                         "请给探针断电重插 —— 见 bug.md B1", n);
+                         "请给探针断电重插（固件侧已知缺陷：一次失败后通道闸死）", n);
         }
         return false;
     }
@@ -714,7 +904,7 @@ void ORBMDK_DapNoteResult(int rc)
         if (InterlockedExchange(&h->tripped, 0)) {
             InterlockedIncrement(&h->recoveries);
             LOG_HID_ERROR("DAP 通道已恢复：命令重新得到响应（熔断期间共拦下 %ld 条）。"
-                          "可以继续调试 —— 若再次卡死，多半仍是 bug.md B1",
+                          "可以继续调试 —— 若再次卡死，多半仍是同一固件缺陷（通道闸死）",
                           (long)h->suppressed);
         }
         InterlockedExchange(&h->consecutive, 0);
@@ -738,7 +928,7 @@ void ORBMDK_DapNoteResult(int rc)
             InterlockedIncrement(&h->trips);
             LOG_HID_ERROR("================ DAP 通道熔断 ================");
             LOG_HID_ERROR("连续 %ld 次超时（rc=%d），探针已不再响应任何 DAP 命令。", n, rc);
-            //LOG_HID_ERROR("这是 orbtrace 固件的已知缺陷（bug.md B1）：一次握手失败后");
+            //LOG_HID_ERROR("这是 orbtrace 固件的已知缺陷：一次握手失败后");
             //LOG_HID_ERROR("命令通道永久停止接收，而 USB 层仍然正常，主机侧无法复位它。");
             //LOG_HID_ERROR("本层从现在起不再等待 1s 超时，DAP 命令立即失败。");
             //LOG_HID_ERROR(">>> 唯一有效的恢复手段：给探针断电重插后重试本次调试。");
@@ -775,6 +965,37 @@ void ORBMDK_DapChannelReset(const char* why)
     }
 }
 
+// ---------------------------------------------------------------------------
+// 原始字节 → hex 串（最底层调试日志用）。调用方提供缓冲，不做动态分配；
+// 超过 maxBytes 字节时尾部以 " ..." 标记。返回 out（便于直接嵌进 LOG 里）。
+// ---------------------------------------------------------------------------
+static const char* HidHexBytes(const uint8_t* p, size_t n, char* out, size_t outCap,
+                               size_t maxBytes)
+{
+    if (!out || outCap == 0) {
+        return "";
+    }
+    out[0] = '\0';
+    if (!p || n == 0 || maxBytes == 0) {
+        return out;
+    }
+
+    size_t pos = 0;
+    const size_t m = (n < maxBytes) ? n : maxBytes;
+    for (size_t i = 0; i < m; ++i) {
+        const int w = snprintf(out + pos, outCap - pos, (i == 0) ? "%02X" : " %02X", p[i]);
+        if (w <= 0 || static_cast<size_t>(w) >= outCap - pos) {
+            break;
+        }
+        pos += static_cast<size_t>(w);
+    }
+    if (n > m && pos + 4 < outCap) {
+        memcpy(out + pos, " ...", 4);
+        out[pos + 4] = '\0';
+    }
+    return out;
+}
+
 // 前向声明：熔断闸门必须包在真正的分发逻辑外面（原函数体在下面，已更名为 _DapCommandRaw）
 static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
                           uint8_t* resp, size_t* respLen, int timeoutMs);
@@ -782,7 +1003,7 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
 int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
                           uint8_t* resp, size_t* respLen, int timeoutMs)
 {
-    // 熔断闸门（bug.md B1）：设备已判定无响应时直接失败，不再把 1s 超时重复几十遍
+    // 熔断闸门：设备已判定无响应时直接失败，不再把 1s 超时重复几十遍
     if (!ORBMDK_DapChannelUsable()) {
         if (respLen) {
             *respLen = 0;
@@ -792,6 +1013,21 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
 
     const int rc = _DapCommandRaw(cmd, cmdLen, resp, respLen, timeoutMs);
     ORBMDK_DapNoteResult(rc);
+
+    // ★ 最底层 raw 往返日志（**DEBUG** 级 —— 输出量大，2026-10-03 由 INFO 降级）：**所有** DAP 命令（含 DAP_ReadReg /
+    //   DAP_WriteReg / CMSIS_DAP_Commands）都经这里，"raw 返回值"就是 resp [..]。
+    //   注意 V2 分支在 _DapCommandRaw 里把响应规整成 V1 布局（前置报告ID占位），
+    //   故 resp[0] 恒为 0x00、命令号在 resp[1]。
+    {
+        char reqHex[3 * 24 + 8] = {};
+        char respHex[3 * 24 + 8] = {};
+        const size_t rl = respLen ? *respLen : 0;
+        LOG_HID_DEBUG("DAP raw: cmd=0x%02X reqLen=%zu req=[%s] -> rc=%d respLen=%zu resp=[%s]",
+                     (cmd && cmdLen) ? cmd[0] : 0, cmdLen,
+                     HidHexBytes(cmd, cmdLen, reqHex, sizeof(reqHex), 24),
+                     rc, rl,
+                     HidHexBytes(resp, rl, respHex, sizeof(respHex), 24));
+    }
     return rc;
 }
 
@@ -817,7 +1053,13 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
 
         const int r = ORBMDK_USB_Bulk_DAPCommand(cmd, cmdLen, tmp, &tmpLen, timeoutMs);
         if (r != 0) {
-            LOG_HID_ERROR("V2 Bulk DAPCommand failed: result=%d", r);
+            if (r == HID_RC_NOT_IMPLEMENTED) {
+                // 设备明确回 0xFF："该命令未实现"。协议层失败，不是通道故障 ——
+                // 用 WARN 而不是 ERROR，免得多探针的日志把现场指向"探针坏了"。
+                LOG_HID_WARN("V2 Bulk DAPCommand: cmd=0x%02X 未实现（设备回 0xFF）", cmd[0]);
+            } else {
+                LOG_HID_ERROR("V2 Bulk DAPCommand failed: result=%d", r);
+            }
             return r;
         }
 
@@ -881,7 +1123,7 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
                 CloseHandle(writeOl.hEvent);
                 return HID_RC_WRITE_FAILED;
             }
-            DWORD waitResult = WaitForSingleObject(writeOl.hEvent, timeoutMs > 0 ? timeoutMs : 1000);
+            DWORD waitResult = WaitForSingleObject(writeOl.hEvent, timeoutMs > 0 ? timeoutMs : ORBMDK_TIMEOUT_CMD_MS);
             if (waitResult == WAIT_TIMEOUT) {
                 CancelIo(g_hDevice);
                 CloseHandle(writeOl.hEvent);
@@ -909,7 +1151,7 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
                 CloseHandle(ol.hEvent);
                 return HID_RC_READ_FAILED;
             }
-            if (WaitForSingleObject(ol.hEvent, timeoutMs > 0 ? timeoutMs : 1000) == WAIT_TIMEOUT) {
+            if (WaitForSingleObject(ol.hEvent, timeoutMs > 0 ? timeoutMs : ORBMDK_TIMEOUT_CMD_MS) == WAIT_TIMEOUT) {
                 CancelIo(g_hDevice);
                 CloseHandle(ol.hEvent);
                 return HID_RC_READ_TIMEOUT;
@@ -946,6 +1188,18 @@ static int _DapCommandRaw(const uint8_t* cmd, size_t cmdLen,
         } else {
             if (reportIn[0] == cmd[0]) { payloadStart = 1; break; }
             if (bytesRead >= 2 && reportIn[1] == cmd[0]) { payloadStart = 2; break; }
+        }
+
+        // CMSIS-DAP 规范：**未实现的命令**回 0xFF，而不是回显命令字节（ORBMDK_DAP.h
+        // 里也记着这条）。它不是 FIFO 残留 —— 重试三轮也只会再拿到 0xFF，最后报成
+        // "响应错乱"，日志把人指到错误的方向。V2 路径已有同样的判定
+        // （ORBMDK_USB_Bulk_DAPCommand 的 resp[0]==0xFF 分支），这里补齐 V1 侧。
+        if (reportIn[0] == 0xFF || (bytesRead >= 2 && reportIn[1] == 0xFF)) {
+            LOG_HID_WARN("HID 命令未实现（设备回 0xFF）：cmd=0x%02X, "
+                         "IN[0..2]=%02X %02X %02X, readLen=%lu",
+                         cmd[0], reportIn[0], reportIn[1], reportIn[2],
+                         (unsigned long)bytesRead);
+            return HID_RC_NOT_IMPLEMENTED;
         }
 
         // 既不回显也不是本命令的响应（陈旧/无关报告）：丢弃重读
@@ -994,16 +1248,19 @@ static int SendDAPCommand(uint8_t cmdId, const uint8_t* data, size_t dataLen)
 
     uint8_t resp[64] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, 1 + dataLen, resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, 1 + dataLen, resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
+// 返回值 = 设备回报的 Info Length；0 = 没给信息（规范里"未识别的 ID"也是这一档，与
+// 空串 Len=1 是两档，本层不区分，调用方一律按"没答上来"处理）。
+// ⚠ 只用于**字符串类 ID**，理由见 ORBMDK_HID.h 里 DAP_GetInfo 的说明。
 static int DAP_Info(uint8_t infoId, char* buffer, size_t bufferLen)
 {
     uint8_t cmd[2] = {ID_DAP_INFO, infoId};
     uint8_t resp[256] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
 
     // 响应（含报告ID）：[报告ID][命令ID][Info Length][Info Data...]
@@ -1022,7 +1279,7 @@ static int DAP_ConnectSWD(void)
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
 
     // 响应（含报告ID）：[报告ID][命令ID][Port]
@@ -1034,7 +1291,7 @@ static int DAP_SWDConfigure(uint8_t config)
     uint8_t cmd[2] = {ID_DAP_SWD_CONFIGURE, config};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
 static int DAP_TransferConfigure(uint8_t idleCycles, uint16_t waitRetry, uint16_t matchRetry)
@@ -1049,12 +1306,12 @@ static int DAP_TransferConfigure(uint8_t idleCycles, uint16_t waitRetry, uint16_
     };
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
 static int DAP_SWJ_Clock(uint32_t clock)
 {
-    LOG_HID_DEBUG("DAP_SWJ_Clock: enter, clock=%u", clock);
+    LOG_HID_INFO("DAP_SWJ_Clock: enter, clock=%u", clock);
     uint8_t cmd[5] = {
         ID_DAP_SWJ_CLOCK,
         static_cast<uint8_t>(clock & 0xFF),
@@ -1064,7 +1321,7 @@ static int DAP_SWJ_Clock(uint32_t clock)
     };
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
 // ============================================================================
@@ -1073,6 +1330,40 @@ static int DAP_SWJ_Clock(uint32_t clock)
 
 int DAP_GetInfo(uint8_t infoId, char* buffer, size_t bufferLen) { return DAP_Info(infoId, buffer, bufferLen); }
 
+// ★ 探针自报能力位（DAP_Info 0xF0）。
+//
+// 长度**必须按设备自报的 Info Length 读**，不能假定只有 1 字节：
+//   * ARM 官方 DAP.c 的 DAP_ID_CAPABILITIES 就填 `length = 2`（第 2 字节是
+//     "DAP_UART over USB COM port" 那一位），CMSIS-DAP v2.1 固件基本都这样；
+//   * 实测 CherryDAP/HSLinkPro 回 `00 02 33 01`，老一点的固件回 `00 01 1F`。
+// 返回 0 = 成功（*caps = 低字节 | 高字节<<8），<0 = 这条命令没答上来（*caps = 0）。
+int DAP_GetCapabilities(uint16_t* caps)
+{
+    if (caps) *caps = 0;
+
+    uint8_t cmd[2] = {ID_DAP_INFO, static_cast<uint8_t>(DAP_INFO_CAPABILITIES)};
+    uint8_t resp[64] = {};
+    size_t respLen = sizeof(resp);
+
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
+    if (result != 0 || respLen < 4) return -1;
+
+    // 响应（含报告ID）：[报告ID][命令ID][Info Length][Info Data...]
+    const size_t infoLen = resp[2];
+    if (infoLen < 1) return -1;
+
+    uint16_t value = static_cast<uint16_t>(resp[3]);
+    if (infoLen >= 2 && respLen >= 5) {
+        value |= static_cast<uint16_t>(resp[4]) << 8;
+    }
+
+    if (caps) *caps = value;
+    LOG_HID_INFO("DAP_GetCapabilities: caps=0x%04X (infoLen=%u, respLen=%u)",
+                 static_cast<unsigned>(value), static_cast<unsigned>(infoLen),
+                 static_cast<unsigned>(respLen));
+    return 0;
+}
+
 int DAP_ConnectTarget(void)
 {
     int mode = DAP_ConnectSWD();
@@ -1080,7 +1371,7 @@ int DAP_ConnectTarget(void)
         uint8_t cmd[2] = {ID_DAP_CONNECT, 0};
         uint8_t resp[4] = {};
         size_t respLen = sizeof(resp);
-        int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+        int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
         if (result != 0 || respLen < 3) return -1;
         mode = resp[2];
     }
@@ -1095,7 +1386,7 @@ int DAP_ConnectTargetPort(int port)
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
 
-    const int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    const int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     return resp[2];
 }
@@ -1104,7 +1395,7 @@ int DAP_DisconnectTarget(void) {
     uint8_t cmd[1] = {ID_DAP_DISCONNECT};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, 1, resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, 1, resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 int DAP_ConfigureTransfer(uint8_t idleCycles, uint16_t waitRetry, uint16_t matchRetry) { return DAP_TransferConfigure(idleCycles, waitRetry, matchRetry); }
 int DAP_SetSWJClock(uint32_t clock) { return DAP_SWJ_Clock(clock); }
@@ -1118,13 +1409,13 @@ int DAP_Transfer(int dapId, uint8_t request, uint32_t* data)
 
     if ((request & 0x02) == 0) {
         memcpy(&cmd[4], data, 4);
-        int result = ORBMDK_HID_DAPCommand(cmd, 8, resp, &respLen, 1000);
+        int result = ORBMDK_HID_DAPCommand(cmd, 8, resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
         if (result != 0) {
             LOG_HID_ERROR("DAP_Transfer write failed: result=%d", result);
             return DAP_RES_ERROR;
         }
     } else {
-        int result = ORBMDK_HID_DAPCommand(cmd, 4, resp, &respLen, 1000);
+        int result = ORBMDK_HID_DAPCommand(cmd, 4, resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
         if (result != 0) {
             LOG_HID_ERROR("DAP_Transfer read failed: result=%d", result);
             return DAP_RES_ERROR;
@@ -1155,6 +1446,15 @@ int DAP_Transfer(int dapId, uint8_t request, uint32_t* data)
         status = DAP_RES_VALUE_MISMATCH;
     }
     
+    // ★ raw 返回值（**DEBUG** 级）：DAP_ReadReg / DAP_WriteReg 的最终判据全在这条 ——
+    //   整条响应原样打印（含 ack 与 status），只看它就能判断"设备到底回了什么"。
+    {
+        char respHex[3 * 12 + 8] = {};
+        LOG_HID_DEBUG("DAP_Transfer raw: dapId=%d request=0x%02X respLen=%zu ack=0x%X status=%d resp=[%s]",
+                     dapId, request, respLen, static_cast<unsigned>(ack), status,
+                     HidHexBytes(resp, respLen, respHex, sizeof(respHex), 12));
+    }
+
     if (respLen >= 8) {
         memcpy(data, &resp[4], 4);
     }
@@ -1176,14 +1476,17 @@ int DAP_TransferBlock(int dapId, uint16_t count, uint8_t request,
         cmd.insert(cmd.end(), data, data + count * 4);
     }
 
-    // 响应缓冲按**最大可能的块传输**开：V2 Bulk 一次往返可带 ~250 字
-    // （5 + 250*4 = 1005 字节），旧值 64*4+4=260 会把 V2 的块传输截断到
-    // 63 字，白白浪费了 Bulk 的大包能力。V1 HID 下命令长度本身被下面的
-    // HID_MAX_PACKET_SIZE 校验挡住，缓冲开大无副作用。
+    // 响应缓冲按**固件允许的上限**开：V2 块传输最多 126 字
+    //     响应 = 5 + 126*4 = 509 字节
+    // （上限见 ORBMDK_RDDI.cpp 的 kMaxBlockWordsHardLimit；旧值 64*4+4=260
+    //  会把 V2 的块传输截断到 63 字，白白浪费 Bulk 的大包能力）。
+    // ⚠ 这个缓冲**不是**上限来源：真正夹取在 BlockWordsLimit()，那里按固件
+    //   自报包长算（orbtrace 标定 508 -> 125 字）。V1 HID 下命令长度另有
+    //   报告负载校验挡住，缓冲开大无副作用。
     uint8_t resp[1024] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 5000);
+    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, ORBMDK_TIMEOUT_RESET_MS);
     if (result != 0 || respLen < 5) return DAP_RES_ERROR;
 
     // 标准响应（含报告ID）：
@@ -1241,7 +1544,7 @@ int DAP_WriteAbort(int dapId, uint32_t abort)
     };
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
 int DAP_SWJ_Sequence(uint8_t count, const uint8_t* data)
@@ -1254,7 +1557,7 @@ int DAP_SWJ_Sequence(uint8_t count, const uint8_t* data)
 
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 1000);
+    return ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
 }
 
 int DAP_SWJ_Pins(uint8_t pinSelect, uint8_t pinOut, int* pinIn, int wait)
@@ -1269,7 +1572,7 @@ int DAP_SWJ_Pins(uint8_t pinSelect, uint8_t pinOut, int* pinIn, int wait)
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     // 响应（含报告ID）：[报告ID][命令ID][Pin State]
     if (result == 0 && pinIn && respLen >= 3) *pinIn = resp[2];
     return result;
@@ -1281,7 +1584,7 @@ int DAP_ResetTarget(void)
     uint8_t cmd[1] = {ID_DAP_RESET_TARGET};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    const int rc = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 5000);
+    const int rc = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_RESET_MS);
     LOG_HID_INFO("DAP_ResetTarget: rc=%d, respLen=%u, resp=[%02X %02X %02X %02X]",
                  rc, (unsigned)respLen, resp[0], resp[1], resp[2], resp[3]);
     return rc;
@@ -1292,7 +1595,7 @@ int DAP_TransferAbort(int dapId)
     uint8_t cmd[2] = {ID_DAP_TRANSFER_ABORT, static_cast<uint8_t>(dapId)};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 100);
+    return ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_SHORT_MS);
 }
 
 // ============================================================================
@@ -1317,7 +1620,7 @@ int DAP_JTAG_Configure(const uint8_t* irLengths, uint8_t devCount)
 
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    const int result = ORBMDK_HID_DAPCommand(cmd, (size_t)(2 + devCount), resp, &respLen, 1000);
+    const int result = ORBMDK_HID_DAPCommand(cmd, (size_t)(2 + devCount), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     // 响应格式：[报告ID][命令ID][状态]
     return resp[2] == 0 ? 0 : -1;
@@ -1355,7 +1658,7 @@ int DAP_JTAG_Sequence(const JtagSeg* segs, int segCount,
 
     uint8_t resp[128] = {};
     size_t respLen = sizeof(resp);
-    const int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 1000);
+    const int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0) return -1;
 
     // 响应（已规整为 V1 布局）：[报告ID][0x14][status][捕获段的 TDO 依次拼接]
@@ -1379,7 +1682,7 @@ int DAP_JTAG_IDCODE(int* idcodeCount, uint32_t* idcodes)
     uint8_t resp[64] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 2) return -1;
 
     // 响应（含报告ID）：[报告ID][命令ID][IDCODE Count][IDCODE 数据...]
@@ -1409,7 +1712,7 @@ int DAP_SWO_Transport(uint8_t transport)
     uint8_t cmd[2] = {ID_DAP_SWO_TRANSPORT, transport};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     return resp[2] == 0 ? 0 : -1;
 }
@@ -1419,7 +1722,7 @@ int DAP_SWO_Mode(uint8_t mode)
     uint8_t cmd[2] = {ID_DAP_SWO_MODE, mode};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     return resp[2] == 0 ? 0 : -1;
 }
@@ -1435,7 +1738,7 @@ int DAP_SWO_Baudrate(uint32_t baudrate)
     };
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     return resp[2] == 0 ? 0 : -1;
 }
@@ -1445,7 +1748,7 @@ int DAP_SWO_Control(uint8_t control, uint8_t* status)
     uint8_t cmd[2] = {ID_DAP_SWO_CONTROL, control};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     // 响应（含报告ID）：[报告ID][命令ID][状态]
     if (status) *status = resp[2];
@@ -1464,7 +1767,7 @@ int DAP_SWO_Data(uint8_t* data, size_t* dataLen, uint8_t* status, uint16_t* trac
     uint8_t resp[512] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
 
     // 响应格式：[报告ID][命令ID][状态][计数LSB][计数MSB][数据...]
@@ -1501,7 +1804,7 @@ int DAP_QueueCommands(const uint8_t* commands, size_t cmdLen, uint8_t* responses
     std::vector<uint8_t> resp(*respLen > 0 ? *respLen : 256);
     size_t localRespLen = resp.size();
 
-    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp.data(), &localRespLen, 5000);
+    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp.data(), &localRespLen, ORBMDK_TIMEOUT_RESET_MS);
     if (result != 0 || localRespLen < 2) return -1;
 
     if (responses && *respLen > 0) {
@@ -1548,7 +1851,7 @@ int DAP_SWD_Sequence(uint8_t count, const uint8_t* data)
 
     uint8_t resp[64] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, 1000);
+    int result = ORBMDK_HID_DAPCommand(cmd.data(), cmd.size(), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
     if (result != 0 || respLen < 3) return -1;
     // 响应格式：[报告ID][命令ID][状态]
     return resp[2] == 0 ? 0 : -1;
@@ -1559,7 +1862,7 @@ int DAP_HostStatus(uint8_t hostStatus, uint8_t state)
     uint8_t cmd[3] = {ID_DAP_HOST_STATUS, hostStatus, state};
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 100);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_SHORT_MS);
     if (result != 0 || respLen < 3) return -1;
     // 响应格式：[报告ID][命令ID][状态]
     return resp[2] == 0 ? 0 : -1;
@@ -1859,7 +2162,7 @@ int StreamingTrace_GetStatus(uint8_t* status, uint16_t* traceCount)
     uint8_t resp[8] = {};
     size_t respLen = sizeof(resp);
 
-    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, 100);
+    int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_SHORT_MS);
     // 响应（含报告ID）：[报告ID][命令ID][Status][Count LSB][Count MSB]
     //   原实现按 resp[1]/resp[2]/resp[3] 解析，漏掉了报告ID偏移，导致读到命令ID。
     if (result != 0 || respLen < 5) {

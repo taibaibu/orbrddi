@@ -3,10 +3,10 @@
 """
 pe_re.py — Keil AGDI / RDDI DLL 逆向分析小工具
 
-用于分析 32 位 PE（典型目标）：
-    D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll       官方 ARM CMSIS-AGDI（AGDI 层）
-    D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll        实际生效的 RDDI 层（可能是 ORBMDK）
-    D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll.bak    官方 RDDI 层备份（对照基准）
+用于分析 32 位 PE（典型目标；<KeilRoot> = Keil 安装根，如 D:\\Keil_v5）：
+    <KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll       官方 ARM CMSIS-AGDI（AGDI 层）
+    <KeilRoot>\\ARM\\BIN\\CMSIS_DAP.dll        实际生效的 RDDI 层（可能是 ORBMDK）
+    <KeilRoot>\\ARM\\BIN\\CMSIS_DAP.dll.bak    官方 RDDI 层备份（对照基准）
 
 依赖：仅 capstone（PE 解析自带，无 pefile 依赖）
     python -m pip install capstone
@@ -35,15 +35,15 @@ pe_re.py — Keil AGDI / RDDI DLL 逆向分析小工具
     `mov reg,eax` + `mov [slot],reg` 的写法（曾据此漏判 CMSIS_DAP_SWO_Data 的槽位）。
 
 示例：
-    python pe_re.py exports "D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll.bak"
-    python pe_re.py names   "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" "^(CMSIS_DAP|DAP|RDDI)_"
-    python pe_re.py dis     "D:\\MDK5\\ARM\\BIN\\CMSIS_DAP.dll" CMSIS_DAP_GetDeviceIDList 400
-    python pe_re.py dis     "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x10022A60 0xD0
-    python pe_re.py xref    "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" CMSIS_DAP_Disconnect
-    python pe_re.py refs    "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x102F8B90
-    python pe_re.py slots   "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1002C000 0x1002CA00
-    python pe_re.py slots   "D:\\MDK5\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1003CC80 0x1003CF00
-    python pe_re.py scan    "D:\\Keil_v5\\ARM\\BIN\\CMSIS_AGDI.dll"
+    python pe_re.py exports "<KeilRoot>\\ARM\\BIN\\CMSIS_DAP.dll.bak"
+    python pe_re.py names   "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" "^(CMSIS_DAP|DAP|RDDI)_"
+    python pe_re.py dis     "<KeilRoot>\\ARM\\BIN\\CMSIS_DAP.dll" CMSIS_DAP_GetDeviceIDList 400
+    python pe_re.py dis     "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" 0x10022A60 0xD0
+    python pe_re.py xref    "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" CMSIS_DAP_Disconnect
+    python pe_re.py refs    "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" 0x102F8B90
+    python pe_re.py slots   "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1002C000 0x1002CA00
+    python pe_re.py slots   "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll" 0x1003CC80 0x1003CF00
+    python pe_re.py scan    "<KeilRoot>\\ARM\\BIN\\CMSIS_AGDI.dll"
 """
 
 import bisect

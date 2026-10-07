@@ -23,9 +23,16 @@
 #include <winioctl.h>
 #pragma comment(lib, "setupapi.lib")
 
+// 设备接口 GUID 直接取**系统头常量**（不再手抄 16 字节字面量，消除抄错风险）：
+//   initguid.h 让随后的 DEFINE_GUID 在本 TU 实例化；uuid.lib 兜底 extern 符号。
+#include <initguid.h>
+#include <usbiodef.h>   // GUID_DEVINTERFACE_USB_DEVICE
+#pragma comment(lib, "uuid.lib")
+
 // WinUSB 需要在 setupapi.h 之后包含，且需要先定义
 #define WINUSB_NO_DEFAULT_LIB
 #include <winusb.h>
+#include <winusbio.h>   // GUID_DEVINTERFACE_WINUSB
 #pragma comment(lib, "winusb.lib")
 
 // GUID for USB devices (定义在 WinUSB 辅助函数区)
@@ -121,24 +128,28 @@ static const GUID CMSIS_DAP_V2_GUID_DEVINTERFACE =
 // orbtrace 的 MI_05("CMSIS-DAP v2") 同时挂了两个接口 GUID：本 GUID 与上面的
 // CMSIS-DAP 专用 GUID。实测用专用 GUID 调 SetupDiGetClassDevs 枚举到 0 个接口
 // （尽管注册表 DeviceClasses 下确实有该实例），所以优先用这个标准的 WinUSB GUID。
+// ⚠ 这个 GUID **SDK 没给常量名**（winusb.h / winusbio.h / usbiodef.h 里都没有
+//    GUID_DEVINTERFACE_WINUSB），只能手写字面量；值取自 WinUSB INF/官方文档
+//    {DEE824EF-729B-4A0E-9C14-B7117D33A817}。
 static const GUID WINUSB_GUID_DEVINTERFACE =
     {0xDEE824EF, 0x729B, 0x4A0E, {0x9C, 0x14, 0xB7, 0x11, 0x7D, 0x33, 0xA8, 0x17}};
 
-// 普通 USB 设备接口 GUID (从 wdmguid.h)，作为兜底再试一次
-static const GUID USB_GUID_DEVINTERFACE = 
-    {0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED}};
+// 普通 USB 设备接口（兜底）：系统头常量 GUID_DEVINTERFACE_USB_DEVICE（usbiodef.h）
+static const GUID& USB_GUID_DEVINTERFACE = GUID_DEVINTERFACE_USB_DEVICE;
 
 // ---------------------------------------------------------------------------
 // 诊断日志（统一实现见 src/ORBMDK_Log.cpp，COMPAT_ANALYSIS §8.3）
 //
 // 本文件此前完全没有日志（见 §8.1），V2 打不开时无从排查；后来补了 BulkTrace，
 // 但它绕过级别、绕过 ORBMDK_LOG_FILE、且手写前缀（§8.2(2)(3)）。
-// 现在走统一入口：**仍然不受级别控制、仍然只落盘**，但会遵循 ORBMDK_LOG_FILE，
-// 并带上时间戳与进程/线程号。
+// 现在走统一入口：遵循 ORBMDK_LOG_FILE 并带时间戳/进程线程号。
+//
+// ⚠ 2026-10-03：按"**最底层日志统一 INFO**"的口径改为 ORBMDK_LOG_INFO ——
+// 传输级日志是排障必备，阈值设为 INFO(1) 时即可见，并会送宿主（Keil）日志窗口。
 // 只记关键路径（枚举到的接口、被拒绝的原因、最终选中的端点），不记逐次传输。
 // ---------------------------------------------------------------------------
 #define ORBMDK_LOG_MODULE "BULK"
-#define BulkTrace(...) ORBMDK_LOG_TRACE(__VA_ARGS__)
+#define BulkTrace(...) ORBMDK_LOG_INFO(__VA_ARGS__)
 
 // V2 接口的产品名（来自接口字符串描述符，通常是 "CMSIS-DAP v2"）
 static char g_bulkProductName[128] = {0};
@@ -235,14 +246,17 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
         // 放开 VID/PID 之后，枚举可能选中别的厂商的 0xFF 接口（也绑了 WinUSB、
         // 也有 Bulk 对）。不在这里问一句，错误会一路拖到第一条命令读超时才爆，
         // 现场表现就成了"探针不响应"，而不是"这台设备不是 DAP"。
-        char v2fw[64] = {};
-        if (DAP_GetInfo(DAP_INFO_FIRMWARE, v2fw, sizeof(v2fw)) <= 0 || v2fw[0] == '\0') {
+        //
+        // ⚠ 这里只校验"有没有有效应答"，**不校验版本号内容**：0x04 是 CMSIS-DAP
+        //    **协议版本**（不是产品固件版本，那是 0x09）。
+        char v2ver[64] = {};
+        if (DAP_GetInfo(DAP_INFO_PROTOCOL_VERSION, v2ver, sizeof(v2ver)) <= 0 || v2ver[0] == '\0') {
             BulkTrace("SelectInterface: ifNo=0 (bulk) 打开成功但对 DAP_Info 无有效应答 "
                       "-> 该接口不是 CMSIS-DAP");
             ORBMDK_DapChannelReset("V2 接口不是 CMSIS-DAP");
             return -1;
         }
-        BulkTrace("SelectInterface: ifNo=0 (bulk) DAP 自检通过 (fw='%s')", v2fw);
+        BulkTrace("SelectInterface: ifNo=0 (bulk) DAP 自检通过 (protoVer='%s')", v2ver);
         return 0;
     }
 
@@ -258,8 +272,8 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
     // "CMSIS_DAP_Connect: connect failed, mode=0x61"（0x61='a' 正是那段文本的
     // 第 3 个字节），日志指向"探针失效"而不是"选错了接口"。
     // ------------------------------------------------------------------
-    char fw[64] = {};
-    if (DAP_GetInfo(DAP_INFO_FIRMWARE, fw, sizeof(fw)) <= 0 || fw[0] == '\0') {
+    char ver[64] = {};
+    if (DAP_GetInfo(DAP_INFO_PROTOCOL_VERSION, ver, sizeof(ver)) <= 0 || ver[0] == '\0') {
         BulkTrace("SelectInterface: ifNo=1 (HID) 打开成功但对 DAP_Info 无有效应答 "
                   "-> 该 HID 接口不是 CMSIS-DAP，请在适配器列表里选 ifNo=0 (%s)",
                   _transportName(USB_BULK_TRANSPORT_BULK));
@@ -268,7 +282,7 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo)
         ORBMDK_DapChannelReset("HID 接口不是 CMSIS-DAP");
         return -1;
     }
-    BulkTrace("SelectInterface: ifNo=1 (HID) DAP 自检通过 (fw='%s')", fw);
+    BulkTrace("SelectInterface: ifNo=1 (HID) DAP 自检通过 (protoVer='%s')", ver);
     return 0;
 }
 
@@ -283,8 +297,22 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetInterfaceName(int ifNo, char* buf, size_t
     buf[0] = '\0';
 
     if (ifNo == 1) {
-        // V1：HID 接口自己的字符串描述符就是 "CMSIS-DAP v1"
-        strncpy_s(buf, len, "CMSIS-DAP v1", _TRUNCATE);
+        // ifNo=1 的名字**必须先问一句**"总线上到底有没有 v1 接口"。
+        //
+        // CMSIS_DAP_Detect 恒报 2 个接口（0=v2 / 1=v1），所以**并不存在**的 v1
+        // 也会进适配器列表。历史问题：这里无条件回 "CMSIS-DAP v1"，于是只有
+        // 厂商配置通道 HID 的 0x0D28:0x0204 也显示成一条可选 v1 适配器；用户
+        // 选中它必然失败（ConfigureInterface 的 DAP_Info 自检，还要白等 1 秒）。
+        // 现在没有 v1 候选就如实标注，用户不会再去选空气。
+        if (ORBMDK_HID_HasV1Candidate() > 0) {
+            strncpy_s(buf, len, "CMSIS-DAP v1", _TRUNCATE);
+        } else {
+            // ⚠ 返回给 AGDI 的串**只能是 ASCII**：它被 µVision 按 ANSI 代码页
+            // 解释，而本工程是 /utf-8 编译的，直接写中文必然乱码。
+            // 想显示中文（非 ASCII）就得像 ORBMDK_HID.cpp 里读设备描述符那样
+            // 先 WideCharToMultiByte(CP_ACP, ...) 转码，别直接塞 UTF-8 字面量。
+            strncpy_s(buf, len, "CMSIS-DAP v1 (not detected)", _TRUNCATE);
+        }
         return 0;
     }
 
@@ -1164,7 +1192,7 @@ static bool _initWinUSB(uint16_t vid, uint16_t pid, const char* serial)
         return false;
     }
 
-    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态（bug.md B1）。
+    // 设备刚打开：清掉上一次会话在这个进程里留下的熔断状态。
     // 放在两条探测之前 —— 它们走 _bulkWrite/_bulkRead 直连、不经熔断闸门，而
     // "刚打开就认定设备已死"本来也不成立；真的是哑机，随后几条 DAP 命令会立刻
     // 把它重新熔断。这保证"探针重新上电"这条恢复路径永远不被熔断挡住。
@@ -1289,12 +1317,22 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_Init(uint16_t vid, uint16_t pid, const char*
     }
     g_ctx.deviceInfo.protocol_version = 1;
 
-    // 包长取设备 HID 报告负载，但 DAP v1 规范上限 64
+    // 包长取设备 HID 报告负载。v1 规范上限 64，且能走到这里的设备在准入时已被
+    // 判据"负载 ≤ 64"筛过（见 ORBMDK_HID.cpp 的 CMSIS_DAP_V1_PAYLOAD_MAX）——
+    // 这里的钳位只剩兜底作用（hidPayload == 0：报告布局没解析出来）。
     const size_t hidPayload = ORBMDK_HID_GetPayloadMax();
     g_ctx.deviceInfo.max_packet_size = (hidPayload == 0 || hidPayload >= 64)
                                            ? 64U : (uint32_t)hidPayload;
 
-    BulkTrace("Init: V1 HID mode OK (vid=0x%04X pid=0x%04X 报告负载=%zu)",
+    // ⚠ 这里**不能**写 "OK"："接口打开成功" ≠ "接口在讲 CMSIS-DAP"。
+    // 实测（Todo 续 5）：这句 "V1 HID mode OK" 出现在 SelectInterface 的 DAP_Info
+    // 自检**之前 1 秒**，等于给一条最终不可用的通道打了 OK，误导性很强
+    // （现场就是靠它认定"HID 通道没问题"的）。自检通过后 SelectInterface 会另打
+    // "SelectInterface: ifNo=1 (HID) DAP 自检通过"，那才是可用的证据。
+    // 注：V2 那行 "Init: V2 Bulk mode OK" 保留原样 —— 它的打开路径里有
+    // _calibrateOutPacket 的真实 DAP_Info 往返，OK 是有据的。
+    BulkTrace("Init: V1 HID 接口已打开 (vid=0x%04X pid=0x%04X 报告负载=%zu)，"
+              "尚未做 DAP 自检",
               g_ctx.deviceInfo.vid, g_ctx.deviceInfo.pid, hidPayload);
     return 0;
 }
@@ -1371,6 +1409,13 @@ static size_t _bulkPacketSize(size_t cmdLen)
         if (def == 0) {
             def = 64;                         // 描述符没给出时的保守回退
         }
+    }
+    // ★ 规则 ①对**标定值**同样成立，必须在这里再兜一次：
+    //   H7-TOOL（0xC251:0xF00A）的 DAP_Info(0xFF) 自报 512 == 端点 wMaxPacketSize，
+    //   标定若照单全收，就又把"整包"发了出去 —— 实测该固件在整包上"连答两条、
+    //   随后永久无响应"，整场会话报废（与 orbtrace 同类现象）。统一夹到 maxPkt-1。
+    if (g_winusb.bulkOutMaxPkt > 1 && def >= (size_t)g_winusb.bulkOutMaxPkt) {
+        def = (size_t)g_winusb.bulkOutMaxPkt - 1;
     }
     if (def < cmdLen) {
         def = cmdLen;
@@ -1466,6 +1511,35 @@ static bool _probeRoundTrip(size_t cand, int infoId, uint8_t* rbuf, size_t rcap,
     return true;
 }
 
+/**
+ * @brief flush 之后的"热身"：把被啃掉的前几条命令提前消耗掉
+ *
+ * 实测（H7-TOOL 0xC251:0xF00A，端点 512）：`_flushAndDrainPipes()` 里的
+ * AbortPipe/ResetPipe 之后，该固件会**连续吞掉两条**命令（各等满超时），
+ * 第三条起才恢复一问一答。不热身的话，这两次超时正好落在 `RDDI_Open` 的
+ * 第一条真实命令上 —— 既白等 2 秒，还会把"连续失败"喂给熔断器
+ * （日志里表现为每次打开都报一次"V2 Bulk DAPCommand failed" + "DAP 通道熔断"）。
+ *
+ * 热身用 `DAP_Info(0xF0)`（只读、无副作用，任何 CMSIS-DAP v2 固件都必须答），
+ * 最多 3 次，拿到合法响应就认为通道已活。对本来没这个毛病的固件
+ * （CherryDAP / orbtrace）第一次就成功，代价只有一次往返（毫秒级）；
+ * 全部失败也不报错，把判断权交回调用方的第一条真实命令。
+ */
+static void _warmUpAfterFlush(void)
+{
+    const size_t pad = g_winusb.alignedOutPkt ? (size_t)g_winusb.alignedOutPkt : 64;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        uint8_t rbuf[128] = {0};
+        int n = 0;
+        if (_probeRoundTrip(pad, 0xF0, rbuf, sizeof(rbuf), &n) &&
+            n >= 3 && rbuf[0] == 0x00 && rbuf[1] >= 1) {
+            BulkTrace("warmup: channel alive after %d attempt(s)", attempt + 1);
+            return;
+        }
+    }
+    BulkTrace("warmup: no valid response in 3 attempts (cold channel?)");
+}
+
 static void _calibrateOutPacket(void)
 {
     if (g_winusb.bulkOutMaxPkt == 0) {
@@ -1499,11 +1573,25 @@ static void _calibrateOutPacket(void)
                   (unsigned)g_winusb.deviceSpeed);
     }
 
-    // ---- ③ 候选验证：谁能稳定答对 DAP_Info(0xF0) 就用谁 ----
+    // ---- ③ 候选验证：谁能**连续两次**稳定答对 DAP_Info(0xF0) 就用谁 ----
     size_t cands[3] = {0, 0, 0};
     int nc = 0;
     if (devPkt >= 8) {
-        cands[nc++] = (size_t)devPkt;
+        size_t v = (size_t)devPkt;
+        // ★ 规则 ①：绝不用"整包"。设备自报的"最大可接收长度"经常**就是端点
+        //   wMaxPacketSize 本身**（H7-TOOL 自报 512 == 端点 512），照单全收等于
+        //   把规则 ① 绕过去 —— 实测该固件在整包上"连答两条、之后永久无响应"
+        //   （orbtrace 更谨慎：自报 508 = 512-4，正是为避开 ① 留的余量）。
+        //   统一夹到 maxPkt-1，标定值因此也永远是短包。
+        if (g_winusb.bulkOutMaxPkt > 1 && v >= (size_t)g_winusb.bulkOutMaxPkt) {
+            const size_t clamped = (size_t)g_winusb.bulkOutMaxPkt - 1;
+            BulkTrace("calibrate: device reports %u >= endpoint max %u (整包) -> clamp to %u",
+                      (unsigned)v, (unsigned)g_winusb.bulkOutMaxPkt, (unsigned)clamped);
+            v = clamped;
+        }
+        if (v >= 8) {
+            cands[nc++] = v;
+        }
     }
     if (nc == 0 || cands[0] != 64) {
         cands[nc++] = 64;                        // 通用安全值（短包）
@@ -1516,18 +1604,34 @@ static void _calibrateOutPacket(void)
         if (i > 0) {
             _flushAndDrainPipes();               // 换候选前把通道清干净
         }
+        // 合法响应判据：[报告ID][命令ID][Info Length >= 1][Info Data...]。
+        // ★ Info Length **不能只认 1**：CMSIS-DAP v2.1 的固件把 capabilities 报成
+        //   两字节（ARM 官方 DAP.c 的 DAP_ID_CAPABILITIES 就是 length = 2），实测
+        //   CherryDAP/HSLinkPro 回 `00 02 33 01`。按 "== 1" 判会让这类固件**每个
+        //   候选都不通过**，于是每次退化到 64（日志里的 "no packet size verified"）。
+        // ★ 连续两次都通过才接受：整包候选在某些固件上表现为"第一条能答、之后永久
+        //   无响应"（见 _bulkPacketSize ① 的注释），只验一次会被这种候选骗过去。
+        int consecutive = 0;
         for (int attempt = 0; attempt < 3; ++attempt) {
             uint8_t rbuf[128] = {0};
             int n = 0;
-            if (_probeRoundTrip(cands[i], 0xF0, rbuf, sizeof(rbuf), &n) &&
-                n >= 3 && rbuf[0] == 0x00 && rbuf[1] == 1) {
+            const bool valid = _probeRoundTrip(cands[i], 0xF0, rbuf, sizeof(rbuf), &n) &&
+                               n >= 3 && rbuf[0] == 0x00 && rbuf[1] >= 1;
+            if (!valid) {
+                consecutive = 0;
+                BulkTrace("calibrate: packet=%u attempt %d -> no valid response, retry",
+                          (unsigned)cands[i], attempt + 1);
+                continue;
+            }
+            if (++consecutive >= 2) {
                 g_winusb.alignedOutPkt = (USHORT)cands[i];
-                BulkTrace("calibrate: outPacket=%u verified (DAP_Info 0xF0 -> %02X %02X %02X)",
-                          (unsigned)cands[i], rbuf[0], rbuf[1], rbuf[2]);
+                BulkTrace("calibrate: outPacket=%u verified (DAP_Info 0xF0 -> %02X %02X %02X %02X, n=%d)",
+                          (unsigned)cands[i], rbuf[0], rbuf[1], rbuf[2], rbuf[3], n);
                 _flushAndDrainPipes();
+                _warmUpAfterFlush();             // 吞命令的固件在这里把前两条交掉
                 return;
             }
-            BulkTrace("calibrate: packet=%u attempt %d -> no valid response, retry",
+            BulkTrace("calibrate: packet=%u attempt %d -> valid, confirm again",
                       (unsigned)cands[i], attempt + 1);
         }
     }
@@ -1592,7 +1696,7 @@ static int _bulkTransferCommand(const uint8_t* cmd, size_t cmdLen,
 ORBMDK_INTERNAL int ORBMDK_USB_Bulk_DAPCommand(const uint8_t* cmd, size_t cmdLen,
                                           uint8_t* resp, size_t* respLen, int timeoutMs)
 {
-    // 熔断闸门（bug.md B1）。这里**只拦、不记账** —— 记账统一由
+    // 熔断闸门。这里**只拦、不记账** —— 记账统一由
     // ORBMDK_HID_DAPCommand 那个分发点做，否则同一次失败会被记两次。
     // 加在这里是为了覆盖绕过分发点的直连调用（如 CMSIS_DAP_PC_Capture）。
     if (!ORBMDK_DapChannelUsable()) {
@@ -1635,11 +1739,13 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_DAPCommand(const uint8_t* cmd, size_t cmdLen
         }
 
         if (resp[0] == 0xFF) {
-            // 0xFF = 设备明确回答"不支持该命令"（DAPLink 约定；orbtrace 对
-            // SWO 类命令即如此）。这不是 FIFO 残留，不必冲刷重试 —— 重试也
-            // 只会再拿到一个 0xFF，白白多花一次 flush + 复位的时间。
-            BulkTrace("DAPCommand: cmd=0x%02X not supported by device (resp=0xFF)", cmd[0]);
-            return -1;
+            // 0xFF = 设备明确回答"不支持该命令"（CMSIS-DAP 规范；DAPLink 与
+            // orbtrace 对未实现的命令都如此）。这不是 FIFO 残留，不必冲刷重试 ——
+            // 重试也只会再拿到一个 0xFF，白白多花一次 flush + 复位的时间。
+            // 返回码与 V1 路径同一语义（HID_RC_NOT_IMPLEMENTED）：协议层失败，
+            // 既不是超时，也不参与熔断。
+            BulkTrace("DAPCommand: cmd=0x%02X not implemented by device (resp=0xFF)", cmd[0]);
+            return HID_RC_NOT_IMPLEMENTED;
         }
 
         BulkTrace("DAPCommand: cmd=0x%02X got stale response (resp[0]=0x%02X) -> flush & retry",
@@ -1715,14 +1821,17 @@ ORBMDK_INTERNAL int CMSIS_DAP_V2_GetInfo(uint8_t info_id, uint8_t* buffer, size_
         return 1;
 
     case DAPV2_INFO_FIRMWARE_VERSION: {
-        // 版本必须**问设备**（CMSIS-DAP `ID_DAP_INFO` + 标准 idNo = 4），
-        // **不读** USB 描述符的 bcdDevice —— 那是 USB 栈写的字段，不等于固件版本。
-        // 转调统一分发点 DAP_GetInfo：它按当前传输模式发命令并解析响应。
-        // ⚠ 这里用**标准编号 DAP_INFO_FIRMWARE(=4)**，而不是本 switch 的
-        // DAPV2_INFO_FIRMWARE_VERSION(==0x03)：ORBMDK_DAPV2.h 里那套 DAPV2_INFO_*
-        // 编号与 CMSIS-DAP 的 DAP_INFO_* 不对齐（见该头 148-161 行）。
+        // 版本必须**问设备**（CMSIS-DAP `ID_DAP_INFO`），**不读** USB 描述符的
+        // bcdDevice —— 那是 USB 栈写的字段，不等于固件版本。转调统一分发点
+        // DAP_GetInfo：它按当前传输模式发命令并解析响应。
+        //
+        // ⚠️ 本 case 名为 FIRMWARE_VERSION，实际问的是 **0x04 = CMSIS-DAP 协议版本**
+        //    （按规范产品固件版本才是 0x09；H7-TOOL 对 0x09 回 Len=0）。此处保持原行为。
+        //    另：本 switch 的 DAPV2_INFO_FIRMWARE_VERSION(==0x03) 那套编号与规范不对齐，
+        //    必须用 ORBMDK_DAP.h 的 DAP_INFO_*（见 ORBMDK_DAPV2.h 的说明）。
+        // 现状：`CMSIS_DAP_V2_GetInfo` 在全工程**没有调用点**，故上述口径不影响运行时。
         buffer[0] = '\0';
-        (void)DAP_GetInfo(DAP_INFO_FIRMWARE, (char*)buffer, buffer_len);
+        (void)DAP_GetInfo(DAP_INFO_PROTOCOL_VERSION, (char*)buffer, buffer_len);
         if (buffer[0] == '\0') {
             return -1;
         }
