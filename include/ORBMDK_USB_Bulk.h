@@ -20,6 +20,20 @@ typedef enum {
     USB_BULK_BULK_MODE    = 2,    // V2 Bulk 模式
 } USB_Bulk_Mode;
 
+// 传输模式偏好
+//
+// 需求：V1(HID) 与 V2(Bulk) 两种都要能**显式选择使用**，而不是只能被动回退。
+//   AUTO ：优先 V2，不可用才回退 V1（仅用于"用户尚未选定接口"的窗口期）
+//   BULK ：只用 V2；不可用直接失败（不做静默降级）
+//   HID  ：只用 V1
+//
+// 选择来源只有一处：CMSIS_DAP_ConfigureInterface(ifNo)。没有文件/环境变量开关。
+typedef enum {
+    USB_BULK_TRANSPORT_AUTO = 0,
+    USB_BULK_TRANSPORT_BULK = 1,
+    USB_BULK_TRANSPORT_HID  = 2,
+} USB_Bulk_TransportPref;
+
 // 连接信息
 typedef struct {
     uint16_t vid;
@@ -74,6 +88,43 @@ ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetDeviceInfo(USB_Bulk_Device_Info* info);
  * @return 0 成功（取到名字）, <0 失败
  */
 ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetProductName(char* buf, size_t len);
+
+/**
+ * @brief 获取当前配置的传输模式偏好
+ * @return USB_Bulk_TransportPref 取值
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetTransportPreference(void);
+
+/**
+ * @brief 按"接口序号"选定传输层（来自 AGDI 的 CMSIS_DAP_ConfigureInterface）
+ *
+ *   ifNo 0 -> CMSIS-DAP v2 (USB Bulk)
+ *   ifNo 1 -> CMSIS-DAP v1 (HID)
+ *
+ * 这是传输层的**唯一**选择来源（没有文件/环境变量开关）。必要时现场切换；
+ * 选中的通道打不开时返回非 0（上层据此如实报错，不做静默降级）。
+ *
+ * @return 0 成功
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_SelectInterface(int ifNo);
+
+/**
+ * @brief 某个接口序号对应的适配器名字（AGDI 对话框列表里显示的就是它）
+ * @return 0 成功
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetInterfaceName(int ifNo, char* buf, size_t len);
+
+/**
+ * @brief 获取 V2 接口所属设备的序列号
+ *
+ * V2 模式下没有打开 HID 接口，HidD_GetSerialNumberString 不可用；
+ * 序列号改从设备的 iSerialNumber 字符串描述符读，供 CMSIS_DAP_Identify(idNo=3)。
+ *
+ * @param buf 输出缓冲
+ * @param len 缓冲长度
+ * @return 0 成功（取到序列号）, <0 失败
+ */
+ORBMDK_INTERNAL int ORBMDK_USB_Bulk_GetSerialNumber(char* buf, size_t len);
 
 /**
  * @brief 发送 DAP 命令并接收响应

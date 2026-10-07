@@ -56,10 +56,11 @@ static int ApWrite32(uint32_t addr, uint32_t val)
     return pBlk(H, 0, 2, regID, regData);
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
-    HMODULE dll = LoadLibraryA("C:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll");
-    if (!dll) { printf("LoadLibrary failed\n"); return 1; }
+    const char* dllPath = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "ORBMDK_RDDI.dll";
+    HMODULE dll = LoadLibraryA(dllPath);
+    if (!dll) { printf("LoadLibrary failed (%s)\n", dllPath); return 1; }
 
     PFN_RDDI_Open  pOpen  = (PFN_RDDI_Open)GetProcAddress(dll, "RDDI_Open");
     PFN_RDDI_Close pClose = (PFN_RDDI_Close)GetProcAddress(dll, "RDDI_Close");

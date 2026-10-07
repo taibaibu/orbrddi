@@ -37,10 +37,11 @@ static void* Get(HMODULE d, const char* n, bool& ok)
     return p;
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
-    HMODULE dll = LoadLibraryA("C:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll");
-    if (!dll) { printf("LoadLibrary failed %lu\n", GetLastError()); return 1; }
+    const char* dllPath = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "ORBMDK_RDDI.dll";
+    HMODULE dll = LoadLibraryA(dllPath);
+    if (!dll) { printf("LoadLibrary failed %lu (%s)\n", GetLastError(), dllPath); return 1; }
 
     bool ok = true;
     PFN_RDDI_Open  pOpen   = (PFN_RDDI_Open)Get(dll, "RDDI_Open", ok);

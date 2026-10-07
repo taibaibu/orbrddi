@@ -1,10 +1,10 @@
-# ORBMDK Build Script for MSVC 2017
-# PowerShell version - Fixed paths
+﻿# ORBMDK Build Script (MSVC x86)
+# PowerShell version - toolchain paths are auto-detected
 
 $ErrorActionPreference = "Continue"
 
 Write-Host "========================================"
-Write-Host "ORBMDK Build Script (MSVC 2017 x86)"
+Write-Host "ORBMDK Build Script (MSVC x86)"
 Write-Host "========================================"
 Write-Host ""
 
@@ -17,19 +17,92 @@ $BinDir = Join-Path $ScriptDir "bin"
 if (-not (Test-Path $ObjDir)) { New-Item -ItemType Directory -Path $ObjDir | Out-Null }
 if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir | Out-Null }
 
-# MSVC 2017 Paths
-$MSVCDir = "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community"
-$VCTools = "$MSVCDir\VC\Tools\MSVC\14.16.27023"
+# ----------------------------------------------------------------------------
+# 工具链定位（x86）：vswhere -> 常见安装目录；VC 工具集 / Windows SDK 取最高版本
+# 不写死盘符、VS 版本、SDK 版本
+# ----------------------------------------------------------------------------
+function Find-VSDir {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -LiteralPath $vswhere) {
+        $p = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null
+        if ($p) {
+            $cand = ($p | Select-Object -First 1).Trim()
+            if (Test-Path -LiteralPath "$cand\VC\Tools\MSVC") { return $cand }
+        }
+    }
+    foreach ($c in @(
+        "D:\Program Files\Microsoft Visual Studio\2022\Community",
+        "C:\Program Files\Microsoft Visual Studio\2022\Community",
+        "D:\Program Files\Microsoft Visual Studio\2022\Professional",
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional",
+        "D:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+        "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community",
+        "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community")) {
+        if (Test-Path -LiteralPath "$c\VC\Tools\MSVC") { return $c }
+    }
+    return $null
+}
+
+function Get-NewestVersionDir {
+    param([string]$Parent, [string]$Pattern)
+    if (-not (Test-Path -LiteralPath $Parent)) { return $null }
+    Get-ChildItem -LiteralPath $Parent -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $Pattern } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
+$MSVCDir = Find-VSDir
+if (-not $MSVCDir) {
+    Write-Host "[ERROR] Visual Studio C++ toolchain not found." -ForegroundColor Red
+    Write-Host "        Install VS 2017+ with 'Desktop development with C++'." -ForegroundColor Red
+    exit 1
+}
+
+$VCTools = Get-NewestVersionDir -Parent "$MSVCDir\VC\Tools\MSVC" -Pattern '^\d+(\.\d+)*$'
+if (-not $VCTools) {
+    Write-Host "[ERROR] VC tools not found under $MSVCDir\VC\Tools\MSVC" -ForegroundColor Red
+    exit 1
+}
+
 $CompilerBin = "$VCTools\bin\Hostx86\x86"
 $Compiler = Join-Path $CompilerBin "cl.exe"
 $Linker = Join-Path $CompilerBin "link.exe"
 
+# Windows SDK 根目录：注册表 KitsRoot10 -> 常见目录
+$sdkRoot = $null
+foreach ($key in @("HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+                   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots")) {
+    if (Test-Path $key) {
+        $root = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).KitsRoot10
+        if ($root -and (Test-Path -LiteralPath $root)) { $sdkRoot = $root; break }
+    }
+}
+if (-not $sdkRoot) {
+    foreach ($c in @("D:\Windows Kits\10", "C:\Program Files (x86)\Windows Kits\10")) {
+        if (Test-Path -LiteralPath $c) { $sdkRoot = $c; break }
+    }
+}
+# 取"同时具备 Include\<ver> 与 Lib\<ver>\ucrt\x86"的最高版本
+$sdkVer = $null
+if ($sdkRoot) {
+    $sdkVer = Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^10\.\d+' -and (Test-Path -LiteralPath "$sdkRoot\Lib\$($_.Name)\ucrt\x86") } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty Name
+}
+if (-not $sdkVer) {
+    Write-Host "[ERROR] Windows SDK (10.x) not found." -ForegroundColor Red
+    exit 1
+}
+$WindowsSDKInclude = Join-Path $sdkRoot "Include\$sdkVer"
+$WindowsSDKLib = Join-Path $sdkRoot "Lib\$sdkVer"
+
 # Add to PATH
 $env:Path = "$CompilerBin;$MSVCDir\Common7\IDE;$env:Path"
-
-# Windows SDK
-$WindowsSDKInclude = "D:\Windows Kits\10\Include\10.0.17763.0"
-$WindowsSDKLib = "D:\Windows Kits\10\Lib\10.0.17763.0"
 
 Write-Host "MSVC Directory: $MSVCDir"
 Write-Host "VC Tools: $VCTools"
@@ -38,7 +111,14 @@ Write-Host "Windows SDK Lib: $WindowsSDKLib"
 Write-Host ""
 
 # Compiler flags - use /EHsc to enable exception handling
-$CompilerFlags = "/c /nologo /MD /W3 /EHsc /std:c++17 /utf-8"
+#
+# /MT (静态链接 CRT)，不要改回 /MD —— 原因见 COMPAT_ANALYSIS.md §12：
+# Keil 的 ARMCLANG\bin 下自带一个旧的 MSVCP140.dll(14.29)，UV4 加载的是它。
+# MSVC 运行时只保证"向前兼容"（旧工具集产物跑在新运行时上），不保证反向兼容；
+# 用 VS2022(14.4x) 编译却跑在 14.29 上会直接崩在 MSVCP140.dll（0xc0000005）。
+# /MT 让本 DLL 不再依赖 MSVCP140/VCRUNTIME140/UCRT，宿主进程里是哪个版本都无所谓。
+# RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指针），静态 CRT 是安全的。
+$CompilerFlags = "/c /nologo /MT /W3 /EHsc /std:c++17 /utf-8"
 $CompilerFlags += " /D_WINDOWS /D_USRDLL /DORBMDK_EXPORTS /DWIN32 /D_WINDLL"
 $CompilerFlags += " /DNOMINMAX /DWIN32_LEAN_AND_MEAN"
 $CompilerFlags += " /D_CRT_SECURE_NO_WARNINGS"  # 禁用 deprecated 警告

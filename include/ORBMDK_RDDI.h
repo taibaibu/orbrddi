@@ -235,6 +235,8 @@ RDDI_FUNC int CMSIS_DAP_GetGUID(const RDDIHandle handle, int ifNo, char *guid, i
 RDDI_FUNC int CMSIS_DAP_GetInterfaceVersion(const RDDIHandle handle, int *version);
 RDDI_FUNC int CMSIS_DAP_GetNumberOfDevices(const RDDIHandle handle, int *count);
 RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface);
+// AGDI 的 RDDI 绑定表要求它存在（54 个导出名里曾唯一缺失的一个）
+RDDI_FUNC int CMSIS_DAP_Disconnect(const RDDIHandle handle);
 RDDI_FUNC int CMSIS_DAP_ResetDAP(const RDDIHandle handle);
 RDDI_FUNC int CMSIS_DAP_DetectNumberOfDevices(const RDDIHandle handle, int *count);
 // Keil 扩展：与 DAP_GetDAPIDList 同构 —— idArray 是 int 数组，sizeOfArray 是字节数

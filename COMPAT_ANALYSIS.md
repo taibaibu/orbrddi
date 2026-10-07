@@ -13,13 +13,15 @@
 | 项 | 状态 |
 |----|------|
 | 编译 | ✅ `build.ps1` 全量编译通过，**无 error、无 warning** |
+| 运行库 | ✅ **静态 CRT（`/MT`）**，产物不依赖 `MSVCP140`/`VCRUNTIME140`/UCRT（原因见第十二节） |
 | 输出 | `bin/ORBMDK_RDDI.dll` |
 | 导出符号 | `ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **78 个** |
 | 实机验证 | ✅ `ORBMDK_RDDI_FullTest.exe` **40/40 全部通过** |
 | 目标识别 | ✅ DP IDCODE `0x2BA01477`、AP IDR `0x24770011`（STM32F1） |
 | Keil 联调 | ✅ 官方 AGDI v1.33.24 下对话框正确显示 `IDCODE 0x2BA01477` / `ARM CoreSight SW-DP`（见 4.7） |
 | Flash 下载 | ✅ 烧录与调试均验证通过（擦除失败根因见 4.8） |
-| 烧录速率 | 🔧 已实施块传输优化（§9.8），瓶颈在 USB 往返次数而非 SWD 时钟，预期 ≈ 14×，待实测 |
+| 烧录速率 | 🔧 块传输优化已实施（§9.8）；**orbtrace 确认支持 `ID_DAP_TRANSFER_BLOCK`**（§13.7 更正），探测已改到连上目标时执行，待实测提速幅度 |
+| 传输模式 | ✅ V1(HID) / V2(Bulk) 两种在 Keil 适配器列表里**都显示、可选可切换**（§14） |
 
 **导出符号分类（78 个）**
 
@@ -309,7 +311,7 @@ if (numOfIFs == 0) {
 
 ### 4.7 Keil 对话框显示 "IDCODE 0x00000000 / Unknown device" 根因
 
-**现象**：官方 AGDI（`D:\MDK5\ARM\BIN\CMSIS_AGDI.dll` v1.33.24）+ ORBMDK 组合下，
+**现象**：官方 AGDI（`D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll` v1.33.24；旧环境为 `D:\MDK5\ARM\BIN\`）+ ORBMDK 组合下，
 µVision 的 "CMSIS-DAP Cortex-M Target Driver Setup" 对话框里 SW Device 列表恒显示
 `IDCODE 0x00000000` / `Device Name = Unknown device`，其余调试链路正常。
 
@@ -685,7 +687,8 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 | `src/ORBMDK_ETM_Decoder.cpp` | ETM 解码器 |
 | `src/ORBMDK_TPIU_Decoder.cpp` | TPIU 解码器 |
 | `src/ORBMDK_COBS.cpp` | COBS 解码 |
-| `build.ps1` | 编译脚本（MSVC 2017 **x86**，Keil 为 32 位进程，必须 x86） |
+| `build.ps1` | 编译脚本（自动探测 VS2017+/MSVC/SDK，固定 **x86**，Keil 为 32 位进程，必须 x86） |
+| `deploy.ps1` | 部署脚本（复制 `bin\ORBMDK_RDDI.dll` 覆盖 Keil 的 `CMSIS_DAP.dll`，自动定位 `ARM\BIN` 并备份原件） |
 | `test/build_test.ps1` | 测试构建脚本（同为 x86） |
 | `test/ORBMDK_RDDI_FullTest.cpp` | 实机功能测试（40 项） |
 | `tools/pe_re.py` | 逆向分析工具（exports / imports / names / dis / xref / slots 六个子命令），用法与结论见 §十 |
@@ -697,35 +700,46 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 > 筛查日期：2026-09-30。范围为 `ORBMDK/` 全目录（`src/`、`include/`、`test/`、`deprecated/`、`build.ps1`）。
 > 按「可移植性风险」分级，🔴 必改、🟠 建议改、🟡 可接受（设计内 fallback）。
 
-### 7.1 🔴 严重：测试程序写死本机绝对路径
+### 7.1 ✅ 已修复：测试程序写死本机绝对路径
 
-| 文件:行 | 硬编码内容 | 影响 |
-|---------|-----------|------|
-| `test/ORBMDK_RDDI_Test.cpp:51` | `"c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll"` | 换机器 / 换目录后 `LoadLibraryA` 失败，测试无法运行 |
-| `test/ORBMDK_RDDI_FullTest.cpp:116` | 同上 | 同上 |
+| 文件 | 原硬编码内容 | 现状 |
+|------|--------------|------|
+| `test/ORBMDK_RDDI_Test.cpp` | `"c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll"` | ✅ |
+| `test/ORBMDK_RDDI_FullTest.cpp` | 同上 | ✅ |
+| `test/orbprobe.cpp` / `orbprobe2.cpp` / `orbprobe3.cpp` | 同上 | ✅ |
+| `test/ORBMDK_BlockTransferTest.cpp` | 同上 | ✅ |
 
-- 两处均用于 `LoadLibraryA(dllPath)`，是测试唯一的外部依赖路径。
-- **建议修复**：用 `GetModuleFileNameA(NULL, ...)` 取 exe 所在目录后拼 `ORBMDK_RDDI.dll`；或支持 `argv[1]` 覆盖，缺省时回退到 exe 同目录。
+- 均用于 `LoadLibraryA(dllPath)`，曾是测试唯一的外部依赖路径；换机器 / 换目录后必然 `LoadLibraryA` 失败。
+- **修复方式**：默认改为**裸文件名** `"ORBMDK_RDDI.dll"` —— `build_test.ps1` 把 exe 与 DLL 都输出到 `bin\`，
+  而 `LoadLibraryA` 的搜索顺序**首先就是"应用程序加载的目录"（exe 同目录）**，因此无需拼绝对路径。
+  另支持 `argv[1]` 显式覆盖（`ORBMDK_BlockTransferTest` 的 `argv[1]` 是 RAM 地址，故不占用该参数）。
 
-### 7.2 🟠 中等：构建脚本写死工具链位置
+### 7.2 ✅ 已修复：构建脚本写死工具链位置
 
-| 文件:行 | 硬编码内容 | 影响 |
-|---------|-----------|------|
-| `build.ps1:21-32` | `$MSVCDir = "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community"`、`$VCTools = "...\MSVC\14.16.27023"`、`$WindowsSDKInclude/Lib = "D:\Windows Kits\10\...10.0.17763.0"` | 绑定 `D:` 盘 + VS2017 具体版本 + SDK 版本，换盘符/版本即失效 |
-| `test/build_test.ps1:23-33` | 同上（4 处一致） | 同上 |
+| 文件 | 原硬编码内容 | 现状 |
+|------|--------------|------|
+| `build.ps1` | `$MSVCDir = "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community"`、`$VCTools = "...\MSVC\14.16.27023"`、`$WindowsSDKInclude/Lib = "D:\Windows Kits\10\...10.0.17763.0"` | ✅ |
+| `test/build_test.ps1` | 同上 | ✅ |
 
-- **建议修复**：用 `vswhere.exe` 自动定位 VS 安装路径与 `VC\Tools\MSVC\<ver>`；Windows SDK 路径从注册表 `HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots` 或环境变量 `WindowsSdkDir` 推导，并保留当前硬编码值作为兜底。
+- **修复方式**（两个脚本同构，按本项目既有的"脚本各自独立"风格维护）：
+  - VS 安装路径：`vswhere.exe -latest -requires ...VC.Tools.x86.x64` → 回退到常见安装目录候选（VS 2022 / 2019 / 2017，`D:` 与 `C:`）；
+  - VC 工具集：`VC\Tools\MSVC` 下**版本号最大者**（不写死 `14.16.27023`）；
+  - Windows SDK：注册表 `HKLM\...\Windows Kits\Installed Roots` 的 `KitsRoot10` → 回退 `D:\Windows Kits\10` / `C:\Program Files (x86)\Windows Kits\10`；
+    版本取"同时具备 `Include\<ver>` 与 `Lib\<ver>\ucrt\x86`"的**最高版本**（不写死 `10.0.17763.0`）。
+- 位数约束不变：始终用 `bin\Hostx86\x86`，产物为 **x86**（Keil µVision 是 32 位进程）。
+- 当前环境实测：VS2022 Community（`VC\Tools\MSVC\14.44.35207`）+ SDK `10.0.26100.0`，全量编译无 error / 无 warning。
 
 ### 7.3 🟡 低：符号解析的候选搜索路径（设计内 fallback）
 
 | 文件:行 | 硬编码内容 | 说明 |
 |---------|-----------|------|
-| `src/ORBMDK_Symbols.cpp:928-930` | Keil `TOOLS.INI`：`C:\Program Files\Keil_v5\`、`C:\Program Files (x86)\Keil_v5\`、`D:\MDK5\` | `ORBMDK_FindObjdumpPath` 第 4 步候选 |
+| `src/ORBMDK_Symbols.cpp:927-933` | Keil `TOOLS.INI`：`C:\Program Files\Keil_v5\`、`C:\Program Files (x86)\Keil_v5\`、**`D:\Keil_v5\`**、`C:\Keil_v5\`、`D:\MDK5\` | `ORBMDK_FindObjdumpPath` 第 4 步候选 |
 | `src/ORBMDK_Symbols.cpp:973-979` | GNU Arm Toolchain 7 条候选（含 `12.3.rel1` 等版本号） | 第 5 步候选 |
 | `include/ORBMDK_Symbols.h:243` | 注释中的 `C:\Keil_v5\ARM\ARMCC\Bin` | 仅文档说明 |
 
 - 该函数已按「环境变量 → Keil TOOLS.INI → 常见安装目录 → `PATH`」顺序探测，前序步骤（`OBJDUMP` / `ARM_TOOLCHAIN_PATH` / `ARMGCC_DIR`）和 `PATH` 兜底可覆盖多数场景，故归为可接受。
-- 但 `D:\MDK5\TOOLS.INI` 及带具体版本号的候选路径较脆，建议精简为「系统盘默认项 + 环境变量」，去掉写死盘符/版本。
+- 已补充 `D:\Keil_v5\TOOLS.INI`（当前环境的实际位置）与 `C:\Keil_v5\TOOLS.INI`。
+- `D:\MDK5\TOOLS.INI` 与带具体版本号的 GNU 候选路径仍较脆，可继续精简为「系统盘默认项 + 环境变量」。
 
 ### 7.4 ✅ 无需处理
 
@@ -739,10 +753,21 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 
 ### 7.5 结论
 
-- **必改 1 类**：测试程序的 DLL 绝对路径（7.1，2 处）。
-- **建议改 1 类**：构建脚本的 `D:\...` 工具链路径（7.2，2 个脚本）。
-- **可选优化**：符号解析候选路径精简（7.3）。
-- 上述硬编码**不影响已实机验证的 Keil 调试链路**，仅在跨机器 / 跨环境复现构建与测试时造成阻塞。
+- ✅ **必改 1 类（已改）**：测试程序的 DLL 绝对路径（7.1，5 个文件），改为裸文件名 + `argv[1]` 覆盖。
+- ✅ **建议改 1 类（已改）**：构建脚本的工具链路径（7.2，2 个脚本），改为 vswhere + 注册表自动探测。
+- 🟡 **可选优化（部分已改）**：符号解析候选路径（7.3），已补 `D:\Keil_v5\`。
+- 残留硬编码均在"候选路径 fallback"语义内，不影响构建与实机调试链路。
+
+### 7.6 环境变更记录（2026-09-30）
+
+| 项 | 旧值 | 新值 |
+|----|------|------|
+| Keil MDK | `D:\MDK5\ARM\BIN` | **`D:\Keil_v5\ARM\BIN`** |
+| Visual Studio | `D:\Program Files (x86)\Microsoft Visual Studio\2017\Community`（MSVC 14.16.27023） | **`D:\Program Files\Microsoft Visual Studio\2022\Community`（MSVC 14.44.35207）** |
+| Windows SDK | `D:\Windows Kits\10\...\10.0.17763.0` | **`D:\Windows Kits\10\...\10.0.26100.0`** |
+
+- 受影响的文件：`build.ps1`、`test/build_test.ps1`、`deploy.ps1`、`test/*.cpp`（DLL 路径）、`src/ORBMDK_Symbols.cpp`。
+- `deploy.ps1` 的目标路径已改为 `D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll`，并支持 `-KeilArmBin` 显式指定与多候选自动探测。
 
 ---
 
@@ -1110,7 +1135,14 @@ OUT + IN 各一轮 → 保守按 **1–2 ms / 往返** 估算：
    | 传输中途块传输意外失败 | 立即回退（双保险） |
    | 排障需强制关闭 | `set ORBMDK_BLOCK_TRANSFER=0`（跳过探测，直接逐字） |
 
-   **实测：orbtrace 固件未实现 `ID_DAP_TRANSFER_BLOCK`**，故在该固件上自动回退、
+   > ⚠️ **本节结论已被 §13.7 推翻**：orbtrace **确实支持** `ID_DAP_TRANSFER_BLOCK`
+> （实测 `resp = [06 01 00 01]`）。当时之所以判定"不支持"，是因为探测代码放在
+> `DAP_RegWriteRepeat` 里，而那个入口在收到非法 regID 时会提前 return ——
+> **探测根本没跑过**，所谓"不支持"只是陈旧产物。现探测已移到连上目标时执行。
+>
+> 下面这段保留作历史记录：
+
+**实测（当时的错误结论）：orbtrace 固件未实现 `ID_DAP_TRANSFER_BLOCK`**，故在该固件上自动回退、
    行为与优化前一致；换用实现了该命令的调试器时**无需改代码即可提速**。
 
 **保留的有效修复**：§9.5 的 HID 长度校验（纯加固、无副作用）、`DAP_TransferBlock`
@@ -1140,7 +1172,7 @@ bin\ORBMDK_BlockTransferTest.exe 0x20000000
 |------|------|
 | 两种模式全部 PASS，加速比 > 10× | 固件支持块传输，Keil 中会自动启用 |
 | 有 FAIL 或哨兵被踩坏 | 仍有越界，**不能启用** |
-| 加速比 ≈ 1 | 固件未实现 `ID_DAP_TRANSFER_BLOCK`（已自动回退）。**orbtrace 即属此类**；Keil 行为与优化前一致，想再提速需转 P3（Bulk） |
+| 加速比 ≈ 1 | 固件未实现 `ID_DAP_TRANSFER_BLOCK`（已自动回退）。（**此判定当时是错的**，见 §13.7：orbtrace 支持块传输） |
 
 > 注：该文件刻意写成**纯 ASCII**。原先含中文时 MSVC 报 C4819（当前代码页无法表示的字符），
 > 并连带产生一条假的 C4474 printf 告警。
@@ -1170,9 +1202,9 @@ bin\ORBMDK_BlockTransferTest.exe 0x20000000
 
 ```bash
 PY="python tools/pe_re.py"
-AGDI="D:\MDK5\ARM\BIN\CMSIS_AGDI.dll"        # 官方 AGDI 层
-RDDI="D:\MDK5\ARM\BIN\CMSIS_DAP.dll"         # 当前生效的 RDDI 层
-OFF="D:\MDK5\ARM\BIN\CMSIS_DAP.dll.bak"      # 官方 RDDI 层（对照基准）
+AGDI="D:\Keil_v5\ARM\BIN\CMSIS_AGDI.dll"     # 官方 AGDI 层
+RDDI="D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll"      # 当前生效的 RDDI 层
+OFF="D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll.bak"   # 官方 RDDI 层（对照基准）
 
 $PY exports "$AGDI"                    # 导出表（名称/序号/RVA/VA）
 $PY imports "$AGDI"                    # 导入的 DLL 名
@@ -1595,7 +1627,8 @@ AGDI 在一次调试会话里会反复调用 `rddi_Open`（实测 7 次），每
 先做**最小可复现的独立程序**，比在被测进程里反复重启试探快一个数量级。
 
 > ⚠️ V2 只改变**传输层**，不改变命令集。orbtrace 依然不支持
-> `ID_DAP_TRANSFER_BLOCK`（§9.9），块传输仍会自动回退；V2 的提速来自
+> ~~`ID_DAP_TRANSFER_BLOCK`（§9.9），块传输仍会自动回退~~（**该结论有误，见 §13.7**：
+> orbtrace 支持块传输）；V2 的提速来自
 > 包长与延迟，而非块传输。
 
 ### 11.2 状态 LED：`DAP_HostStatus` 无人调用
@@ -1626,3 +1659,747 @@ AGDI 在一次调试会话里会反复调用 `rddi_Open`（实测 7 次），每
 避免每个字一次 USB 往返。
 
 **待实测**：接上目标后 Connect LED 亮；烧录 / 运行时 Running LED 亮，停机时灭。
+
+---
+
+## 十二、VS2022 工具链升级导致的 Keil 崩溃（0xc0000005 in MSVCP140.dll）
+
+> 日期：2026-09-30。环境由 VS2017 换到 VS2022 后，Keil µVision 一启动调试就崩溃。
+
+### 12.1 现象
+
+Windows 应用程序日志：
+
+```
+Faulting application name: UV4.exe, version: 5.43.1.0
+Faulting module name: MSVCP140.dll, version: 14.29.30157.0
+Exception code: 0xc0000005
+Faulting module path: D:\Keil_v5\ARM\ARMCLANG\bin\MSVCP140.dll
+```
+
+`%TEMP%\ORBMDK_RDDI.log` **完全没有生成** —— 说明还没走到 `RDDI_Open` 就已经崩了。
+
+### 12.2 根因：新工具集 + 旧运行库（MSVC 运行时只向前兼容）
+
+| 运行库 | 版本 | 位置 |
+|--------|------|------|
+| Keil 自带（UV4 实际加载的那个） | **14.29**.30157.0 | `D:\Keil_v5\ARM\ARMCLANG\bin\` |
+| 系统 SysWOW64 | 14.50.35719.0 | `C:\Windows\SysWOW64\` |
+| 本次编译所用工具集 | **14.44**.35207 | VS2022 |
+
+MSVC 运行时**只保证"向前兼容"**：旧工具集编译的程序可以跑在新版运行时上；
+反向（新工具集编译、却跑在旧运行时上）**不受支持**。
+
+- 旧环境 VS2017(14.16) 编译：需求被 14.29 满足 → 正常；
+- 新环境 VS2022(14.44) 编译：UV4 进程里加载到的是 Keil 目录下的旧 14.29 → **不受支持组合** → 崩在 `MSVCP140.dll`。
+
+`dumpbin /dependents` 确认旧产物的 CRT 依赖：
+
+```
+MSVCP140.dll      <- _Mtx_lock / _Mtx_unlock           (std::mutex)
+                     _Query_perf_counter / _Query_perf_frequency  (std::chrono)
+                     ?_Xlength_error / ?_Xout_of_range / ?_Xinvalid_argument / ?_Throw_Cpp_error
+VCRUNTIME140.dll  <- __CxxFrameHandler3 / _CxxThrowException ...
+api-ms-win-crt-*  <- UCRT
+```
+
+> 注意：这 8 个 `MSVCP140` 导入符号在旧版 14.29 的**导出表里全都存在** —— 所以不是"缺符号"，
+> 而是**新 STL 头文件 + 旧运行库实现**的 ABI 不匹配，属未定义行为。
+
+### 12.3 修复：改为静态链接 CRT（`/MT`）
+
+`build.ps1` / `test/build_test.ps1` 的编译开关由 `/MD` 改为 **`/MT`**。
+
+| 方案 | 评价 |
+|------|------|
+| **`/MT`（采用）** | 产物不再依赖 `MSVCP140` / `VCRUNTIME140` / UCRT，宿主进程里是哪个版本都无所谓 |
+| 替换 Keil 的 `ARMCLANG\bin\MSVCP140.dll` | 要改 Keil 安装目录，可能影响 ARMCLANG 自身工具，风险外溢 |
+| 让 UV4 改用系统 `SysWOW64` 的 14.50 | 依赖 Keil 的 DLL 搜索路径行为，不可控 |
+
+`/MT` 对本项目是安全的：RDDI 是**纯 C ABI**（导出全为 `RDDI_FUNC` 函数，所有缓冲区由调用方提供，
+不跨模块传 STL 对象或堆指针），不存在"两个 CRT 堆互相 free"的问题。
+
+**验证**（改后）：
+
+```
+D:\Keil_v5\ARM\BIN\CMSIS_DAP.dll   323584 字节   machine (x86)
+Dependents: KERNEL32 / SETUPAPI / WINUSB / HID / SHLWAPI      <- 已无任何 CRT DLL
+```
+
+> ⚠️ **不要改回 `/MD`**。`build.ps1` 中该处已就地写明原因。
+
+### 12.4 附带修复：PowerShell 脚本的编码与行尾
+
+本轮还发现并修掉一个**构建脚本自身**的坑（与崩溃无关，但会让构建失败）：
+
+`build.ps1` / `deploy.ps1` / `test\build_test.ps1` 原本是**无 BOM 的 UTF-8 + LF 换行**。
+Windows PowerShell 5.1 对无 BOM 脚本按 **ANSI(936/GBK)** 解码，于是：
+
+```
+…是安全的。<LF>
+              "。" = E3 80 82，末尾字节 0x82 与后面的 0x0A 被 GBK 当成一个双字节字 → <LF> 被吃掉
+```
+
+→ 换行消失 → 下一行 `$CompilerFlags = "/c /nologo /MT …"` 被并入注释，
+`/MT` 与 `/utf-8` **全部失效**，编译报 C4819 + C1004（"发现意外的文件尾"）。
+
+| 试验 | 结果 |
+|------|------|
+| LF + 无 BOM | 赋值被吞 ❌ |
+| CRLF + 无 BOM | 正常 ✅ |
+| LF + UTF-8 BOM | 正常 ✅ |
+
+是否被吞取决于**该行字节能凑成几对 GBK 双字节**（奇偶性），所以同一个文件里有的行正常、有的行被吞，
+且**不报任何语法错误**。旧脚本之所以一直没暴露，是运气。
+
+**处理**：三个 `.ps1` 统一为 **CRLF + UTF-8 BOM**。
+
+> 教训：脚本里写非 ASCII 注释时，必须让 PowerShell 明确知道编码（BOM / CRLF，最好两者都要），
+> 否则注释里的多字节字符可能"吃掉"换行，把下一行代码变成注释的一部分 —— 现象会诡异到像是编译器坏了。
+
+---
+
+## 十三、V2 (USB Bulk) 通道打通 + 传输模式可选
+
+> 日期：2026-09-30。承接 §11（V2 能打开但用不了）。用户诉求：**V1 与 V2 两种模式都要能选用**，
+> 且 bulk 出问题时要能回退。
+
+### 13.1 现象
+
+Keil 对话框能看到 `CMSIS-DAP v2`，但一选它就退化成 V1。日志（`%TEMP%\ORBMDK_RDDI.log`）：
+
+```
+Init: V2 Bulk mode OK (product='CMSIS-DAP v2')
+[RDDI] CMSIS_DAP_Connect: DAP_ConnectTarget failed, mode=-1     ← V2 下命令全失败
+Init: entered ...  reject: CreateFile failed, err=5             ← 之后连 V2 都打不开了
+Init: V2 Bulk unavailable -> fall back to V1 HID
+```
+
+### 13.2 根因（三个独立缺陷，缺一不可）
+
+**（1）分发契约不一致 —— V2 命令"成功"被当成"失败"**
+
+```cpp
+// src/ORBMDK_USB_Bulk.cpp：成功时返回**字节数**
+return (int)copy;
+
+// src/ORBMDK_HID.cpp：契约是 0 = 成功
+const int r = ORBMDK_USB_Bulk_DAPCommand(...);
+if (r != 0) { LOG_HID_ERROR("V2 Bulk DAPCommand failed: result=%d", r); return r; }
+```
+
+于是**每一条成功的 V2 命令都被判失败** → `DAP_ReadReg` / `DAP_ConnectTarget` 全挂 →
+AGDI 立刻退回 V1。修正：成功统一返回 `0`，字节数由 `*respLen` 回传。
+
+**（2）出包长度用了 512，而端点只有 64**
+
+> ⚠️ 本小节的机理描述（"MI_05 是 Full Speed、描述符把 `wMaxPacketSize` 报成 0"）
+> 已被 §17.2 的实测取代：该端点实际是 **High Speed、描述符报 512**，而设备用
+> `DAP_Info(0xFF)` 自报 **508**。方向一致（不能用描述符整包），但数值与原因以
+> §17.2 为准；`ORBMDK_BULK_PAD` 这个手动开关也已随之删除。
+
+原实现把命令补齐到 512 字节（DAP_PACKET_SIZE）再发。orbtrace 的 MI_05 是
+**Full Speed** bulk 端点，真实包长 64（其描述符把 `wMaxPacketSize` 报成 `0`，
+本身就是不规范）。实测标定：
+
+| `ORBMDK_BULK_PAD` | 结果 |
+|---|---|
+| `0`（精确长度） | 命令失步，读超时 |
+| **`64`（端点包长）** | **读写即时成功** ✅ |
+| `512` | 第一条能读到数据，第二条起 `bulkWrite` 直接 TIMEOUT（设备收不完、主机积压） |
+
+修正：默认取端点 `wMaxPacketSize`（报 0 时按 FS bulk 的 64），保留
+`ORBMDK_BULK_PAD` 供现场标定。
+
+**（3）超时后不释放设备 → WinUSB 接口被永久占用**
+
+```cpp
+CancelIo(g_winusb.deviceHandle);   // 异步，返回时 IRP 往往还挂在驱动里
+CloseHandle(overlapped.hEvent);    // 直接关事件对象
+return -2;                         // …随后 _closeWinUSB() 里 WinUsb_Free + CloseHandle
+```
+
+有未完成 IRP 时内核不放 file object → 设备接口不释放 → 之后**所有** `CreateFile`
+都是 `ERROR_ACCESS_DENIED(5)`，且是永久的（表现为"V2 整场会话再也打不开"）。
+另外 `ORBMDK_USB_Bulk_Shutdown()` 里 `if (!g_ctx.initialized) return;` 会漏关
+`g_winusb` 中仍然有效的句柄。
+
+修正：
+- 新增 `_cancelOverlapped()`：`CancelIoEx` 之后**带超时地等 IRP 真正完成**再释放；
+- `ORBMDK_USB_Bulk_Shutdown()` 不再看 `g_ctx`，一律按 `g_winusb` 实际状态关闭。
+
+**（4）附带：设备 FIFO 里的历史响应**
+
+设备的响应是**流式**的，超时/中断后没取走的响应会留在设备 FIFO 里，
+下一次打开时第一条命令就会读到**上一次的响应**（实测：发 `DAP_Info` 收到 `05 01 77 14`）。
+修正：打开后 `AbortPipe` + `ResetPipe` + 把 IN FIFO 读空（`_flushAndDrainPipes()`），
+并在命令层校验"响应首字节 == 命令号"，不符则冲刷后重试一次；
+`0xFF` 单独识别为"设备不支持该命令"（DAPLink 约定），不做无意义的重试。
+
+### 13.3 传输模式可选（本轮的显式需求）
+
+新增开关，与日志级别同风格（**文件优先、环境变量次之**，免重新编译）：
+
+| 开关 | 取值 |
+|------|------|
+| `%TEMP%\ORBMDK_TRANSPORT`（优先，运行期可改） | `auto` / `bulk`(=v2) / `hid`(=v1) |
+| 环境变量 `ORBMDK_TRANSPORT` | 同上 |
+
+| 取值 | 行为 |
+|------|------|
+| `auto`（缺省） | 优先 V2；不可用才回退 V1。**已回退后不再每次重试**（避免反复触发 CreateFile 失败路径） |
+| `bulk` | 只用 V2；不可用**直接失败**，不做静默降级（便于定位） |
+| `hid` | 只用 V1 |
+
+切换到与当前不同的模式时，`RDDI_Open` 会重新初始化传输层（这是 AGDI 唯一能触发切换的入口）。
+
+**V2 下的产品名/序列号**：V2 时没有打开 HID 接口，`HidD_GetProductString` /
+`HidD_GetSerialNumberString` 都不可用。产品名改从 **Bulk 接口自己的字符串描述符**读
+（§11.1.2 已有），序列号新增从设备的 `iSerialNumber` 字符串描述符读
+（`ORBMDK_USB_Bulk_GetSerialNumber`），否则 `CMSIS_DAP_Identify(idNo=3)` 只能返回 `"Unknown"`。
+
+### 13.4 实测（orbtrace v1.4.3 + STM32F1）
+
+三种模式下的 DP IDCODE 读取完全一致：
+
+| `ORBMDK_TRANSPORT` | `Identify(idNo=2)` | `DAP_ReadReg(DP_IDCODE)` |
+|---|---|---|
+| `auto` | `CMSIS-DAP v2` | `0x2BA01477` ✅ |
+| `bulk` | `CMSIS-DAP v2` | `0x2BA01477` ✅ |
+| `hid` | `CMSIS-DAP v1` | `0x2BA01477` ✅ |
+
+V2 的报文实测（日志节选）：
+
+```
+opened V2 iface 5: bulkIn=0x85(0) bulkOut=0x03(0)
+bulkWrite OUT ep=0x03 len=64 -> 64 bytes, 0 ms
+bulkRead  IN ep=0x85 maxLen=64 -> 7 bytes, 0 ms
+DAPCommand: cmd=0x05 outLen=64 -> resp 7 bytes [05 01 01 77]   ← ACK=OK + IDCODE
+```
+
+> ⚠️ 注意 V2 在这里**并不比 V1 快**：端点就是 64 字节，与 HID 单包相同，且 orbtrace
+> 不支持 `ID_DAP_TRANSFER_BLOCK`（§9.9）。V2 的收益要等换用实现了块传输的调试器。
+
+### 13.5 顺带修复：测试程序的陈旧原型（会直接崩）
+
+`test/ORBMDK_RDDI_FullTest.cpp` 有多处仍按**旧 API**声明函数指针，实参错位后
+直接往垃圾地址写入 → `0xc0000005`（cdb 定位：`CMSIS_DAP_SWO_Status+0x28`、
+`DAP_RegWriteBlock+0x5e`）。V1 / V2 下都崩，与本次传输层改动无关。
+
+| 函数 | 测试里的旧原型 | 真实签名 | 后果 |
+|------|----------------|----------|------|
+| `CMSIS_DAP_GetDeviceIDList` | `(h, int *count, char *buf, int len)` | `(h, int *idArray, size_t bytes)` | `sizeOfArray` 收到指针值（天文数字）→ 向 `&count` 后狂写 → 踩坏栈 |
+| `CMSIS_DAP_SWO_Status` | `(h, uint8_t *status)` | `(h, int *count, int *status)` | 第 3 参取寄存器垃圾当指针写入 → AV |
+| `CMSIS_DAP_SWO_Data` | `(h, int*, uint8_t*)` | `(h, int*, void*, int*)` | 同上 |
+| `CMSIS_DAP_GetInterfaceVersion` | `(h, char*, int)` | `(h, int *version)` | 版本号是 int，不是字符串 |
+| `DAP_RegReadBlock` / `DAP_RegWriteBlock` | 按"同一寄存器重复 N 次"调用 | `(h, DAP_ID, numRegs, const int *regIDArray, dataArr)` | `dataArray` 收到字面量 `4` → AV |
+| `DAP_Target` | `(h, int, int*)` | `(h, const char*, char*, int)` | 未被调用，仅预防 |
+
+已按真实签名修正（崩溃消失）。**仍待同步**：该文件里的 `DAP_REG_*` 常量仍是
+"字节偏移"风格（例如 `DAP_REG_AP_DRW` 传成 `0x0001000C`），与
+`rddi_dap.h` 的**编号**语义（DP 0–3 / AP 4–7）不符，导致 Test 9/10 报
+`RDDI_DAP_BAD_REGISTER_ID`。因此该测试目前 `PASSED 22 / FAILED 20`，
+**不再是 40/40**；剩余失败分两类：
+1. 测试自身的常量/预期陈旧（上面这条）；
+2. 目标侧状态：`DP CTRL/STAT = 0x00000000 [NOT powered]` —— 目标被复位后调试电源未上，
+   AP 访问必然 FAULT。三种传输模式表现**完全一致**，可排除传输层。
+
+> 复现崩溃定位的方法：`cdb` + `link /MAP`（见 §10）：
+> `cdb -g -G -c "g; .ecxr; kb; q" bin\ORBMDK_RDDI_FullTest.exe`
+
+### 13.6 ⭐ 最后一环：DLL 卸载时泄漏 WinUSB 句柄（"V2 只有第一次能用"的真因）
+
+§13.2(3) 修完后，Keil 里**仍然是**第一次 V2、之后全 V1。日志给出两个铁证：
+
+```
+19:25:31.484  RDDI_Close: handle=1 closed
+19:25:33.934  RDDI_Open called
+19:25:33.935  RDDI_Open: opening transport (current=0, ...)   ← ★ 全局状态归零
+              Init: entered …  reject: CreateFile failed, err=5 ← ★ MI_05 仍被占用
+```
+
+推论链：
+
+1. `RDDI_Close` **不碰** `g_ctx`，但重载后 `GetMode()` 却是 `NOT_INITED` →
+   说明那是一个**全新的 DLL 实例**：**AGDI 在两次 `rddi_Open` 之间卸载并重新加载了本 DLL**
+   （§2.1 的 `LoadLibrary` 在 `InitInstance()` 里，窗口/会话切换时会走一次卸载-重载）。
+2. **WinUSB 句柄属于进程，不随 DLL 卸载而关闭**。`DllMain(DLL_PROCESS_DETACH)` 原来只调了
+   `ORBMDK_HID_Shutdown()`，**从没关 V2 的句柄** →
+   `g_winusb.winusbHandle` / `deviceHandle` 永久泄漏在 `UV4.exe` 里 →
+   新实例的 `CreateFile(MI_05)` 永远 `ERROR_ACCESS_DENIED(5)` → 只能退回 V1。
+
+**修复**（`src/ORBMDK_DLL.cpp`）：`DLL_PROCESS_DETACH` 里补上 `ORBMDK_USB_Bulk_Shutdown()`。
+
+**本地复现 / 验证方法**（不需要 Keil，`ORBMDK_BlockTransferTest.exe` 内部就会
+`FreeLibrary` + `LoadLibrary` 重载 DLL，正好覆盖这个场景）：
+
+```
+修复前：Open#1 → V2 OK
+        Open#2（重载后）→ reject: CreateFile failed, err=5 → 退回 V1   ✗
+修复后：Open#1 → V2 OK
+        Shutdown: mode=2, initialized=1, winusbHandle=1, deviceHandle=1
+        Open#2（重载后）→ opened V2 iface 5 → V2 OK                      ✓
+        Open#2 → V2 OK
+```
+
+> **通用教训**：插件型 DLL 里任何**进程级资源**（文件句柄、USB 句柄、内核对象）都必须在
+> `DllMain(DLL_PROCESS_DETACH)` 里释放。宿主可以随时卸载再重载你，
+> 而操作系统**不会**代你回收这些句柄 —— 泄漏后表现为"第一次正常、之后永远失败"，
+> 且现象会被误判成"设备被独占"。
+>
+> 另一个排查要点：日志里出现 `GetMode()`/`current=0` 这类**全局状态归零**的迹象时，
+> 优先怀疑"模块被卸载重载"，而不是逻辑写错。
+
+### 13.7 更正：orbtrace **支持** `ID_DAP_TRANSFER_BLOCK`；端点包长取自描述符
+
+> 日期：2026-09-30。本节**推翻 §9.9 的结论**。
+
+**（1）§9.9 的"orbtrace 未实现 ID_DAP_TRANSFER_BLOCK"是错的**
+
+实测（V2 通道，BulkTrace 原始字节日志）：
+
+```
+DAPCommand: cmd=0x06 outLen=64 -> resp 8 bytes [06 01 00 01]
+Block transfer probe OK (ID_DAP_TRANSFER_BLOCK supported, idcode=0x2BA01477)
+```
+
+`06`=命令回显、`01 00`=Transfer Count(1)、`01`=ACK OK，后 4 字节就是 IDCODE —— 完全正常。
+
+**为什么会得到错误结论**：探测写在 `DAP_RegWriteRepeat` 的"首次调用"里，
+而那个入口前面有 `GetRegOffset(regId) < 0 → return`。测试/调用方只要传了非法 regID，
+函数就直接返回，**探测从未执行**，"不支持"只是某次失败留下的陈旧产物。
+
+修正：把探测移到 `DetectTargetDapIdList()` —— **只有这里能确定目标已连接**，
+每次连上目标都探测一次并留证（`EnsureBlockTransferProbed`）。
+
+**（2）端点包长必须从配置描述符解析，而且类型不能截断**
+
+`WinUsb_QueryPipe` / 配置描述符给出的 `wMaxPacketSize` 是 **USHORT**。原代码用
+`UCHAR` 存放/转换 —— orbtrace 声明的是 **512**，`512 & 0xFF == 0`，
+于是包长"变成 0"，后面所有基于它的判断全被带偏。
+
+实测描述符（新增的逐条 dump）：
+
+```
+desc iface 5 alt=0 class=0xFF eps=2  <- target
+desc   ep 0x03 attr=0x02 type=Bulk wMaxPacketSize=512
+desc   ep 0x85 attr=0x02 type=Bulk wMaxPacketSize=512
+```
+
+**（3）但"描述符值"不等于"能用的值" —— 需要自标定**
+
+| 出包长度 | 结果 |
+|----------|------|
+| 512（描述符值，端口 `DEVICE_SPEED=3` High Speed） | 写入成功，设备**一律不响应**（读全超时） |
+| **64** | **一问一答正常** ✅ |
+
+orbtrace 固件只读固定 64 字节命令缓冲，跟描述符声明不一致 —— 这类差异没有
+单一规则能覆盖（有的固件反而是"必须按端点包长发"）。
+
+于是新增 **开机自标定** `_calibrateOutPacket()`：打开设备后用一次只读探测
+（`DAP_Info` vendor 项）实测能通的长度，结果记在 `g_winusb.alignedOutPkt`。
+
+- **先试 64**，再试描述符值。顺序不能反：先发一个过大的包会把设备的输入流带偏
+  （它按 64 收下后再去凑剩余字节），**连后面的 64 也一起弄坏**（实测两次都无响应）。
+- 每次换包重试之间 `_flushAndDrainPipes()` 清一次端点。
+- 特殊设备仍可用 `ORBMDK_BULK_PAD=<n>` 直接指定（跳过标定）。
+
+> ⚠️ 本节策略已被 §17.2 取代：现在是 ① 用 64 短包问 `DAP_Info(0xFF)` 拿**设备自报包长**；
+> ② 用 `DAP_Info(0xF0)`（期望 `[00 01 xx]`）**验证**；③ 不合法才换候选（含 64）。
+> **描述符值当整包永不使用** —— 实测按 512 发时"第一条能答、之后永久无响应"。
+> `ORBMDK_BULK_PAD` 开关已删除（§17.4：不留隐藏开关）。
+
+标定后的日志：
+
+```
+calibrate: outPacket=64 OK (descriptor=512, speed=3)
+```
+
+---
+
+## 十四、V1 / V2 双接口可显示、可切换（AGDI 侧语义 + 实现）
+
+> 日期：2026-09-30。需求："Keil 里 V1、V2 都要显示出来，并且可以切换"。
+
+### 14.1 AGDI 到底怎么处理接口列表（反汇编 `CMSIS_AGDI.dll`）
+
+对话框的枚举循环在 **`0x1002203C`**（`tools/pe_re.py dis` 可复现）：
+
+```asm
+0x10022051  lea  ecx, [ebp-0x21C]        ; &numOfIFs
+0x10022057  push ecx
+0x10022058  push eax                    ; handle
+0x10022059  call [0x10362F64]           ; CMSIS_DAP_Detect(h, &numOfIFs)
+
+0x1002206A  xor  esi, esi               ; ifNo = 0
+0x1002206C  cmp  [ebp-0x21C], esi
+0x10022072  jle  0x100222C7             ; 没有接口 -> 空列表
+0x10022084  cmp  esi, 0x10              ; 最多枚举 16 个
+0x10022087  jge  0x100222C7
+loop:
+  push 0x104  / push buf / push 2 / push esi / push handle
+  call [0x10362F6C]                     ; CMSIS_DAP_Identify(h, ifNo, idNo=2, buf, 0x104) 产品名
+  mov  [eax + 0x102F9204], esi          ; ★ 把 ifNo 存进列表项
+  push 3 ... call [0x10362F6C]          ; idNo=3 -> 序列号
+  ...(拷贝名字/序列号进 entry[0x148*n + ...])
+```
+
+用户选中某项后，初始化序列（`0x10022AA8`）把**该项的 ifNo** 原样传回来：
+
+```asm
+0x10022A9A  push cfg
+0x10022AA1  push [edi + 0x102F9204]     ; ★ 选中项的 ifNo
+0x10022AA7  push handle
+0x10022AA8  call [0x10362F74]           ; CMSIS_DAP_ConfigureInterface(h, ifNo, cfg)
+0x10022AAE  ...
+0x10022ABF  push 0 / push handle / call [0x10362F1C]   ; DAP_Configure(h, NULL)
+0x10022AF5  push [edi+0x102F9204] / push handle / call CMSIS_DAP_Connect
+```
+
+**结论**：AGDI 本来就是**多接口**的 ——
+`Detect` 报几项就列几项、逐项用 `ifNo` 取名字、选中项的 `ifNo` 再传回 `ConfigureInterface`。
+本层只要如实暴露两个接口即可，无需任何 AGDI 侧配合。
+
+### 14.2 实现
+
+| 接口序号 | 传输 | `CMSIS_DAP_Identify(idNo=2)` 返回 |
+|----------|------|-----------------------------------|
+| `ifNo=0` | CMSIS-DAP v2 (USB Bulk) | `CMSIS-DAP v2`（Bulk 接口字符串描述符） |
+| `ifNo=1` | CMSIS-DAP v1 (HID) | `CMSIS-DAP v1` |
+
+| 函数 | 改动 |
+|------|------|
+| `CMSIS_DAP_Detect` | 由 `1` 改为 `kTransportInterfaceCount = 2`（**绝不返回 0**，否则 AGDI 直接 EU02） |
+| `CMSIS_DAP_Identify` | `idNo=2` 按 `ifNo` 返回不同名字（`ORBMDK_USB_Bulk_GetInterfaceName`）；序列号两个接口相同（同一物理设备） |
+| `CMSIS_DAP_ConfigureInterface` | 入口按 `ifNo` 调 `ORBMDK_USB_Bulk_SelectInterface(ifNo)`，**现场切换传输层**（必须发生在 `DAP_Configure`/`Connect` 之前） |
+
+`SelectInterface` 把选择写进 `g_forcedPref`，其优先级**高于** `%TEMP%\ORBMDK_TRANSPORT`
+与环境变量 —— 用户在对话框里的显式选择应当压过配置文件。
+
+### 14.3 实测
+
+```
+CMSIS_DAP_Detect -> numOfIFs=2
+  Identify(ifNo=0, idNo=2) -> 'CMSIS-DAP v2'
+  Identify(ifNo=1, idNo=2) -> 'CMSIS-DAP v1'
+ConfigureInterface(ifNo=1) -> SelectInterface: ifNo=1 -> hid  (Init: switching transport)
+                             DAP_ReadReg(DPIDR) -> 0x2BA01477   ✓
+ConfigureInterface(ifNo=0) -> SelectInterface: ifNo=0 -> bulk (Init: switching transport)
+                             DAP_ReadReg(DPIDR) -> 0x2BA01477   ✓
+```
+
+即 Keil 的适配器列表现在会出现 **两条**：`CMSIS-DAP v2` / `CMSIS-DAP v1`，
+选中哪条就走哪条，且选择会被 UV4 保存在工程里、跨会话生效。
+
+---
+
+## 十五、⭐ 选中 `CMSIS-DAP v1` 就崩溃的根因：AGDI 把"接口索引"当指针传
+
+> 日期：2026-09-30。§14 做完双接口后，Keil 一选 `CMSIS-DAP v1` 就当场消失。
+
+### 15.1 现象
+
+`%TEMP%\ORBMDK_RDDI.log` **恰好停在 `CMSIS_DAP_Connect` 里**：
+
+```
+19:44:54.000 CMSIS_DAP_Connect: configured SWD
+19:44:54.000 CMSIS_DAP_Connect: configured transfer (wait=100, match=10)
+             <- 日志到此为止，"connection complete" 再也没有出现
+```
+
+日志是**每行 fopen/fclose** 写的（必然落盘），所以最后一行就是真实的最后一步。
+
+而 Windows 事件日志里**没有 UV4.exe 的 Application Error 记录** —— 主机把异常吞掉后直接结束了进程。
+
+### 15.2 定位
+
+`CMSIS_DAP_Connect` 中该语句之后只剩三条，唯一可能出错的是写"出参"：
+
+```cpp
+if (connectedInterface) {
+    *connectedInterface = mode;      // ← 写 AGDI 传进来的指针
+}
+ctx->isConnected = true;
+LOG_DEBUG("... connection complete ...");
+```
+
+**本地最小复现**（`test/orbprobe.cpp`：把第 2 个实参照 AGDI 的行为传成 `(int*)ifNo`）：
+
+| 传入的实参 | 结果 |
+|------------|------|
+| `&iface`（合法指针) | 正常，`connection complete` 打印 ✅ |
+| `(int *)1`（= AGDI 在 ifNo=1 时的行为） | `exit=0xC0000005`，日志尾巴与 Keil **逐字一致** ❌ |
+
+反汇编印证（`0x10022AA1` 与 `0x10022AF5` 两处 push **同一个地址**）：
+
+```asm
+; ConfigureInterface(handle, ifNo, cfg)
+0x10022AA1  push dword ptr [edi + 0x102F9204]   ; arg2 = 选中项索引
+; CMSIS_DAP_Connect(handle, connectedInterface)
+0x10022AF5  push dword ptr [edi + 0x102F9204]   ; arg2 = 同一个值！
+```
+
+**即 AGDI 把"选中项索引"当成了 `int *connectedInterface` 传进来。**
+
+### 15.3 为什么几十年都没暴露
+
+| 选中项索引 | 实参 | `if (connectedInterface)` | 结果 |
+|-----------|------|---------------------------|------|
+| **0**（此前列表里只有一项，恒为 0） | `NULL` | 判空跳过，**从不写入** | 一直正常 |
+| **1**（§14 暴露两个接口后才可能出现） | `(int*)1` | 成立 → 向地址 `1` 写入 | `0xc0000005` |
+
+也就是说：这个坑一直存在，只是**以前只有一条可选适配器，索引恒为 0**，恰好绕过了写入。
+
+### 15.4 修复
+
+写入前先校验指针是否可写（这是唯一一处宿主传入且需要写入的指针）：
+
+```cpp
+if (IsWritablePointer(connectedInterface)) {
+    *connectedInterface = mode;      // 1=SWD, 2=JTAG
+} else if (connectedInterface) {
+    LOG_WARN("CMSIS_DAP_Connect: out-pointer %p is not writable "
+             "(AGDI passes the selected interface index here) -> write skipped",
+             (void *)connectedInterface);
+}
+```
+
+`IsWritablePointer()` 用 `VirtualQuery` 检查 `MEM_COMMIT` + 可写保护属性 + 区域足够放下一个 `int`。
+
+**验证**（同一份回归用例，修复前必崩）：
+
+```
+exit=0
+  CMSIS_DAP_Connect(handle, (int*)1) [mimics AGDI] -> 0  (survived the bogus pointer)
+  DAP_ReadReg(DPIDR) -> 0, 0x2BA01477
+日志: WARN  out-pointer 00000001 is not writable ... -> write skipped
+      DEBUG CMSIS_DAP_Connect: connection complete, interface=SWD
+```
+
+> **教训**：宿主传进来的"出参指针"不能无条件信任 —— 尤其是那种
+> "索引 0 = NULL 所以一直没出事"的值。一旦语义扩展（这里从 1 个接口变成 2 个），
+> 边界值立刻变成非法指针。凡是跨模块写入**外部**提供的内存，先校验再写。
+> 定位手法仍然是"最小独立复现"：`test/orbprobe.cpp` 一个 `(int*)1` 就把线上现象
+> 逐字复刻到了本地。
+
+---
+
+## 十六、双接口（V1/V2 分开显示）下 `RDDI-DAP Error` 的补齐
+
+> 日期：2026-09-30。现象：µVision 的 "CMSIS-DAP Cortex-M Target Driver Setup" 里，
+> 适配器下拉框有两条接口（`CMSIS-DAP v2` / `CMSIS-DAP v1`），但 SW Device 列表只有
+> `SWDIO / RDDI-DAP Error`，ID CODE / Device Name 为空；Firmware Version 显示 `2.1.0`。
+> 需求：**两个接口必须继续分开**，不得合并回单接口。
+
+### 16.1 定位链（工作区内可复现的证据）
+
+AGDI 有两条与"设备数量"有关的判断，触发条件都不在我们手里：
+
+| 判断 | 触发 | 证据 |
+|------|------|------|
+| "多设备"（一个接口 = 一台调试器） | `CMSIS_DAP_Detect` 返回 > 1 | §14.1（反汇编 `0x1002203C`） |
+| "多 DAP"（RDDI v2 能力） | `CMSIS_DAP_Identify(idNo=4)` 取主版本号 ≥ 2 | `test/orbprobe.cpp:97-99` |
+
+而"多 DAP"分支里有一句裸名 `LoadLibraryA("CMSIS_DAP.dll")`，失败即 `0x2029`，
+µVision 把它显示成 **`RDDI-DAP Error`**（`test/orbprobe.cpp:41-59`）。
+
+版本串的来源是本轮最关键的一处不一致：
+
+```223:223:src/ORBMDK_HID.cpp
+    strcpy_s(g_firmwareVersion, "1.0.0");
+```
+
+只有 HID 通道才给 `ctx->firmwareVersion` 赋值，且是主版本 1；而 auto 现在默认优先 V2
+（§13.3），V2 下这段被跳过 → 字段为空 → `CMSIS_DAP_Identify(idNo=4)` 落到回退分支
+现问设备，把**设备自己的** DAP_Info 固件串 `2.1.0` 透给 AGDI（主版本 2）。
+这解释了"**之前 V1 一直是好的**"：V1 路径恰好把版本钉在 `1.0.0`，从来不会进那条分支。
+
+叠加 `CMSIS_DAP_Detect` 恒为 2（§14），AGDI 眼里"两台设备 + 驱动自报支持多 DAP"，
+但本层的设备表/DAP 表始终只有 1 项 —— 三条口径互不自洽。
+
+### 16.2 本轮修复（4 项）
+
+| # | 位置 | 问题 | 修复 |
+|---|------|------|------|
+| 48 | `DAP_GetDAPIDList` | `sizeOfArray < sizeof(int) → RDDI_BADARG`：官方按**字节数**解释（§10.3(6) 的 `shr esi,2`），但 AGDI 在"多 DAP"分支里传的是**元素个数 1** → 直接返回 `RDDI_BADARG`，而且**静默**（不发任何 USB 命令、不写输出参数）。现场表现就是"`CMSIS_DAP_Connect` 成功之后立刻 Disconnect/Close，对话框显示 RDDI-DAP Error" | 两种解释都接受：`≥ sizeof(int)` 按字节、`1..sizeof(int)-1` 按元素个数；两者都不越界。内容仍是 DAP **索引** `0`（会被当作 CMSIS-DAP 的 DAP Index 字节使用，不能写 IDCODE）。日志补 `sizeOfArray → maxEntries` |
+| 49 | `CMSIS_DAP_JTAG_GetIDCODEs` | 只认固件的 `ID_DAP_JTAG_IDCODE` 命令；**SWD** 目标上该命令必然失败 → 即使 IDCODE 读得出来，这里也给不出任何 IDCODE。单设备路径下 AGDI 只取 `*count`（还能容忍 0），"多 DAP"分支要的是 idcodes **列表** → 空 = 失败 | 改为优先用与 `GetDeviceIDList` / `DetectDAPIDList` / `DetectNumberOfDAPs` **同一张表**（`ctx->dapIdList`，即协议无关的 DAP 扫描）填充 `idcodes` + `*count`；表为空时才回退 JTAG 命令。保持"扫不到 = 成功 + count 0"（§4.14）。`idcodes == NULL` 时只写 `*count` |
+| 50 | `RDDI_Open`（V2 分支） | V2 下 `firmwareVersion` 为空 → `Identify(idNo=4)` 每次现问设备，两次调用可能给出不同的串（AGDI 拿它做能力判定） | V2 打开后补一次 `DAP_GetInfo(DAP_INFO_FIRMWARE)` 并**缓存进 ctx**，此后 `Identify` 只回缓存值 |
+| 51 | `ORBMDK_USB_Bulk.cpp` | `_findAndOpenDevice` 里 `(void)serial;`：序列号筛选**从未实现**。同机插多台时只能取枚举到的第一台，插拔顺序一变就换机，界面也看不出来 | 新增 `%TEMP%\ORBMDK_SERIAL` / 环境变量 `ORBMDK_SERIAL`（与传输开关同风格，文件优先）；`_findAndOpenDeviceInGuid` 打开候选后读 iSerialNumber 描述符比对（设备路径里是位置型实例 ID，取不到序列号）；`RDDI_Open` 把该值传下去，V2/HID 两条路径共用。⚠️ **2026-09-30 该开关已移除**（§17.4 的原则：不留任何隐藏开关）；AGDI 的 `pDetails` 恒为 NULL，本层按枚举顺序取第一台 |
+
+### 16.3 明确不做（本轮结论）
+
+- **不合并双接口**：`CMSIS_DAP_Detect` 保持 2，`Identify` 继续按 `ifNo` 分名，
+  `ConfigureInterface(ifNo)` 继续负责切传输层（§14 的契约不变）。
+- **不改版本串的取值** —— ⚠️ **本条已被 §17.5 的对照实验推翻**。当时的推断是
+  "官方 RDDI 层同样把设备固件串透给 AGDI，所以只能逐项对齐那条分支里的接口"。
+  实验证明：那条分支在本环境下**根本走不到**那些接口（AGDI 连设备枚举都不做，
+  Connect 之后立即 Disconnect/Close；而 RDDI 层看到的 DPIDR/Connect 全是成功的）。
+  现已改为由本层自持版本串 `kDriverFirmwareVersion = "1.0.0"`，理由与数据见 §17.5。
+
+### 16.4 待实测
+
+1. 结束整个 `UV4.exe` → `.\deploy.ps1` → 重开 Keil → Debug Settings；
+   期望：SW Device 显示 `IDCODE 0x2BA01477 / ARM CoreSight SW-DP`，下拉框仍是两条。
+2. `%TEMP%\ORBMDK_RDDI.log` 搜 `DAP_GetDAPIDList: sizeOfArray`、
+   `from target scan`、`V2 firmware version`、`serial filter`；
+   `Init: entered ... serial='...'` 应显示被钉住的序列号。
+3. ~~多调试器：`echo 29B4E080E2289E06 > %TEMP%\ORBMDK_SERIAL` 指定具体设备~~
+   —— 该开关已于 2026-09-30 移除（见 §17.4）。AGDI 的 `pDetails` 恒为 NULL，
+   本层按枚举顺序取第一台。
+
+---
+
+## 十七、⭐ V2 打不开的两条真正根因（2026-09-30 定位并修复）
+
+> 现场：`SelectInterface: ifNo=0 -> bulk` 之后总是
+> `reject: CreateFile failed, err=5`，整场会话退化成 V1；
+> 一旦 V2 真打开，又是 `write 成功 / 读永远超时`。
+> 两条根因都不在 Keil、不在设备，而在本层。
+
+### 17.1 根因一：WinUSB 句柄泄漏 → v2 接口被**永久**独占
+
+| 探测（同一设备、同一驱动） | 结果 | 说明 |
+|---------------------------|------|------|
+| `mi_02/03/06/07` 的 WINUSB 接口，**非提权**进程 CreateFile | 全部成功 | 排除 ACL / 驱动 / 设备问题 |
+| `mi_05`（CMSIS-DAP v2 的 Bulk 接口） | **err=5（拒绝访问）** | WinUSB 独占 → 有人仍持有句柄 |
+| 全机进程列表 | 只有 `UV4.exe` | 持有者只能是 UV4 进程里的本层 DLL |
+
+机理：WinUSB 是独占设备。关闭时若还有挂起的 overlapped IRP 没被取消并收尾，
+内核会一直持有 file object 引用 → 接口不释放 → **此后任何进程**（含 Keil 自己）
+CreateFile 都是 err=5，且不会自己恢复（必须结束持有它的进程）。
+这解释了"**V2 明明以前能用，后来整场会话再也打不开**"。
+
+修复（`ORBMDK_USB_Bulk.cpp`）：
+- `_closeWinUSB()`：`CancelIoEx(句柄, NULL)` → `WinUsb_AbortPipe/ResetPipe(IN/OUT)`
+  （同步等 IRP 真正结束）→ **才** `WinUsb_Free` + `CloseHandle`。
+- `_cancelOverlapped()`：`CancelIoEx` 不回来就用 `WinUsb_AbortPipe` 强制收尾；
+  仍不回来则**故意弃置该 OVERLAPPED**（绝不能释放驱动仍持有的指针）。
+
+### 17.2 根因二：出包长度取了端点 wMaxPacketSize → 固件认为"传输未结束"
+
+日志关键事实：`bulkWrite OUT ep=0x03 len=512 -> 512 bytes, 0 ms`，然后**永远读不到响应**。
+用 `test/v2padprobe.cpp`（直连 WinUSB，**每个候选都重开设备**，避免残留字节造成假阳性）实测：
+
+| OUT 包长 | 结果 |
+|----------|------|
+| 2（按命令精确长度） | 无响应 |
+| **64** | 一问一答正常（仅"打开后第一条"会被吞，重发即可） |
+| **508** | **完全正常，第一条也答** ✓ |
+| 512（= 描述符 `wMaxPacketSize`） | **只有第一条能答，之后永久死** ✗ |
+
+机理：USB 上**长度恰等于 wMaxPacketSize 的包不是短包**，TinyUSB 一类固件会认为
+这次传输还没结束、继续等下一包 → 命令永远不被派发。设备自己用
+`DAP_Info(0xFF)` 报了 **508 = 512 − 4**，正是让我们避开这个陷阱。
+
+修复（`ORBMDK_USB_Bulk.cpp`）：
+- `_calibrateOutPacket()` 重写：① 用 64 的短包做引导，问设备 `DAP_Info(0xFF)`
+  拿**自报包长**；② 再用可校验的只读命令 `DAP_Info(0xF0)`（期望 `[00 01 xx]`）
+  **验证**该长度；③ 不合法就换候选（含 64），候选之间 `_flushAndDrainPipes()`；
+  ④ `_bulkPacketSize()` 无标定结果时用**描述符值减 1**，绝不发整包。
+
+### 17.3 验证（命令行完成，不依赖 Keil）
+
+`test/orbprobe3.exe`（强制 `ConfigureInterface(ifNo=0)` → 只许 V2）：
+
+```
+transport = CMSIS-DAP v2 (USB Bulk)   idcode=0x2BA01477
+[1] ROM table base = 0xE00FF003      [2] AP CSW R/W = 0x23000052
+[3] SCB->CPUID = 0x410FC241          [4] DHCSR -> S_HALT set
+[5] PC 读出（S_REGRDY=1）            [6] RAM 0x20000000 写读 0xA5A55A5A [OK]
+[7] resume -> running                （全程 ep=0x03/0x85，len=508）
+```
+
+### 17.4 传输选择：去掉一切"开关"
+
+- 删除 `%TEMP%\ORBMDK_TRANSPORT` 文件与环境变量；`_transportPreference()` 只认
+  AGDI 在 `CMSIS_DAP_ConfigureInterface(ifNo)` 给出的选择；未选定期间为 AUTO
+  （V2 优先、不可用才 V1）。
+- 选中的通道打不开时**如实失败**（`CMSIS_DAP_ConfigureInterface` 返回 `RDDI_FAILED`），
+  **不再静默降级**到另一条 —— 静默降级正是把 17.1 的 err=5 掩盖了那么久的元凶。
+
+### 17.5 结论：`Identify(idNo=4)` 的版本串**就是** AGDI"多 DAP 分支"的开关
+
+2026-09-30 做了单变量对照实验：同一台设备、同一份 DLL、同一台 Keil，
+**唯一变化**是上报的固件版本串（用临时诊断入口切换，实验后已删除该入口）。
+
+| 臂 | 上报串 | 传输 | 结果 | AGDI 实际调用序列（日志） |
+|----|--------|------|------|--------------------------|
+| A | `2.1.0`（设备自报，主版本 2） | V2 | **失败**（RDDI-DAP Error） | Open → Detect(2) → Identify → ConfigureInterface → Connect（DPIDR 读到了 0x2BA01477）→ 再读 3 条寄存器 → **Disconnect/Close**。**没有** `GetNumberOfDevices` / `GetDeviceIDList` / `ConfigureDebugger` |
+| A' | `2.1.0` | HID（另一条接口） | **失败**，同上 | 同上 |
+| B | `1.0.0`（主版本 1） | **V2** | **成功**，完整调试下载 | Open → Detect → Identify → ConfigureInterface → Connect → `DetectTargetDapIdList`(0x2BA01477) → `Block transfer probe OK` → `GetNumberOfDevices: count=1` → `GetDeviceIDList: id[0]=0x2BA01477` → `ConfigureDebugger` → …整场调试… |
+
+要点：
+1. A 臂里 **RDDI 层完全正常**（V2 通、IDCODE 正确、Connect 成功），错只出在 AGDI
+   那条分支上 —— 它连"设备列表枚举"都不做，连上就放弃。
+2. 与传输层无关：A 在 V2 与 HID 上都失败，B 在 V2 上成功 → 唯一变量就是这个版本串。
+3. 因此**保留钉值**：`kDriverFirmwareVersion = "1.0.0"`，设备自报串只写日志
+   （`RDDI_Open: device DAP_Info firmware = '...' (log only, not exposed)`）。
+   本节结论**取代 §16.3 中"不改版本串的取值"那一条**（当时的推断被本次实验推翻：
+   那条分支在本环境下靠"逐项对齐接口"过不去，AGDI 根本不会走到那些接口）。
+4. 临时诊断入口 `ORBMDK_FWVER` 已按约定删除，正式代码里不留开关。
+
+> 附注：若将来希望对话框里显示设备真实版本，可考虑"只把主版本归一化为 1"
+> （把 `2.1.0` 上报成 `1.1.0`），语义上仍能过闸；当前实现选择最保守的固定串。
+
+### 17.6 AGDI 侧"版本号判断"的反汇编证据（CMSIS_AGDI.dll v1.33.24.0）
+
+问："是不是 AGDI 层对版本号有判断？" —— **有，而且是显式的**。用新增的
+`tools/agdi_ver.py`（按"适配器条目字段基址"的 disp32 字节模式在整个 `.text` 里搜，
+再找指向目标地址的 `call rel32`）定位到下面这条链。
+
+**适配器条目布局**（步长 `0x148`，数组基址 `0x102F9044` 附近）：
+
+| 条目偏移 | 绝对地址 | 内容 | 写入者 |
+|----------|----------|------|--------|
+| `+0x07C` | `0x102F90C0` | 名字（0x104 字节） | `Identify(ifNo, 2)` @`0x100220AA` |
+| `+0x17D` | `0x102F91C1` | 序列号（0x20 字节） | `Identify(ifNo, 3)` @`0x1002210A` |
+| **`+0x19E`** | **`0x102F91E2`** | **固件版本（0x20 字节）** | **`Identify(ifNo, 4)` @`0x100225D9`** |
+| `+0x1C0` | `0x102F9204` | ifNo（用户选的那条） | `Detect` 循环 @`0x100220CD` |
+
+**取主版本号的函数 `0x10021FB0`**（返回 `%lu` 第一个值）：
+
+```asm
+0x10021FB0  push ebp / mov ebp,esp / sub esp,0xC
+0x10021FB6  cmp  dword ptr [0x10362714], 0     ; 适配器条目数
+0x10021FBD  mov  dword ptr [ebp-4], 0          ; major = 0
+0x10021FE0  imul eax, dword ptr [0x102f90b8], 0x148
+0x10021FEA  push 0x101EB37C                    ; ★ 格式串
+0x10021FEF  add  eax, 0x102F91E2               ; 条目的"固件版本"字段
+0x10021FF4  push eax
+0x10021FF5  call 0x100237A0                    ; sscanf(buf,"%lu.%lu.%lu",&major,&minor,&patch)
+0x10021FFF  jle  0x10022008                    ; 解析失败 → 返回 0
+0x10022001  mov  eax, dword ptr [ebp-4]        ; ★ 返回 major
+```
+其中 `0x101EB37C` 处的字符串实测为 **`"%lu.%lu.%lu"`**（紧邻的 `0x101EB384` 是 `"%lu"`）。
+
+**调用点一 `0x10022870`**（会话/DLL 加载路径）—— 判定之后就**换掉整张函数指针表**：
+
+```asm
+0x10022858  call ecx                            ; CMSIS_DAP_Capabilities(handle, ifNo, caps@0x102F8B90)
+0x10022870  call 0x10021FB0                     ; major
+0x10022875  cmp  eax, 2
+0x10022878  jb   0x10022897                     ; major < 2 → 原样（单 DAP 路径）
+0x1002287A  test byte ptr [0x102F8B90], 0x40    ; caps 位
+0x10022890  mov  byte ptr [0x10304B79], al      ; ★ 置"新模式"标志
+0x1002289C  mov  dword ptr [0x102375F4], 0x1003D030   ; ★ 换函数指针表 1
+0x100228A6  mov  dword ptr [0x10237994], 0x1003D0F0   ; ★ 换函数指针表 2
+```
+
+**调用点二 `0x1003CB92`** —— 同一个判定，同样在 `major >= 2` 时改装另一张表：
+
+```asm
+0x1003CB92  call 0x10021FB0
+0x1003CB97  cmp  eax, 2
+0x1003CB9A  jb   0x1003CEF1
+0x1003CBA0  cmp  dword ptr [0x10363010], 1
+0x1003CBA7  je   0x1003CEF1
+0x1003CBB2  mov  dword ptr [0x10363020], 0x10363120   ; ★ 又一张表
+```
+
+**结论**：AGDI 把 `Identify(idNo=4)` 的返回值当版本号 `sscanf`，用 **`cmp eax,2`** 做门槛；
+主版本 ≥ 2 时切到它自己的另一套驱动逻辑（换函数指针表 + 置标志位）。本环境下那套
+逻辑走不通（A 臂：跳过全部设备枚举、`Connect` 后立刻 Close），所以这一栏必须钉在
+`1.0.0`。这也正是 §17.5"只改这一个字符串、行为就翻转"的代码级解释。
+
+
+

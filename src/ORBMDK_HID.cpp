@@ -65,6 +65,38 @@ static void HID_Log(int level, const char* module, const char* fmt, ...) {
 #define LOG_HID_WARN(fmt, ...)  HID_Log(2, "HID", fmt, ##__VA_ARGS__)
 #define LOG_HID_ERROR(fmt, ...) HID_Log(3, "HID", fmt, ##__VA_ARGS__)
 
+// ---------------------------------------------------------------------------
+// 命令级日志：**直写 %TEMP%\ORBMDK_RDDI.log、不受级别控制**（与
+// ORBMDK_USB_Bulk.cpp 的 BulkTrace 同构）。
+//
+// 为什么必须有：V1(HID) 路径下的 DAP 命令原本**完全不可见** —— HID_Log 走
+// stdout/DebugView 且默认阈值 ERROR，不落文件。实测排障时表现为
+// "AGDI 在 CMSIS_DAP_Connect 之后什么都不做就断开"，而 HID 命令其实可能一直在发。
+// 传输层的排障线索不允许依赖日志级别。
+// ---------------------------------------------------------------------------
+static void HidTrace(const char* fmt, ...)
+{
+    char path[MAX_PATH] = {0};
+    const DWORD n = GetTempPathA((DWORD)sizeof(path), path);
+    if (n == 0 || n >= sizeof(path)) {
+        return;
+    }
+    strncat_s(path, sizeof(path), "ORBMDK_RDDI.log", _TRUNCATE);
+
+    char msg[512] = {0};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "a") != 0 || !f) {
+        return;
+    }
+    fprintf(f, "[ORBMDK][INFO][HID] %s\n", msg);
+    fclose(f);
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -389,7 +421,12 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
 
     std::lock_guard<std::mutex> lock(g_hidMutex);
 
-    if (!g_isConnected || g_hDevice == INVALID_HANDLE_VALUE) return -1;
+    if (!g_isConnected || g_hDevice == INVALID_HANDLE_VALUE) {
+        HidTrace("DAPCommand: cmd=0x%02X outLen=%zu -> NOT CONNECTED", cmd[0], cmdLen);
+        return -1;
+    }
+
+    HidTrace("DAPCommand: cmd=0x%02X outLen=%zu (V1 HID)", cmd[0], cmdLen);
 
     // 上限必须是**实际输出缓冲区**的大小，不是 DAP_BUFFER_SIZE(512)：
     // reportOut 只有 HID_MAX_PACKET_SIZE(65) 字节，下一行的
@@ -475,6 +512,10 @@ int ORBMDK_HID_DAPCommand(const uint8_t* cmd, size_t cmdLen,
             LOG_HID_DEBUG("HID response report ID = 0x%02X (expected 0x%02X)",
                           reportIn[0], CMD_REPORT_ID);
         }
+        HidTrace("DAPCommand: cmd=0x%02X -> resp %zu bytes [%02X %02X %02X %02X]",
+                 cmd[0], copyLen,
+                 (copyLen > 0) ? reportIn[0] : 0, (copyLen > 1) ? reportIn[1] : 0,
+                 (copyLen > 2) ? reportIn[2] : 0, (copyLen > 3) ? reportIn[3] : 0);
     }
 
     return 0;

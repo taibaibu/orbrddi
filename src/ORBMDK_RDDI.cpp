@@ -227,6 +227,22 @@ static constexpr uint32_t kDefaultClock = 1000000;  // 1 MHz
 static constexpr uint8_t kDefaultWaitRetry = 100;
 static constexpr uint8_t kDefaultMatchRetry = 10;
 
+// ---------------------------------------------------------------------------
+// 驱动自持的"固件版本"串（Identify(idNo=4) 的返回值）—— **不要**改成设备的 DAP_Info 串
+//
+// 机理（§15 反汇编）：AGDI 把该串按 "%lu.%lu.%lu" 解析并取**主版本号**，
+// 主版本 >= 2 就切到它的"多 DAP 设备"分支；那条分支在本环境下走不通。
+//
+// 2026-09-30 对照实验（同一台设备、同一份 DLL、唯一变量是这个串，见 §17.5）：
+//   * 串 = 设备自报 "2.1.0"（主版本 2）：RDDI 层一切正常（V2 通、DPIDR=0x2BA01477、
+//     Connect 成功），但 **AGDI 跳过全部设备枚举**（日志里没有
+//     GetNumberOfDevices / GetDeviceIDList / ConfigureDebugger），连上即断开 →
+//     界面报 RDDI-DAP Error。V2 与 HID 两条通路都一样失败。
+//   * 串 = "1.0.0"（主版本 1）：完整枚举 + 正常调试下载，V2 全程可用。
+// 所以这一栏必须由本层自持；设备自报的串只写日志，不向宿主暴露。
+// ---------------------------------------------------------------------------
+static constexpr const char* kDriverFirmwareVersion = "1.0.0";
+
 // ----------------------------------------------------------------------------
 // 单 DAP 枚举常量
 //
@@ -296,6 +312,9 @@ struct RDDIContext {
     bool isSWD = true;
     uint32_t debugClock = kDefaultClock;
     bool isConnected = false;
+
+    // SWD 链路自愈重入保护（见 SwdLinkRecover）
+    bool swdRecovering = false;
 
     // Device info
     uint32_t capabilities = INFO_CAPS_SWD | INFO_CAPS_ATOMIC_CMDS;
@@ -546,31 +565,45 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
 
     std::lock_guard<std::mutex> lock(gContextMutex);
 
-    // 打开设备：优先 CMSIS-DAP V2（USB Bulk），失败自动回退 V1（HID）。
-    // ORBMDK_USB_Bulk_Init 内部已实现该优先级与回退逻辑。
+    // 打开设备：此刻用户还没选接口（AGDI 要到 ConfigureInterface 才把选择告诉我们），
+    // 所以按"哪个能用用哪个"打开：V2(Bulk) 优先，打不开才 V1(HID)。
+    // 用户一旦在对话框里选定，CMSIS_DAP_ConfigureInterface 会把传输层切过去，
+    // 并且**不再允许**两条通道互相顶替（选了 V2 就必须是 V2，打不开就报错）。
     //
     // 注意**不要**把这件事放进 ORBMDK_HID_OpenDevice：它会持有 g_hidMutex，
     // 而回退路径又会调用 ORBMDK_HID_OpenDevice，std::mutex 非递归会死锁。
-    if (ORBMDK_USB_Bulk_GetMode() == USB_BULK_NOT_INITED &&
-        !ORBMDK::ORBMDK_HID_IsConnected()) {
-        LOG_DEBUG("RDDI_Open: no transport yet, trying V2 Bulk then V1 HID...");
-        if (ORBMDK_USB_Bulk_Init(0, 0, nullptr) != 0) {
-            // 带上系统错误码：否则现场只能看到"失败了"，无从判断是
-            // 设备未插、被独占、还是驱动问题。
-            const DWORD sysErr = GetLastError();
-            LOG_ERROR("RDDI_Open: open failed (V2 Bulk and V1 HID both failed), "
-                      "GetLastError()=%lu", (unsigned long)sysErr);
-            // 失败时必须把句柄置 0（本层句柄从 1 开始，0 恒为无效值）：
-            // AGDI 的 `rddi_Open(&handle, NULL)` 之后直接用该变量当句柄，
-            // 不写的话它会保留上一次成功打开时的旧句柄，继续对着一个
-            // 已失效的连接调用各接口。
-            *pHandle = 0;
-            return RDDI_FAILED;
+    {
+        const USB_Bulk_Mode cur = ORBMDK_USB_Bulk_GetMode();
+        const int pref = ORBMDK_USB_Bulk_GetTransportPreference();
+        const bool switchNeeded =
+            (pref == USB_BULK_TRANSPORT_BULK && cur != USB_BULK_BULK_MODE) ||
+            (pref == USB_BULK_TRANSPORT_HID  && cur != USB_BULK_HID_MODE);
+        const bool firstOpen = (cur == USB_BULK_NOT_INITED &&
+                               !ORBMDK::ORBMDK_HID_IsConnected());
+
+        if (firstOpen || switchNeeded) {
+            // 多调试器：AGDI 的 pDetails 是 NULL（实测），**不提供**"用哪一台"，
+            // 所以按枚举顺序取第一台 —— 本层不再提供任何"指定序列号"的隐藏开关。
+            LOG_DEBUG("RDDI_Open: opening transport (current=%d, pref=%d, switch=%d)...",
+                      (int)cur, pref, (int)switchNeeded);
+            if (ORBMDK_USB_Bulk_Init(0, 0, nullptr) != 0) {
+                // 带上系统错误码：否则现场只能看到"失败了"，无从判断是
+                // 设备未插、被独占、还是驱动问题。
+                const DWORD sysErr = GetLastError();
+                LOG_ERROR("RDDI_Open: open failed (V2 Bulk and V1 HID both failed), "
+                          "GetLastError()=%lu", (unsigned long)sysErr);
+                // 失败时必须把句柄置 0（本层句柄从 1 开始，0 恒为无效值）：
+                // AGDI 的 `rddi_Open(&handle, NULL)` 之后直接用该变量当句柄，
+                // 不写的话它会保留上一次成功打开时的旧句柄，继续对着一个
+                // 已失效的连接调用各接口。
+                *pHandle = 0;
+                return RDDI_FAILED;
+            }
+            LOG_INFO("RDDI_Open: transport = %s",
+                     ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE
+                         ? "CMSIS-DAP v2 (USB Bulk)"
+                         : "CMSIS-DAP v1 (HID)");
         }
-        LOG_INFO("RDDI_Open: transport = %s",
-                 ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE
-                     ? "CMSIS-DAP v2 (USB Bulk)"
-                     : "CMSIS-DAP v1 (HID)");
     }
 
     // 分配新句柄
@@ -601,6 +634,11 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
             LOG_DEBUG("RDDI_Open: device product='%s' serial='%s' fw='%s'",
                       ctx->productName.c_str(), ctx->serialNumber.c_str(),
                       ctx->firmwareVersion.c_str());
+        } else if (ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE) {
+            // V2 模式下本来就没打开 HID 接口，这里取不到属正常，
+            // 产品名/序列号改从 Bulk 接口与设备描述符取（见下）
+            LOG_DEBUG("RDDI_Open: no HID device open (V2 mode), "
+                      "product/serial are taken from the Bulk interface");
         } else {
             LOG_WARN("RDDI_Open: ORBMDK_HID_GetDeviceInfo failed");
         }
@@ -621,8 +659,36 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
                 LOG_WARN("RDDI_Open: V2 interface string unavailable, keeping '%s'",
                          ctx->productName.c_str());
             }
+
+            // 序列号：V2 下没有打开 HID 接口，HidD_GetSerialNumberString 取不到，
+            // 改从设备的 iSerialNumber 字符串描述符读。不做的话
+            // CMSIS_DAP_Identify(idNo=3) 只能返回 "Unknown"，
+            // µVision 适配器列表里看不到序列号。
+            char bulkSerial[128] = {};
+            if (ORBMDK_USB_Bulk_GetSerialNumber(bulkSerial, sizeof(bulkSerial)) == 0) {
+                ctx->serialNumber = bulkSerial;
+                LOG_INFO("RDDI_Open: V2 serial = '%s'", ctx->serialNumber.c_str());
+            }
+
+            // 设备自报的固件串**只写日志**，不进 ctx、不向宿主暴露：
+            // 它是 "2.1.0"（主版本 2），会让 AGDI 切到"多 DAP"分支（见
+            // kDriverFirmwareVersion 的说明）。真正返回给 Identify(idNo=4) 的
+            // 是驱动自持的那一份，在函数末尾统一赋值。
+            {
+                char devFw[64] = {};
+                ORBMDK::DAP_GetInfo(DAP_INFO_FIRMWARE, devFw, sizeof(devFw));
+                LOG_INFO("RDDI_Open: device DAP_Info firmware = '%s' (log only, not exposed)",
+                         devFw);
+            }
         }
     }
+
+    // 固件版本串一律由本层自持（两种传输、每次打开都一致）—— 它是 AGDI
+    // "是否走多 DAP 分支"的开关，绝不能让设备自报的 "2.1.0"（主版本 2）漏出去。
+    // 对照实验见 COMPAT_ANALYSIS §17.5。
+    ctx->firmwareVersion = kDriverFirmwareVersion;
+    LOG_INFO("RDDI_Open: firmware version exposed to host = '%s'",
+             ctx->firmwareVersion.c_str());
 
     // 插入 map（堆分配，地址稳定）
     gContexts.emplace(handle, std::move(ctx));
@@ -697,6 +763,7 @@ RDDI_FUNC int RDDI_GetLastError(int *pError, char *pDetails, size_t detailsLen)
 
 RDDI_FUNC int DAP_GetInterfaceVersion(const RDDIHandle handle, int *version)
 {
+    LOG_DEBUG("DAP_GetInterfaceVersion: enter, handle=%d", handle);
     if (version) {
         *version = 0;  // 失败时也要写输出参数
     }
@@ -716,6 +783,7 @@ RDDI_FUNC int DAP_GetInterfaceVersion(const RDDIHandle handle, int *version)
 
 RDDI_FUNC int DAP_Configure(const RDDIHandle handle, const char *configFileName)
 {
+    LOG_DEBUG("DAP_Configure: enter, handle=%d, cfgFile=%p", handle, (const void *)configFileName);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -750,6 +818,7 @@ RDDI_FUNC int DAP_Connect(const RDDIHandle handle, RDDI_DAP_CONN_DETAILS *pConnD
 
 RDDI_FUNC int DAP_GetNumberOfDAPs(const RDDIHandle handle, int *noOfDAPs)
 {
+    LOG_DEBUG("DAP_GetNumberOfDAPs: enter, handle=%d", handle);
     if (noOfDAPs) {
         *noOfDAPs = 0;  // 即使失败也写入输出参数，避免调用方读到未初始化内存
     }
@@ -769,25 +838,50 @@ RDDI_FUNC int DAP_GetNumberOfDAPs(const RDDIHandle handle, int *noOfDAPs)
 
 RDDI_FUNC int DAP_GetDAPIDList(const RDDIHandle handle, int *DAP_ID_Array, size_t sizeOfArray)
 {
+    LOG_INFO("DAP_GetDAPIDList: enter, handle=%d, array=%p, sizeOfArray=%llu",
+             handle, (void *)DAP_ID_Array, (unsigned long long)sizeOfArray);
+
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
     }
 
-    if (!DAP_ID_Array || sizeOfArray < sizeof(int)) {
+    if (!DAP_ID_Array || sizeOfArray == 0) {
+        LOG_WARN("DAP_GetDAPIDList: BADARG (array=%p, sizeOfArray=%llu)",
+                 (void *)DAP_ID_Array, (unsigned long long)sizeOfArray);
         return RDDI_BADARG;
     }
 
+    // ⚠️ sizeOfArray 的两种解释都必须接受 —— AGDI 两种都真的会传。
+    //
+    //   * 官方实现按**字节数**解释（反汇编里 `shr esi, 2` 换算成元素个数，
+    //     见 COMPAT_ANALYSIS §10.3(6)），此时传 0x100（256 字节）。
+    //   * 但 AGDI 在"多 DAP"分支里会传**元素个数**（实测传 1）。
+    //
+    // 旧实现写死 `sizeOfArray < sizeof(int) → RDDI_BADARG`：传 1 时直接失败，
+    // 而且是**静默**失败（不发任何 USB 命令、也不写输出参数），现场表现为
+    // "CMSIS_DAP_Connect 成功之后立刻 Disconnect/Close，Debug Settings 里
+    // 显示 RDDI-DAP Error"。≥ sizeof(int) 按字节数解释，1..sizeof(int)-1
+    // 按元素个数解释，两种解释下都不会越界。
+    const size_t maxEntries = (sizeOfArray >= sizeof(int))
+                                  ? (sizeOfArray / sizeof(int))
+                                  : sizeOfArray;
+
     // 与 DAP_GetNumberOfDAPs 保持一致：连接目标之前即可返回，单 DAP，ID = 0。
     // 注意 DAP_ID 会被后续 DAP_ReadReg / DAP_WriteReg 当作 CMSIS-DAP 的
-    // "DAP Index" 字节使用，必须是索引而不是 IDCODE。
+    // "DAP Index" 字节使用，必须是**索引**而不是 IDCODE（写 IDCODE 会让
+    // 低字节变成非法的 DAP Index）。
     DAP_ID_Array[0] = kSingleDapId;
+    LOG_INFO("DAP_GetDAPIDList: sizeOfArray=%llu -> maxEntries=%llu, returned=%d, id[0]=%d",
+             (unsigned long long)sizeOfArray, (unsigned long long)maxEntries,
+             (maxEntries > 0) ? 1 : 0, kSingleDapId);
 
     return RDDI_SUCCESS;
 }
 
 RDDI_FUNC int DAP_Disconnect(const RDDIHandle handle)
 {
+    LOG_DEBUG("DAP_Disconnect: enter, handle=%d", handle);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -801,6 +895,69 @@ RDDI_FUNC int DAP_Disconnect(const RDDIHandle handle)
 // ============================================================================
 // Register Access Functions
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// SWD 链路自愈
+//
+// 实测：目标一旦对某条传输回 NO_ACK（Transfer Response = 0x07），之后**所有**
+// DAP_Transfer 都返回 NO_ACK —— 目标的 SWD 进了"协议错误/静默"状态。这种状态
+// **只有线复位能解除**（写 ABORT 不够）；而 AGDI 的恢复动作只是"写 ABORT 后重试"，
+// 于是它一路重试一路失败，最后报 "RDDI-DAP Error"。
+//
+// 所以本层自己补一次标准恢复序列（与 OpenOCD 的 dap_dp_init 同构）：
+//     line reset → JTAG-to-SWD → line reset → 写 ABORT(0x1E) → 读 DPIDR 校验
+// 恢复成功后把调用方那次传输重放一次。恢复期间用 ctx->swdRecovering 防重入。
+// ---------------------------------------------------------------------------
+static bool SwdLinkRecover(RDDIContext* ctx)
+{
+    if (ctx->swdRecovering) {
+        return false;
+    }
+    ctx->swdRecovering = true;
+
+    uint8_t lineReset[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    uint8_t jtagToSwd[] = { 0x9E, 0xE7 };
+    uint8_t idle[] = { 0x00 };
+
+    bool ok = false;
+    for (int attempt = 0; attempt < 2 && !ok; ++attempt) {
+        if (attempt > 0) {
+            // 第二轮先重新 DAP_Connect(port=SWD)，再走完整切换序列
+            ORBMDK::DAP_ConnectTarget();
+        }
+        ORBMDK::DAP_SWJ_Sequence(56, lineReset);
+        ORBMDK::DAP_SWJ_Sequence(16, jtagToSwd);
+        ORBMDK::DAP_SWJ_Sequence(56, lineReset);
+        ORBMDK::DAP_SWJ_Sequence(8, idle);
+
+        // ABORT 走专用命令(0x08)：即使 DAP_Transfer 全 NO_ACK，它也通常能下发
+        ORBMDK::DAP_WriteAbort(0, 0x1E);   // ORUNERRCLR|WDERRCLR|STKERRCLR|STKCMPCLR
+
+        uint32_t idcode = 0;
+        if (ORBMDK::DAP_Transfer(0, 0x02, &idcode) == ORBMDK::DAP_RES_OK &&
+            idcode != 0 && idcode != 0xFFFFFFFFu) {
+            ok = true;
+            LOG_WARN("SWD link recovered: idcode=0x%08X (attempt=%d)", idcode, attempt + 1);
+        }
+    }
+
+    ctx->swdRecovering = false;
+    if (!ok) {
+        LOG_ERROR("SWD link recovery failed: target still not responding");
+    }
+    return ok;
+}
+
+// 带自愈的传输：NO_ACK / FAULT 时恢复链路并重放一次
+static int TransferWithRecovery(RDDIContext* ctx, int dapId, uint8_t request, uint32_t* data)
+{
+    int status = ORBMDK::DAP_Transfer(dapId, request, data);
+    if ((status == ORBMDK::DAP_RES_NO_ACK || status == ORBMDK::DAP_RES_FAULT) &&
+        !ctx->swdRecovering && SwdLinkRecover(ctx)) {
+        status = ORBMDK::DAP_Transfer(dapId, request, data);
+    }
+    return status;
+}
 
 RDDI_FUNC int DAP_ReadReg(const RDDIHandle handle, const int dapId, const int regId, int *value)
 {
@@ -829,7 +986,7 @@ RDDI_FUNC int DAP_ReadReg(const RDDIHandle handle, const int dapId, const int re
     const uint8_t request = static_cast<uint8_t>(regOffset) | 0x02;  // Read
 
     uint32_t data = 0;
-    int status = ORBMDK::DAP_Transfer(dapId, request, &data);
+    int status = TransferWithRecovery(ctx, dapId, request, &data);
 
     if (status != ORBMDK::DAP_RES_OK) {
         ctx->lastError = RDDI_DAP_ERROR;
@@ -887,7 +1044,7 @@ RDDI_FUNC int DAP_WriteReg(const RDDIHandle handle, const int dapId, const int r
     const uint8_t request = static_cast<uint8_t>(regOffset);  // Write
 
     uint32_t data = static_cast<uint32_t>(value);
-    int status = ORBMDK::DAP_Transfer(dapId, request, &data);
+    int status = TransferWithRecovery(ctx, dapId, request, &data);
 
     if (status != ORBMDK::DAP_RES_OK) {
         ctx->lastError = RDDI_DAP_ERROR;
@@ -1167,6 +1324,75 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
 // CMSIS-DAP Specific Functions
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// 对外暴露的"接口列表" = 可用的**传输层**，与 AGDI 对话框一一对应
+//
+//   接口 0 = CMSIS-DAP v2 (USB Bulk)
+//   接口 1 = CMSIS-DAP v1 (HID)
+//
+// AGDI 的处理（反汇编 0x1002203C，见 COMPAT_ANALYSIS §14）：
+//   CMSIS_DAP_Detect(h, &n)                       ; n 就是个列表项数
+//   for (ifNo = 0; ifNo < min(n, 16); ++ifNo) {   ; 最多 16 项
+//       Identify(h, ifNo, 2, buf, 0x104)          ; 产品名 -> 列表文字
+//       Identify(h, ifNo, 3, buf, 0x104)          ; 序列号
+//       entry[count].ifNo = ifNo;                 ; 记住序号
+//   }
+//   用户选中某项后：ConfigureInterface(h, [选中项的 ifNo], cfg)
+//
+// 所以"两种模式都显示、可切换"= Detect 报 2 + Identify 按 ifNo 给不同名字
+//   + ConfigureInterface 按 ifNo 切传输层。
+// ---------------------------------------------------------------------------
+static constexpr int kTransportInterfaceCount = 2;
+
+// ---------------------------------------------------------------------------
+// 运行期可改的接口数量（默认 2，行为不变）
+//
+//   文件 %TEMP%\ORBMDK_IFACES   内容 1 或 2
+//   环境变量 ORBMDK_IFACES
+//
+// 存在的意义：Keil 的 PDSC 层在"多调试端口"场景下要按端口身份（GUID / 端口 ID）
+// 做匹配。把**同一个物理调试器**的两种传输报成两条接口，会让它走多端口分支
+// （现场症状：PDSC: Unknown Debug Port ID / Cannot switch to Debug Port）。
+// 设为 1 可一次性判定"是否多接口暴露导致"；默认仍为 2。
+// ---------------------------------------------------------------------------
+static int TransportInterfaceCount(void)
+{
+    static int cached = 0;
+    if (cached > 0) {
+        return cached;
+    }
+    cached = kTransportInterfaceCount;
+
+    char raw[32] = {0};
+    char path[MAX_PATH] = {0};
+    const DWORD n = GetTempPathA((DWORD)sizeof(path), path);
+    if (n > 0 && n < sizeof(path)) {
+        strncat_s(path, sizeof(path), "ORBMDK_IFACES", _TRUNCATE);
+        FILE* f = nullptr;
+        if (fopen_s(&f, path, "r") == 0) {
+            if (fgets(raw, sizeof(raw), f) == nullptr) {
+                raw[0] = '\0';
+            }
+            fclose(f);
+        }
+    }
+    if (raw[0] == '\0') {
+        const DWORD got = GetEnvironmentVariableA("ORBMDK_IFACES", raw, (DWORD)sizeof(raw));
+        if (got == 0 || got >= sizeof(raw)) {
+            raw[0] = '\0';
+        }
+    }
+    if (raw[0] != '\0') {
+        const int v = atoi(raw);
+        if (v >= 1 && v <= kTransportInterfaceCount) {
+            cached = v;
+        }
+    }
+    LOG_INFO("interface count = %d (kTransportInterfaceCount=%d, ORBMDK_IFACES)",
+             cached, kTransportInterfaceCount);
+    return cached;
+}
+
 RDDI_FUNC int CMSIS_DAP_Detect(const RDDIHandle handle, int *noOfIFs)
 {
     // 即使失败也写入输出参数：调用方（AGDI 的 PDSCDebug_InitDebugger）
@@ -1181,8 +1407,11 @@ RDDI_FUNC int CMSIS_DAP_Detect(const RDDIHandle handle, int *noOfIFs)
         return RDDI_INVHANDLE;
     }
 
-    *noOfIFs = 1;  // One interface (ORBTrace 单设备)
-    LOG_INFO("CMSIS_DAP_Detect: noOfIFs=1");
+    // ⚠️ 绝不能返回 0：AGDI 看到 0 会直接以 EU02（"No Debug Unit Found"）中止
+    // 整个初始化（见 §4.6）。没有设备时也报 1，让用户能进对话框看到错误。
+    *noOfIFs = TransportInterfaceCount();
+    LOG_INFO("CMSIS_DAP_Detect: noOfIFs=%d (0=CMSIS-DAP v2/Bulk, 1=CMSIS-DAP v1/HID)",
+             *noOfIFs);
     return RDDI_SUCCESS;
 }
 
@@ -1204,8 +1433,18 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
         return RDDI_BADARG;
     }
 
-    // 优先使用 RDDI_Open 时从 HID 层取到的设备标识；
-    // 取不到再向固件查询 DAP_Info；最后才用硬编码兜底。
+    // 优先使用 RDDI_Open 时取到的设备标识；取不到再向固件查询；
+    // 最后才用硬编码兜底。
+    //
+    // ifNo 决定"这是哪一个传输接口"：0 = CMSIS-DAP v2 (Bulk)，1 = CMSIS-DAP v1 (HID)。
+    // AGDI 的对话框就是靠这里的**产品名**把两个接口显示成两条可选适配器的，
+    // 所以 idNo=2 时必须按 ifNo 给出不同名字（见 CMSIS_DAP_Detect 的说明）。
+    if (ifNo < 0 || ifNo >= TransportInterfaceCount()) {
+        LOG_WARN("CMSIS_DAP_Identify: ifNo=%d out of range [0,%d), empty result",
+                 ifNo, TransportInterfaceCount());
+        return RDDI_SUCCESS;   // 保持空串（已在上面清空）
+    }
+
     switch (idNo) {
         case 1:  // Vendor (RDDI_CMSIS_DAP_ID_VENDOR)
             ORBMDK::DAP_GetInfo(DAP_INFO_VENDOR, str, len);
@@ -1214,18 +1453,16 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
             }
             break;
 
-        case 2:  // Product (RDDI_CMSIS_DAP_ID_PRODUCT)
-            if (!ctx->productName.empty()) {
-                strncpy_s(str, len, ctx->productName.c_str(), len - 1);
-            } else {
-                ORBMDK::DAP_GetInfo(DAP_INFO_PRODUCT, str, len);
-                if (str[0] == '\0') {
-                    strncpy_s(str, len, "ORBTrace CMSIS-DAP", len - 1);
-                }
+        case 2:  // Product (RDDI_CMSIS_DAP_ID_PRODUCT) —— 对话框里的列表文字
+            if (ORBMDK_USB_Bulk_GetInterfaceName(ifNo, str, len) != 0 ||
+                str[0] == '\0') {
+                strncpy_s(str, len, (ifNo == 1) ? "CMSIS-DAP v1" : "CMSIS-DAP v2", len - 1);
             }
             break;
 
         case 3:  // Serial number (RDDI_CMSIS_DAP_ID_SER_NUM)
+            // 两个接口属于同一个物理设备，序列号相同：统一用 ctx 里那份
+            // （V2 下它是从 iSerialNumber 描述符读到的）。
             if (!ctx->serialNumber.empty()) {
                 strncpy_s(str, len, ctx->serialNumber.c_str(), len - 1);
             } else {
@@ -1237,13 +1474,13 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
             break;
 
         case 4:  // Firmware version (RDDI_CMSIS_DAP_ID_FW_VER)
+            // 一律回驱动自持的那一份（RDDI_Open 里已赋值）。**不能**回退去问设备：
+            // 设备串是 "2.1.0"，主版本 2 会让 AGDI 走"多 DAP"分支（见
+            // kDriverFirmwareVersion 的说明）。这里保留兜底只是为了防御性。
             if (!ctx->firmwareVersion.empty()) {
                 strncpy_s(str, len, ctx->firmwareVersion.c_str(), len - 1);
             } else {
-                ORBMDK::DAP_GetInfo(DAP_INFO_FIRMWARE, str, len);
-                if (str[0] == '\0') {
-                    strncpy_s(str, len, "1.0.0", len - 1);
-                }
+                strncpy_s(str, len, kDriverFirmwareVersion, len - 1);
             }
             break;
 
@@ -1253,6 +1490,9 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
             break;
     }
 
+    // 入口/出口都留痕：AGDI 在"多接口"路径里就是靠这里取适配器与设备身份，
+    // 报 "Unknown Debug Port ID" 时第一个要看的就是 idNo 与返回的串。
+    LOG_INFO("CMSIS_DAP_Identify: ifNo=%d, idNo=%d -> '%s'", ifNo, idNo, str);
     return RDDI_SUCCESS;
 }
 
@@ -1265,6 +1505,31 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
     }
 
     LOG_INFO("CMSIS_DAP_ConfigureInterface: ifNo=%d, cfg='%s'", ifNo, str ? str : "(null)");
+
+    // ★ 这里就是"用户在对话框里选了哪个适配器"的落点（AGDI 把选中项的 ifNo
+    //   原样传进来，反汇编 0x10022AA8）。据此把传输层切到对应模式：
+    //     ifNo 0 -> CMSIS-DAP v2 (Bulk)    ifNo 1 -> CMSIS-DAP v1 (HID)
+    // 必须在 DAP_Configure / CMSIS_DAP_Connect **之前**完成切换。
+    if (ifNo >= 0 && ifNo < TransportInterfaceCount()) {
+        const int sel = ORBMDK_USB_Bulk_SelectInterface(ifNo);
+        if (sel != 0) {
+            // 选中的通道打不开：**如实报错并中止本次配置**，不偷偷换到另一条。
+            // 静默降级会把"V2 坏了"伪装成"一切正常"（历史上正是如此掩盖了句柄
+            // 泄漏导致的 err=5：整场会话看着能用，其实一直跑在 V1 上）。
+            LOG_ERROR("CMSIS_DAP_ConfigureInterface: interface %d (%s) could not be opened (%d) "
+                      "- NOT falling back to the other transport",
+                      ifNo, (ifNo == 1) ? "CMSIS-DAP v1/HID" : "CMSIS-DAP v2/Bulk", sel);
+            return RDDI_FAILED;
+        } else {
+            LOG_INFO("CMSIS_DAP_ConfigureInterface: transport = %s",
+                     ORBMDK_USB_Bulk_GetMode() == USB_BULK_BULK_MODE
+                         ? "CMSIS-DAP v2 (USB Bulk)"
+                         : "CMSIS-DAP v1 (HID)");
+        }
+    } else {
+        LOG_WARN("CMSIS_DAP_ConfigureInterface: ifNo=%d out of range, transport unchanged",
+                 ifNo);
+    }
 
     // Parse configuration string like:
     // "Master=Y;Port=SW;SWJ=Y;Clock=10000000;..."
@@ -1324,6 +1589,7 @@ RDDI_FUNC int CMSIS_DAP_ConfigureInterface(const RDDIHandle handle, int ifNo, ch
 // 标准函数：配置 DAP
 RDDI_FUNC int CMSIS_DAP_ConfigureDAP(const RDDIHandle handle, const char *str)
 {
+    LOG_DEBUG("CMSIS_DAP_ConfigureDAP: enter, handle=%d, str=%p", handle, (const void *)str);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1346,6 +1612,7 @@ RDDI_FUNC int CMSIS_DAP_ConfigureDAP(const RDDIHandle handle, const char *str)
 // 标准函数：获取 DAP 能力
 RDDI_FUNC int CMSIS_DAP_Capabilities(const RDDIHandle handle, int ifNo, int *cap_info)
 {
+    LOG_DEBUG("CMSIS_DAP_Capabilities: enter, handle=%d, ifNo=%d", handle, ifNo);
     if (cap_info) {
         *cap_info = 0;  // 失败时也要写输出参数
     }
@@ -1450,6 +1717,18 @@ static int DetectTargetDapIdList(RDDIContext *ctx, uint32_t *outIdcode, int *out
 
     LOG_INFO("DetectTargetDapIdList: mode=%d transferStatus=%d idcode=0x%08X -> count=%d",
              mode, status, idcode, (int)ctx->dapIdList.size());
+
+    // ------------------------------------------------------------------
+    // 块传输能力探测：放在这里是因为**只有这里能确定目标已连接**。
+    //
+    // 以前探测是"首次用到 DAP_RegWriteRepeat 时才做"，结果它在很多场合
+    // 根本不会被执行（例如调用方传了非法 regID 就直接返回了），
+    // 于是"固件不支持 ID_DAP_TRANSFER_BLOCK"这个结论**从未被真正验证过**——
+    // 它其实只是某次探测失败留下的产物。现在改成每次连上目标都探测一次并留证。
+    // ------------------------------------------------------------------
+    if (status == ORBMDK::DAP_RES_OK) {
+        EnsureBlockTransferProbed(ctx, 0);
+    }
     return static_cast<int>(ctx->dapIdList.size());
 }
 
@@ -1541,6 +1820,7 @@ RDDI_FUNC int CMSIS_DAP_Commands(const RDDIHandle handle, int num,
                                    unsigned char **request, int *req_len,
                                    unsigned char **response, int *resp_len)
 {
+    LOG_DEBUG("CMSIS_DAP_Commands: enter, handle=%d, num=%d", handle, num);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1564,6 +1844,7 @@ RDDI_FUNC int CMSIS_DAP_Commands(const RDDIHandle handle, int num,
 RDDI_FUNC int CMSIS_DAP_SWJ_Sequence(const RDDIHandle handle, int num,
                                        unsigned char *request)
 {
+    LOG_DEBUG("CMSIS_DAP_SWJ_Sequence: enter, handle=%d, num=%d", handle, num);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1576,6 +1857,8 @@ RDDI_FUNC int CMSIS_DAP_SWJ_Sequence(const RDDIHandle handle, int num,
 RDDI_FUNC int CMSIS_DAP_SWJ_Pins(const RDDIHandle handle, unsigned char pinselect,
                                    unsigned char pinout, int *res, int wait)
 {
+    LOG_DEBUG("CMSIS_DAP_SWJ_Pins: enter, handle=%d, sel=0x%02X, out=0x%02X, wait=%d",
+              handle, pinselect, pinout, wait);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1591,6 +1874,7 @@ RDDI_FUNC int CMSIS_DAP_SWJ_Pins(const RDDIHandle handle, unsigned char pinselec
 
 RDDI_FUNC int CMSIS_DAP_Delay(const RDDIHandle handle, int delay_us)
 {
+    LOG_DEBUG("CMSIS_DAP_Delay: enter, handle=%d, delay_us=%d", handle, delay_us);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1606,6 +1890,7 @@ RDDI_FUNC int CMSIS_DAP_Delay(const RDDIHandle handle, int delay_us)
 
 RDDI_FUNC int CMSIS_DAP_ResetTarget(const RDDIHandle handle)
 {
+    LOG_DEBUG("CMSIS_DAP_ResetTarget: enter, handle=%d", handle);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1613,6 +1898,35 @@ RDDI_FUNC int CMSIS_DAP_ResetTarget(const RDDIHandle handle)
 
     int status = ORBMDK::DAP_ResetTarget();
     return status == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+}
+
+/**
+ * @brief 判断指针是否指向**可写**内存
+ *
+ * 用于挡住宿主（AGDI）传进来的非法"出参"指针。
+ *
+ * 背景（详见 COMPAT_ANALYSIS §15）：AGDI 给 `CMSIS_DAP_Connect` 的第 2 个实参
+ * 并不是 `int*`，而是它在适配器对话框里保存的**选中项索引**：
+ *     ifNo = 0 -> 实参是 NULL，被判空跳过 -> 一直相安无事
+ *     ifNo = 1 -> 实参是 (int*)1 -> 向地址 1 写入 -> 0xc0000005，UV4 直接消失
+ * 以前只有一个接口、索引恒为 0，所以这个坑几十年都没暴露；一旦把
+ * V1/V2 两个接口都暴露出来，用户选了第二项就必然踩中。
+ */
+static bool IsWritablePointer(const void* p)
+{
+    if (!p) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+        return false;
+    }
+    const DWORD kWrite = PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (mbi.Protect & kWrite) != 0 && mbi.RegionSize >= sizeof(int);
 }
 
 RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface)
@@ -1623,6 +1937,11 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
         return RDDI_INVHANDLE;
     }
 
+    // 第 2 个实参必须原样记录：AGDI 在"多接口"路径里传的不是 int*，而是它保存的
+    // **选中项索引**（ifNo=0 -> NULL，ifNo=1 -> (int*)1）。这是判断"该值到底是
+    // 出参指针还是接口序号"的唯一现场依据（见 COMPAT_ANALYSIS §15）。
+    LOG_DEBUG("CMSIS_DAP_Connect: handle=%d, arg2=%p (as index/ptr int=%d)",
+              handle, (void *)connectedInterface, (int)(intptr_t)connectedInterface);
     LOG_DEBUG("CMSIS_DAP_Connect: starting SWD connection sequence");
 
     // 连接目标并获取模式 (0=默认/自动, 1=SWD, 2=JTAG)
@@ -1665,9 +1984,62 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
     ORBMDK::DAP_ConfigureTransfer(0, kDefaultWaitRetry, kDefaultMatchRetry);
     LOG_DEBUG("CMSIS_DAP_Connect: configured transfer (wait=%d, match=%d)", kDefaultWaitRetry, kDefaultMatchRetry);
 
+    // ------------------------------------------------------------------
+    // SWD 建链收尾：必须做一次 **DPIDR 读**（本函数此前缺这一步）
+    //
+    // ADIv5 的 SWD 建链序列是：
+    //     line reset → JTAG-to-SWD(0xE79E) → line reset → **读 DPIDR**
+    // OpenOCD 的 `swd_connect` 最后一步也正是这次读。只做前四步时，DP 会停在
+    // "刚切换完"的状态：后续**读**还能成功，而**写**会被目标拒绝
+    // （Transfer Response = 0x07 / ACK=7=NO_ACK）。
+    //
+    // 实测（orbtrace + STM32F1，V1(HID) 与 V2(Bulk) 同一现象）：
+    //   * 我们的最小宿主（test/orbprobe.cpp）在 Connect 之后立刻读 DPIDR
+    //     → 稳定拿到 0x2BA01477；
+    //   * Keil 的 AGDI 在 Connect 之后**第一条**访问是
+    //     DAP_WriteReg(DP SELECT = 0xF0)（扫 ROM 表用）→ 直接 NO_ACK，
+    //     再清 sticky、重试仍失败 → 报 "RDDI-DAP Error"。
+    // 即：链路收尾是驱动（本层）的责任，不能等宿主去补一次读。
+    // ------------------------------------------------------------------
+    if (mode == 1) {
+        uint32_t idcode = 0;
+        int st = ORBMDK::DAP_Transfer(0, 0x02, &idcode);   // 0x02 = 读 DP 0x0 (DPIDR)
+
+        if (st != ORBMDK::DAP_RES_OK || idcode == 0 || idcode == 0xFFFFFFFFu) {
+            // 还没起来：补一次完整线复位 + 切换，再读一次
+            LOG_WARN("CMSIS_DAP_Connect: DPIDR read failed (status=%d, idcode=0x%08X), "
+                     "re-running the SWD switch sequence", st, idcode);
+            uint8_t lineReset[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+            uint8_t jtagToSwd[] = { 0x9E, 0xE7 };
+            uint8_t idle[] = { 0x00 };
+            ORBMDK::DAP_SWJ_Sequence(56, lineReset);
+            ORBMDK::DAP_SWJ_Sequence(16, jtagToSwd);
+            ORBMDK::DAP_SWJ_Sequence(56, lineReset);
+            ORBMDK::DAP_SWJ_Sequence(8, idle);
+            st = ORBMDK::DAP_Transfer(0, 0x02, &idcode);
+        }
+        LOG_DEBUG("CMSIS_DAP_Connect: DPIDR read -> status=%d, idcode=0x%08X", st, idcode);
+
+        // 清一次 DP 的 sticky/待处理错误：上一轮会话（或刚才那次失败）留下的
+        // 错误位会让宿主的第一条**写**直接吃 FAULT；而 FAULT 之后的写会让固件
+        // 提前结束数据相位，目标随即进入"协议错误/静默"，表现为后续全 NO_ACK。
+        // 用专用 ABORT 命令(0x08)下发，它在 NO_ACK 状态下通常也能过。
+        if (ORBMDK::DAP_WriteAbort(0, 0x1E) == 0) {
+            LOG_DEBUG("CMSIS_DAP_Connect: DP ABORT written (0x1E, cleared sticky)");
+        }
+    }
+
     // 返回连接的接口类型
-    if (connectedInterface) {
+    //
+    // ⚠️ 必须先校验指针再写：AGDI 传进来的不是 int*，而是"选中项索引"
+    //    （ifNo=1 时就是 (int*)1）。不校验就会向地址 1 写入 → AV。
+    //    见 IsWritablePointer 与 COMPAT_ANALYSIS §15。
+    if (IsWritablePointer(connectedInterface)) {
         *connectedInterface = mode;  // 1=SWD, 2=JTAG
+    } else if (connectedInterface) {
+        LOG_WARN("CMSIS_DAP_Connect: out-pointer %p is not writable "
+                 "(AGDI passes the selected interface index here) -> write skipped",
+                 (void *)connectedInterface);
     }
 
     // 设置连接状态
@@ -1677,8 +2049,42 @@ RDDI_FUNC int CMSIS_DAP_Connect(const RDDIHandle handle, int *connectedInterface
     return RDDI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// CMSIS_DAP_Disconnect —— AGDI 的 RDDI 绑定表里**唯一**此前没实现的那个
+//
+// 反汇编 CMSIS_AGDI.dll 的"绑定 RDDI 函数表"例程（0x1002C1B0）可知：它在最外层
+// 流程（0x1002244C）先 LoadLibrary("<AGDI目录>\CMSIS_DAP.dll")，然后按固定顺序
+// GetProcAddress 共 54 个导出名，逐个存进 0x10362F08 起的函数指针槽
+// （索引 i -> 0x10362F08 + i*4）。其中 54 个名字里本层只缺这一个。
+//
+// 缺了不会让绑定例程本身失败（它对槽位不做 NULL 校验），但该槽恒为 NULL：
+// AGDI 一旦在"断开/收尾"路径上调用它就是踩空指针。补上即可。
+// ---------------------------------------------------------------------------
+RDDI_FUNC int CMSIS_DAP_Disconnect(const RDDIHandle handle)
+{
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        LOG_ERROR("CMSIS_DAP_Disconnect: invalid handle");
+        return RDDI_INVHANDLE;
+    }
+
+    // 幂等：AGDI 可能在错误收尾路径上重复调用，未连接时不应再发断开指令
+    if (ctx->isConnected) {
+        ORBMDK::DAP_DisconnectTarget();
+        ctx->isConnected = false;
+    }
+
+    // 状态 LED 熄灭（与 RDDI_Close 一致：官方 AGDI 不驱动 DAP_HostStatus）
+    SetHostLed(ctx, kHostLedConnect, false);
+    SetHostLed(ctx, kHostLedRunning, false);
+
+    LOG_DEBUG("CMSIS_DAP_Disconnect: target released");
+    return RDDI_SUCCESS;
+}
+
 RDDI_FUNC int CMSIS_DAP_SWJ_Clock(const RDDIHandle handle, unsigned int clock)
 {
+    LOG_DEBUG("CMSIS_DAP_SWJ_Clock: enter, handle=%d, clock=%u", handle, clock);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1691,6 +2097,7 @@ RDDI_FUNC int CMSIS_DAP_SWJ_Clock(const RDDIHandle handle, unsigned int clock)
 
 RDDI_FUNC int CMSIS_DAP_WriteABORT(const RDDIHandle handle, int dap_id, unsigned int abort)
 {
+    LOG_DEBUG("CMSIS_DAP_WriteABORT: enter, handle=%d, dap_id=%d, abort=0x%08X", handle, dap_id, abort);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1702,6 +2109,7 @@ RDDI_FUNC int CMSIS_DAP_WriteABORT(const RDDIHandle handle, int dap_id, unsigned
 
 RDDI_FUNC int CMSIS_DAP_SWD_Configure(const RDDIHandle handle, uint8_t cfg)
 {
+    LOG_DEBUG("CMSIS_DAP_SWD_Configure: enter, handle=%d, cfg=0x%02X", handle, cfg);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1713,6 +2121,7 @@ RDDI_FUNC int CMSIS_DAP_SWD_Configure(const RDDIHandle handle, uint8_t cfg)
 
 RDDI_FUNC int CMSIS_DAP_SWD_Sequence(const RDDIHandle handle, int num, unsigned char *request)
 {
+    LOG_DEBUG("CMSIS_DAP_SWD_Sequence: enter, handle=%d, num=%d", handle, num);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1740,6 +2149,7 @@ RDDI_FUNC int CMSIS_DAP_SWD_Sequence(const RDDIHandle handle, int num, unsigned 
 
 RDDI_FUNC int CMSIS_DAP_JTAG_Configure(const RDDIHandle handle, int count, uint8_t *ir_len)
 {
+    LOG_DEBUG("CMSIS_DAP_JTAG_Configure: enter, handle=%d, count=%d", handle, count);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -1763,6 +2173,10 @@ RDDI_FUNC int CMSIS_DAP_JTAG_Sequence(const RDDIHandle handle, int num, uint8_t 
 
 RDDI_FUNC int CMSIS_DAP_JTAG_GetIDCODEs(const RDDIHandle handle, int *count, uint32_t *idcodes)
 {
+    LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: enter, handle=%d, count=%p, idcodes=%p",
+             handle, (void *)count, (void *)idcodes);
+    LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: enter, handle=%d, count=%p, idcodes=%p",
+             handle, (void *)count, (void *)idcodes);
     // 输出参数必须先写入 —— 这里尤其关键：
     // AGDI 把 *count 当作"**设备数量**"使用（反汇编 0x1002C918 → 0x1002C91F，
     // 位于设备探测例程 0x1002c890，其出参直接决定 Debug Settings 里
@@ -1784,6 +2198,41 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIDCODEs(const RDDIHandle handle, int *count, uin
         return RDDI_BADARG;
     }
 
+    // ---------------------------------------------------------------------
+    // 先按"协议无关的 DAP 扫描"回答：用与 CMSIS_DAP_GetDeviceIDList /
+    // DetectDAPIDList / DetectNumberOfDAPs **同一张表**（ctx->dapIdList）。
+    //
+    // 关键认知（COMPAT_ANALYSIS §4.14）：AGDI 在 **SWD 模式**下同样会调用这个
+    // 名字带 JTAG_ 的函数 —— 它是协议无关的"扫描 DAP / 取 IDCODE"探测器。
+    // 旧实现只认固件的 ID_DAP_JTAG_IDCODE 命令：SWD 目标上那条命令必然失败，
+    // 于是即使目标就在那儿、IDCODE 也能读出来，这里仍然一个 IDCODE 都给不出。
+    // 单设备路径下 AGDI 只取 *count（还能容忍 0），但在它的"多 DAP"分支里
+    // 是要拿 idcodes 列表的 —— 列表空 = 失败。
+    //
+    // 注：官方按 4 参调用（handle, count, idcodes, sizeOfArray）。本函数仍按
+    // 3 参实现：x86 __cdecl 由调用方清栈，多传的实参不会破坏调用，也不会被
+    // 本函数读取（因此不能拿它当容量上限用）。表里至多 kSingleDapCount(1) 项。
+    // ---------------------------------------------------------------------
+    if (ctx->dapIdList.empty()) {
+        DetectTargetDapIdList(ctx, nullptr, nullptr);
+    }
+
+    if (!ctx->dapIdList.empty()) {
+        int n = 0;
+        for (size_t i = 0; i < ctx->dapIdList.size() && i < 4; ++i) {
+            if (idcodes) {
+                idcodes[i] = ctx->dapIdList[i];
+            }
+            ++n;
+        }
+        *count = n;
+        LOG_INFO("CMSIS_DAP_JTAG_GetIDCODEs: %d IDCODE(s) from target scan, id[0]=0x%08X "
+                 "(idcodes=%s)", n, (unsigned)ctx->dapIdList[0],
+                 idcodes ? "provided" : "NULL");
+        return RDDI_SUCCESS;
+    }
+
+    // 目标未探测到时，仍试一次固件的 JTAG 扫描（JTAG 链路下才有效）
     int idcodeCount = 0;
     int status = ORBMDK::DAP_JTAG_IDCODE(&idcodeCount, idcodes);
     if (status == 0) {
@@ -1803,6 +2252,7 @@ RDDI_FUNC int CMSIS_DAP_JTAG_GetIDCODEs(const RDDIHandle handle, int *count, uin
 
 RDDI_FUNC int CMSIS_DAP_JTAG_GetIRLengths(const RDDIHandle handle, int *count, uint8_t *lengths)
 {
+    LOG_DEBUG("CMSIS_DAP_JTAG_GetIRLengths: enter, handle=%d", handle);
     // 同 GetIDCODEs：先无条件写输出参数，避免调用方读到栈残留。
     if (count) {
         *count = 0;
@@ -1921,6 +2371,7 @@ RDDI_FUNC int CMSIS_DAP_SWO_Data(const RDDIHandle handle, int *num_written,
 //           guid 实际收到的是 ifNo（0/1），导致向非法地址写入。
 RDDI_FUNC int CMSIS_DAP_GetGUID(const RDDIHandle handle, int ifNo, char *guid, int len)
 {
+    LOG_DEBUG("CMSIS_DAP_GetGUID: enter, handle=%d, ifNo=%d, len=%d", handle, ifNo, len);
     if (guid && len > 0) {
         guid[0] = '\0';  // 失败时也要写输出参数
     }
@@ -1955,6 +2406,7 @@ RDDI_FUNC int CMSIS_DAP_GetGUID(const RDDIHandle handle, int ifNo, char *guid, i
 // ---------------------------------------------------------------------------
 RDDI_FUNC int CMSIS_DAP_GetInterfaceVersion(const RDDIHandle handle, int *version)
 {
+    LOG_DEBUG("CMSIS_DAP_GetInterfaceVersion: enter, handle=%d", handle);
     if (version) {
         *version = 0;  // 失败时也要写输出参数
     }
@@ -2116,6 +2568,9 @@ RDDI_FUNC int CMSIS_DAP_DetectNumberOfDevices(const RDDIHandle handle, int *coun
 // ---------------------------------------------------------------------------
 RDDI_FUNC int CMSIS_DAP_GetDeviceIDList(const RDDIHandle handle, int *idArray, size_t sizeOfArray)
 {
+    LOG_INFO("CMSIS_DAP_GetDeviceIDList: enter, handle=%d, array=%p, sizeOfArray=%llu",
+             handle, (void *)idArray, (unsigned long long)sizeOfArray);
+
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         LOG_ERROR("CMSIS_DAP_GetDeviceIDList: invalid handle");
@@ -2123,14 +2578,24 @@ RDDI_FUNC int CMSIS_DAP_GetDeviceIDList(const RDDIHandle handle, int *idArray, s
     }
 
     if (!idArray) {
+        // 静默返回 RDDI_BADARG 会让现场完全看不见这次调用 —— 加日志。
+        // （官方实现在 idArray == NULL 时也返回 0x0D，见 COMPAT_ANALYSIS §10.7）
+        LOG_WARN("CMSIS_DAP_GetDeviceIDList: idArray == NULL -> RDDI_BADARG "
+                 "(sizeOfArray=%llu)", (unsigned long long)sizeOfArray);
         return RDDI_BADARG;
     }
 
     // sizeOfArray 是字节数，可容纳的元素个数按 sizeof(int) 折算
     const int maxEntries = static_cast<int>(sizeOfArray / sizeof(int));
     if (maxEntries <= 0) {
+        LOG_WARN("CMSIS_DAP_GetDeviceIDList: sizeOfArray=%llu -> nothing fits, "
+                 "returning SUCCESS without writing", (unsigned long long)sizeOfArray);
         return RDDI_SUCCESS;
     }
+
+    LOG_INFO("CMSIS_DAP_GetDeviceIDList: enter, handle=%d, array=%p, sizeOfArray=%llu, "
+             "maxEntries=%d", handle, (void *)idArray,
+             (unsigned long long)sizeOfArray, maxEntries);
 
     // 输出数组里必须是 **IDCODE**，不是 DAP 索引（见 DetectTargetDapIdList 的说明）。
     // 目标尚未探测过时主动探测一次。
@@ -2194,6 +2659,7 @@ RDDI_FUNC int DAP_GetSupportedHostStatusIDs(const RDDIHandle handle, int *count,
 
 RDDI_FUNC int CMSIS_DAP_ConfigureDebugger(const RDDIHandle handle, const char *config)
 {
+    LOG_DEBUG("CMSIS_DAP_ConfigureDebugger: enter, handle=%d, config=%p", handle, (const void *)config);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2221,6 +2687,7 @@ RDDI_FUNC int CMSIS_DAP_ConfigureDebugger(const RDDIHandle handle, const char *c
 // ---------------------------------------------------------------------------
 RDDI_FUNC int CMSIS_DAP_Atomic_Control(const RDDIHandle handle, const int reserved)
 {
+    LOG_DEBUG("CMSIS_DAP_Atomic_Control: enter, handle=%d, reserved=%d", handle, reserved);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2233,6 +2700,7 @@ RDDI_FUNC int CMSIS_DAP_Atomic_Control(const RDDIHandle handle, const int reserv
 RDDI_FUNC int CMSIS_DAP_Atomic_Result(const RDDIHandle handle, const int a2, const int a3,
                                       const int a4, const int a5, const int a6)
 {
+    LOG_DEBUG("CMSIS_DAP_Atomic_Result: enter, handle=%d, a2=%d, a3=%d", handle, a2, a3);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2252,6 +2720,7 @@ RDDI_FUNC int CMSIS_DAP_Atomic_Result(const RDDIHandle handle, const int a2, con
 RDDI_FUNC int DAP_RegReadBlock(const RDDIHandle handle, const int DAP_ID, const int numRegs,
                                const int *regIDArray, int *dataArray)
 {
+    LOG_DEBUG("DAP_RegReadBlock: enter, handle=%d, numRegs=%d", handle, numRegs);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2277,6 +2746,7 @@ RDDI_FUNC int DAP_RegReadBlock(const RDDIHandle handle, const int DAP_ID, const 
 RDDI_FUNC int DAP_RegWriteBlock(const RDDIHandle handle, const int DAP_ID, const int numRegs,
                                 const int *regIDArray, const int *dataArray)
 {
+    LOG_DEBUG("DAP_RegWriteBlock: enter, handle=%d, numRegs=%d", handle, numRegs);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2334,6 +2804,7 @@ RDDI_FUNC int DAP_RegReadWaitForValue(const RDDIHandle handle, const int DAP_ID,
 // Level 1 可选功能，本实现未定义任何自定义序列。
 RDDI_FUNC int DAP_DefineSequence(const RDDIHandle handle, const int seqID, void *seqDef)
 {
+    LOG_DEBUG("DAP_DefineSequence: enter, handle=%d, seqID=%d", handle, seqID);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2349,6 +2820,7 @@ RDDI_FUNC int DAP_DefineSequence(const RDDIHandle handle, const int seqID, void 
 RDDI_FUNC int DAP_RunSequence(const RDDIHandle handle, const int seqID,
                               void *seqInData, void *seqOutData)
 {
+    LOG_DEBUG("DAP_RunSequence: enter, handle=%d, seqID=%d", handle, seqID);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2363,6 +2835,7 @@ RDDI_FUNC int DAP_RunSequence(const RDDIHandle handle, const int seqID,
 
 RDDI_FUNC int DAP_HostStatus(const RDDIHandle handle, int hostStatus, int state)
 {
+    LOG_DEBUG("DAP_HostStatus: enter, handle=%d, hostStatus=%d, state=%d", handle, hostStatus, state);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2376,6 +2849,7 @@ RDDI_FUNC int DAP_HostStatus(const RDDIHandle handle, int hostStatus, int state)
 
 RDDI_FUNC int DAP_GetSupportedOptimisationLevel(const RDDIHandle handle, int *level)
 {
+    LOG_DEBUG("DAP_GetSupportedOptimisationLevel: enter, handle=%d", handle);
     if (level) {
         *level = 0;  // 失败时也要写输出参数
     }
@@ -2395,6 +2869,7 @@ RDDI_FUNC int DAP_GetSupportedOptimisationLevel(const RDDIHandle handle, int *le
 
 RDDI_FUNC int DAP_SetCommTimeout(const RDDIHandle handle, int timeoutMs)
 {
+    LOG_DEBUG("DAP_SetCommTimeout: enter, handle=%d, timeoutMs=%d", handle, timeoutMs);
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;
@@ -2472,6 +2947,7 @@ static std::string TargetCommand(const std::string &item)
 RDDI_FUNC int DAP_Target(const RDDIHandle handle, const char *request_str,
                          char *resp_str, const int resp_len)
 {
+    LOG_DEBUG("DAP_Target: enter, handle=%d, req='%s'", handle, request_str ? request_str : "(null)");
     RDDIContext* ctx = GetContext(handle);
     if (!ctx) {
         return RDDI_INVHANDLE;

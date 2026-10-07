@@ -1,13 +1,49 @@
-# ORBMDK Deploy Script
+﻿# ORBMDK Deploy Script
 # Copy bin\ORBMDK_RDDI.dll over Keil MDK's CMSIS_DAP.dll
 # Usage: run in PowerShell:  .\deploy.ps1
+#        .\deploy.ps1 -KeilArmBin "D:\Keil_v5\ARM\BIN"    # 手动指定 Keil ARM\BIN
 #        (run as Administrator if the copy is denied)
+
+param(
+    [string]$KeilArmBin = ""
+)
 
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $SourceDll = Join-Path $ScriptDir "bin\ORBMDK_RDDI.dll"
-$TargetDll = "D:\MDK5\ARM\BIN\CMSIS_DAP.dll"
+
+# 定位 Keil 的 ARM\BIN：显式参数 > 常见安装目录
+function Find-KeilArmBin {
+    param([string]$Override)
+    if ($Override) {
+        if (Test-Path -LiteralPath $Override) { return $Override }
+        return $null
+    }
+    $candidates = @(
+        "D:\Keil_v5\ARM\BIN",
+        "C:\Keil_v5\ARM\BIN",
+        "D:\MDK5\ARM\BIN",
+        "C:\Program Files\Keil_v5\ARM\BIN",
+        "C:\Program Files (x86)\Keil_v5\ARM\BIN"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath (Join-Path $c "CMSIS_AGDI.dll")) { return $c }
+    }
+    foreach ($c in $candidates) {
+        if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return $null
+}
+
+$KeilArmBin = Find-KeilArmBin -Override $KeilArmBin
+if (-not $KeilArmBin) {
+    Write-Host "[ERROR] Keil ARM\BIN not found." -ForegroundColor Red
+    Write-Host "        Pass it explicitly:  .\deploy.ps1 -KeilArmBin 'D:\Keil_v5\ARM\BIN'" -ForegroundColor Red
+    exit 1
+}
+
+$TargetDll = Join-Path $KeilArmBin "CMSIS_DAP.dll"
 $BackupDll = "$TargetDll.bak"
 
 Write-Host "========================================"

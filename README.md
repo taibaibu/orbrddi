@@ -84,16 +84,51 @@ ORBMDK/
 .\build.ps1
 ```
 
-输出文件：`bin\ORBMDK_RDDI.dll`（MSVC 2017 x64，无 error / 无 warning）
+输出文件：`bin\ORBMDK_RDDI.dll`（MSVC **x86**，无 error / 无 warning）
+
+构建脚本会自动探测工具链，无需手改路径：
+
+| 项 | 探测方式 |
+|----|----------|
+| Visual Studio | `vswhere.exe` → 回退常见安装目录（VS 2022 / 2019 / 2017） |
+| VC 工具集 | `VC\Tools\MSVC` 下版本号最大者 |
+| Windows SDK | 注册表 `KitsRoot10` → 回退 `D:\Windows Kits\10` / `C:\Program Files (x86)\Windows Kits\10`，取同时具备 `Include\<ver>` 与 `Lib\<ver>\ucrt\x86` 的最高版本 |
+
+> 当前环境实测：VS2022 Community（MSVC `14.44.35207`）+ Windows SDK `10.0.26100.0`。
+
+### ⚠️ 必须用 `/MT`（静态链接 CRT），不要改回 `/MD`
+
+Keil 的 `ARM\ARMCLANG\bin\` 下自带一个**旧的** `MSVCP140.dll`（14.29），而 UV4 加载的是它。
+MSVC 运行时**只保证向前兼容**：用 VS2022(14.4x) 编译的模块跑在 14.29 上是不受支持的组合，
+会直接崩在 `MSVCP140.dll`（`0xc0000005`）。
+
+`/MT` 让本 DLL 不再依赖 `MSVCP140` / `VCRUNTIME140` / UCRT：
+
+```
+Dependents: KERNEL32 / SETUPAPI / WINUSB / HID / SHLWAPI
+```
+
+RDDI 是纯 C ABI（缓冲区均由调用方提供，不跨模块传 STL/堆指针），静态 CRT 是安全的。
+详细分析见 [COMPAT_ANALYSIS.md 第十二节](COMPAT_ANALYSIS.md)。
 
 ## 安装
+
+```powershell
+.\deploy.ps1                                  # 自动定位 Keil 的 ARM\BIN
+.\deploy.ps1 -KeilArmBin "D:\Keil_v5\ARM\BIN" # 或显式指定
+```
+
+脚本会把 `bin\ORBMDK_RDDI.dll` 复制为 Keil 的 `CMSIS_DAP.dll`，并在首次覆盖前把官方原件备份为 `CMSIS_DAP.dll.bak`。
+
+手动方式：
 
 1. 编译得到 `bin\ORBMDK_RDDI.dll`
 
 2. 配合 elaphureLinkAGDI（Keil 的 "CMSIS-DAP Debugger"）使用：
    - 安装 [elaphureLinkAGDI](https://github.com/fly2046/elaphureLinkAGDI)
-   - **将 `ORBMDK_RDDI.dll` 重命名为 `CMSIS_DAP.dll`**，放到 Keil 的 `ARM\BIN\` 目录
+   - **将 `ORBMDK_RDDI.dll` 重命名为 `CMSIS_DAP.dll`**，放到 Keil 的 `ARM\BIN\` 目录（如 `D:\Keil_v5\ARM\BIN\`）
    - 必须是 **32 位 (x86)** 构建（`build.ps1` 已默认 x86）；Keil µVision 是 32 位进程，无法加载 64 位 DLL
+   - **覆盖前先结束整个 `UV4.exe` 进程**：µVision 会把 DLL 常驻内存，只关调试会话无效
 
 3. 在 Keil 项目中配置调试器：
    - 打开 "Project" → "Options for Target" → "Debug"
@@ -106,6 +141,9 @@ ORBMDK/
 .\test\build_test.ps1 -Source ORBMDK_RDDI_FullTest.cpp
 .\bin\ORBMDK_RDDI_FullTest.exe
 ```
+
+测试程序默认从**自身所在目录**加载 `ORBMDK_RDDI.dll`（`build_test.ps1` 把 exe 与 DLL 都输出到 `bin\`），
+也可用参数显式指定：`.\bin\ORBMDK_RDDI_FullTest.exe <dll路径>`。
 
 在 ORBTrace + STM32F1 目标上实测 **40/40 全部通过**：
 
@@ -383,6 +421,27 @@ set ORBMDK_LOG_LEVEL=0
 - 通用兼容模式（ORBTrace 固件仅支持 V1）
 
 ### WinUSB Bulk 模式 (V2)
+
+**传输模式由对话框里的接口选择决定**（没有任何配置开关）：
+
+| 适配器条目（Keil 下拉框里显示的名字） | 传输层 |
+|-------------------------------------|--------|
+| `CMSIS-DAP v2`（`ifNo=0`） | USB Bulk (WinUSB)，**只用 V2** |
+| `CMSIS-DAP v1`（`ifNo=1`） | HID，**只用 V1** |
+
+- 选谁就必须是谁：选中的通道打不开时**直接报错**，绝不静默换到另一条
+  （静默降级会把"V2 坏了"伪装成"能用"，详见 `COMPAT_ANALYSIS.md` §17.4）。
+- `RDDI_Open` 阶段（用户尚未选定接口）按"V2 优先、不可用才 V1"先打开一条。
+- `Firmware Version` 一栏固定上报驱动自持的 `1.0.0`（**不是**设备自报值）：设备自报的
+  `2.1.0`（主版本 2）会让 Keil/AGDI 切到一条走不通的"多 DAP 设备"分支，表现为
+  `RDDI-DAP Error`（单变量对照实验见 §17.5）。设备真实版本仍会写进日志。
+
+> V2 的 DAP 命令包按**端点 wMaxPacketSize** 发送（orbtrace 实测 = 64 字节）。
+> 出包长度由驱动**自动标定**：先用短包(64)向设备问 `DAP_Info(0xFF)` 拿它自报的
+> `packet size`（orbtrace = 508），再用可校验的只读命令验证；不合法就换候选。
+> **绝不发长度为端点 `wMaxPacketSize` 的整包** —— 那在 USB 上不是短包，固件会等下一包，
+> 命令永远不被派发（实测 512 时"第一条能答、之后永久死"）。详见 `COMPAT_ANALYSIS.md` §17.2。
+
 - 使用 SetupAPI 枚举设备
 - WinUSB API 实现高速传输
 - 支持端点：
@@ -421,8 +480,8 @@ ORBMDK 专注于底层通信和协议实现，与 AGDI 层解耦。
 ## 开发
 
 ### 依赖
-- Windows SDK (10.0.17763.0+)
-- Visual Studio 2017+ 或 MSVC 工具链
+- Windows SDK 10.x（路径自动探测，见"构建"）
+- Visual Studio 2017+（含 C++ 桌面开发工作负载）
 - Windows HID API
 - WinUSB (USB Bulk V2 传输)
 - SetupAPI

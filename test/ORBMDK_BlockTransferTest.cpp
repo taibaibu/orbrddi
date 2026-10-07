@@ -99,8 +99,11 @@ typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
 static int g_Passed = 0;
 static int g_Failed = 0;
 
-static const char* g_DllPath =
-    "c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll";
+/* Path relative to the test exe -- build_test.ps1 puts both the exe and the
+ * DLL in bin\. LoadLibraryA searches the exe's own directory first, so no
+ * machine-specific absolute path is needed here. argv[1] is the RAM address
+ * for this test, hence no argv override. */
+static const char* g_DllPath = "ORBMDK_RDDI.dll";
 
 /* ==========================================================================
  * API table
@@ -332,6 +335,8 @@ int main(int argc, char* argv[])
     printf("================================================================\n");
     printf("  ORBMDK Block Transfer Test  (DAP_RegWriteRepeat/ReadRepeat)\n");
     printf("================================================================\n");
+
+    printf("DLL: %s\n", g_DllPath);
 
     uint32_t addr = 0x20000000u;
     if (argc > 1 && argv[1] && argv[1][0]) {

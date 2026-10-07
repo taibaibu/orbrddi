@@ -22,7 +22,13 @@ typedef int(*PFN_RDDI_SetLogCallback)(RDDIHandle, void(*)(int, const char*));
 typedef int(*PFN_CMSIS_DAP_Connect)(RDDIHandle, int*);
 typedef int(*PFN_CMSIS_DAP_ResetDAP)(RDDIHandle);
 typedef int(*PFN_CMSIS_DAP_DetectNumberOfDevices)(RDDIHandle, int*);
-typedef int(*PFN_CMSIS_DAP_GetDeviceIDList)(RDDIHandle, int*, char*, int);
+// 注意：ARM/Keil 的实际签名是 3 参 —— (handle, int *idArray, size_t sizeInBytes)，
+// 且写入数组的是 **IDCODE**（不是 DAP 索引），sizeInBytes 是**字节数**。
+// 旧测试误用 4 参原型 (handle, int *count, char *deviceIDs, int len)，实参整体错位：
+// idArray 收到 &count（单个 int 的地址），sizeOfArray 收到 deviceID 指针值（天文数字）
+// → 向 &count 后面狂写 IDCODE → 栈被踩坏 → 之后在无关位置崩溃（0xc0000005）。
+// 这正是历史上 UV4.exe 崩溃的同一个坑，见 ORBMDK_RDDI.cpp 的说明。
+typedef int(*PFN_CMSIS_DAP_GetDeviceIDList)(RDDIHandle, int*, size_t);
 typedef int(*PFN_CMSIS_DAP_ConfigureDebugger)(RDDIHandle, const char*);
 typedef int(*PFN_CMSIS_DAP_SWJ_Sequence)(RDDIHandle, int, unsigned char*);
 typedef int(*PFN_CMSIS_DAP_SWJ_Pins)(RDDIHandle, unsigned char, unsigned char, int*, int);
@@ -41,21 +47,27 @@ typedef int(*PFN_DAP_Connect)(RDDIHandle, RDDI_DAP_CONN_DETAILS*);
 typedef int(*PFN_DAP_Disconnect)(RDDIHandle);
 typedef int(*PFN_DAP_GetInterfaceVersion)(RDDIHandle, int*);
 typedef int(*PFN_DAP_Configure)(RDDIHandle, const char*);
-typedef int(*PFN_DAP_RegReadBlock)(RDDIHandle, int, int, int*, int);
-typedef int(*PFN_DAP_RegWriteBlock)(RDDIHandle, int, int, const int*, int);
+// 真实签名：一次传**多个寄存器号**（handle, DAP_ID, numRegs, regIDArray, dataArray）
+typedef int(*PFN_DAP_RegReadBlock)(RDDIHandle, int, int, const int*, int*);
+typedef int(*PFN_DAP_RegWriteBlock)(RDDIHandle, int, int, const int*, const int*);
 typedef int(*PFN_DAP_RegReadRepeat)(RDDIHandle, int, int, int, int*);
 typedef int(*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
 typedef int(*PFN_DAP_HostStatus)(RDDIHandle, int, int);
-typedef int(*PFN_DAP_Target)(RDDIHandle, int, int*);
+// 真实签名 4 参：DAP_Target(handle, const char *request_str, char *resp_str, int resp_len)
+typedef int(*PFN_DAP_Target)(RDDIHandle, const char*, char*, int);
 
 typedef int(*PFN_CMSIS_DAP_Capabilities)(RDDIHandle, int, int*);
-typedef int(*PFN_CMSIS_DAP_GetInterfaceVersion)(RDDIHandle, char*, int);
+// 版本号是 int（bits[31:24]=major,[23:16]=minor,[15:0]=build），不是字符串
+typedef int(*PFN_CMSIS_DAP_GetInterfaceVersion)(RDDIHandle, int*);
 typedef int(*PFN_CMSIS_DAP_GetNumberOfDevices)(RDDIHandle, int*);
 typedef int(*PFN_CMSIS_DAP_ResetTarget)(RDDIHandle);
-typedef int(*PFN_CMSIS_DAP_SWO_Control)(RDDIHandle, uint8_t);
-typedef int(*PFN_CMSIS_DAP_SWO_Status)(RDDIHandle, uint8_t*);
-typedef int(*PFN_CMSIS_DAP_SWO_Baudrate)(RDDIHandle, uint32_t);
-typedef int(*PFN_CMSIS_DAP_SWO_Data)(RDDIHandle, int*, uint8_t*);
+// SWO 签名严格对齐 ARM rddi_dap_swo.h（见 include/ORBMDK_RDDI.h）：
+//   旧测试用的是 (handle, uint8_t*)（2 参），而真实是 3 参 —— 实参错位后
+//   函数会把寄存器里的垃圾当成第 3 个指针参数并写入 → 0xc0000005。
+typedef int(*PFN_CMSIS_DAP_SWO_Control)(RDDIHandle, int);
+typedef int(*PFN_CMSIS_DAP_SWO_Status)(RDDIHandle, int*, int*);
+typedef int(*PFN_CMSIS_DAP_SWO_Baudrate)(RDDIHandle, int);
+typedef int(*PFN_CMSIS_DAP_SWO_Data)(RDDIHandle, int*, void*, int*);
 
 // ============================================================================
 // 全局变量
@@ -113,7 +125,9 @@ int main(int argc, char* argv[]) {
     printf("       ORBMDK_RDDI.dll Comprehensive Function Test\n");
     printf("================================================================\n\n");
 
-    const char* dllPath = "c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll";
+    // 待测 DLL：默认取"文件名"，LoadLibraryA 会先查 exe 所在目录
+    // （build_test.ps1 把 exe 与 dll 都输出到 bin\）；也可用 argv[1] 显式指定。
+    const char* dllPath = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "ORBMDK_RDDI.dll";
     printf("Loading: %s\n\n", dllPath);
 
     // 加载 DLL
@@ -250,11 +264,10 @@ int main(int argc, char* argv[]) {
     TEST("CMSIS_DAP_DetectNumberOfDevices", pfn_CMSIS_DAP_DetectNumberOfDevices(handle, &deviceCount));
     printf("    Device count: %d\n", deviceCount);
     
-    // Get device ID list
-    char deviceID[256] = {0};
-    int count = 256;
-    TEST("CMSIS_DAP_GetDeviceIDList", pfn_CMSIS_DAP_GetDeviceIDList(handle, &count, deviceID, sizeof(deviceID)));
-    printf("    Device ID: '%s'\n", deviceID);
+    // Get device ID list（3 参：数组 + 字节数；元素是 IDCODE）
+    int deviceIDs[64] = {0};
+    TEST("CMSIS_DAP_GetDeviceIDList", pfn_CMSIS_DAP_GetDeviceIDList(handle, deviceIDs, sizeof(deviceIDs)));
+    printf("    Device ID[0]: 0x%08X\n", deviceIDs[0]);
     
     // Get capabilities
     int caps = 0;
@@ -266,11 +279,12 @@ int main(int argc, char* argv[]) {
     printf("    - SWO UART: %s\n", (caps & 0x04) ? "YES" : "NO");
     printf("    - Atomic: %s\n", (caps & 0x10) ? "YES" : "NO");
     
-    // Get interface version
-    char version[64] = {0};
+    // Get interface version（2 参，版本号是 int 而不是字符串）
+    int ifVersion = 0;
     if (pfn_CMSIS_DAP_GetInterfaceVersion)
-        pfn_CMSIS_DAP_GetInterfaceVersion(handle, version, sizeof(version));
-    printf("    Interface Version: '%s'\n", version);
+        pfn_CMSIS_DAP_GetInterfaceVersion(handle, &ifVersion);
+    printf("    Interface Version: %d.%d.%d (0x%08X)\n",
+           (ifVersion >> 24) & 0xFF, (ifVersion >> 16) & 0xFF, ifVersion & 0xFFFF, ifVersion);
 
     // =========================================================================
     // Test 3: Host Status
@@ -279,10 +293,9 @@ int main(int argc, char* argv[]) {
     printf("Test 3: Host Status\n");
     printf("================================================================\n");
     
-    int statusCount = 0;
-    int statusIDs[16] = {0};
-    TEST("CMSIS_DAP_GetDeviceIDList(NULL buffer)", 
-         pfn_CMSIS_DAP_GetDeviceIDList(handle, &statusCount, NULL, 0));
+    // NULL 数组应被拒绝（RDDI_BADARG = 0x0D），不能返回 0
+    TEST("CMSIS_DAP_GetDeviceIDList(NULL buffer) rejected",
+         pfn_CMSIS_DAP_GetDeviceIDList(handle, NULL, 0) != 0);
     
     // =========================================================================
     // Test 4: SWD/SWJ Initialization (MUST be before register access!)
@@ -423,10 +436,12 @@ int main(int argc, char* argv[]) {
         TEST("CMSIS_DAP_SWO_Baudrate(115200)", pfn_CMSIS_DAP_SWO_Baudrate(handle, 115200));
     }
     
-    uint8_t swo_status = 0;
+    // 3 参：(handle, int *count, int *status)
+    int swo_count = 0;
+    int swo_status = 0;
     if (pfn_CMSIS_DAP_SWO_Status) {
-        TEST("CMSIS_DAP_SWO_Status", pfn_CMSIS_DAP_SWO_Status(handle, &swo_status));
-        printf("    SWO Status: 0x%02X\n", swo_status);
+        TEST("CMSIS_DAP_SWO_Status", pfn_CMSIS_DAP_SWO_Status(handle, &swo_count, &swo_status));
+        printf("    SWO Status: count=%d status=0x%02X\n", swo_count, swo_status);
     }
 
     // =========================================================================
@@ -475,9 +490,17 @@ int main(int argc, char* argv[]) {
                write_data[0], write_data[1], write_data[2], write_data[3]);
         printf("    >>> RegWriteBlock: DAP_ID=0, reg=0x%08X (AP_DRW), count=4\n",
                DAP_REG_AP_DRW);
-        
-        // 写入 AP_DRW (0x0D) - AP Bank 0
-        int writeResult9 = pfn_DAP_RegWriteBlock(handle, 0, DAP_REG_AP_DRW, write_data, 4);
+
+        // DAP_RegWriteBlock/ReadBlock 的真实签名是：
+        //     (handle, DAP_ID, numRegs, const int *regIDArray, int *dataArray)
+        // 即一次传**多个寄存器号**；"同一个寄存器重复 N 次"是 Reg*Repeat。
+        // 旧测试按 (handle, DAP_ID, regId, dataArray, count) 调用 —— 参数整体错位：
+        // dataArray 收到的是字面量 4 → 被当成指针解引用 → 0xc0000005。
+        int ap_reg_ids[4] = { DAP_REG_AP_DRW, DAP_REG_AP_DRW,
+                              DAP_REG_AP_DRW, DAP_REG_AP_DRW };
+
+        // 写入 AP_DRW - AP Bank 0
+        int writeResult9 = pfn_DAP_RegWriteBlock(handle, 0, 4, ap_reg_ids, write_data);
         printf("    <<< RegWriteBlock result: %d\n", writeResult9);
         if (writeResult9 == RDDI_SUCCESS) {
             printf("    PASS\n");
@@ -495,8 +518,8 @@ int main(int argc, char* argv[]) {
             pfn_DAP_WriteReg(handle, 0, DAP_REG_AP_TAR, 0x20000000);
         }
         
-        // 读取 AP_DRW (0x0C) - 读回 TAR 指向地址的数据
-        int readResult9 = pfn_DAP_RegReadBlock(handle, 0, DAP_REG_AP_DRW, read_data, 4);
+        // 读取 AP_DRW - 读回 TAR 指向地址的数据
+        int readResult9 = pfn_DAP_RegReadBlock(handle, 0, 4, ap_reg_ids, read_data);
         printf("    <<< RegReadBlock result: %d\n", readResult9);
         if (readResult9 == RDDI_SUCCESS) {
             printf("    PASS\n");

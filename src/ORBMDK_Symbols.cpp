@@ -927,6 +927,8 @@ bool ORBMDK_FindObjdumpPath(char* buffer, size_t bufferSize) {
     const char* mdkPaths[] = {
         "C:\\Program Files\\Keil_v5\\TOOLS.INI",
         "C:\\Program Files (x86)\\Keil_v5\\TOOLS.INI",
+        "D:\\Keil_v5\\TOOLS.INI",
+        "C:\\Keil_v5\\TOOLS.INI",
         "D:\\MDK5\\TOOLS.INI"
     };
     for (size_t i = 0; i < sizeof(mdkPaths) / sizeof(mdkPaths[0]); i++) {

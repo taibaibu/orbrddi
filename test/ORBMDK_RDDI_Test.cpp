@@ -48,7 +48,9 @@ int main(int argc, char* argv[]) {
     printf("ORBMDK_RDDI.dll Virtual Call Test\n");
     printf("========================================\n\n");
 
-    const char* dllPath = "c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll";
+    // 待测 DLL：默认取"文件名"，LoadLibraryA 会先查 exe 所在目录
+    // （build_test.ps1 把 exe 与 dll 都输出到 bin\）；也可用 argv[1] 显式指定。
+    const char* dllPath = (argc > 1 && argv[1] && argv[1][0]) ? argv[1] : "ORBMDK_RDDI.dll";
     printf("Loading: %s\n\n", dllPath);
 
     // 加载 DLL

@@ -1,4 +1,4 @@
-# ORBMDK RDDI Test Build Script
+﻿# ORBMDK RDDI Test Build Script
 # PowerShell version - 参考项目根目录 build.ps1 风格
 
 param(
@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Continue"
 
 Write-Host "========================================"
-Write-Host "ORBMDK RDDI Test Build (MSVC 2017 x86)"
+Write-Host "ORBMDK RDDI Test Build (MSVC x86)"
 Write-Host "========================================"
 Write-Host ""
 
@@ -19,18 +19,90 @@ Set-Location $ScriptDir
 $BinDir = Join-Path $ScriptDir "..\bin"
 if (-not (Test-Path $BinDir)) { New-Item -ItemType Directory -Path $BinDir | Out-Null }
 
-# MSVC 2017 Paths
-$MSVCDir = "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community"
-$VCTools = "$MSVCDir\VC\Tools\MSVC\14.16.27023"
+# ----------------------------------------------------------------------------
+# 工具链定位（x86）：vswhere -> 常见安装目录；VC 工具集 / Windows SDK 取最高版本
+# 与根目录 build.ps1 保持一致（本项目脚本按同构方式维护）
+# ----------------------------------------------------------------------------
+function Find-VSDir {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -LiteralPath $vswhere) {
+        $p = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null
+        if ($p) {
+            $cand = ($p | Select-Object -First 1).Trim()
+            if (Test-Path -LiteralPath "$cand\VC\Tools\MSVC") { return $cand }
+        }
+    }
+    foreach ($c in @(
+        "D:\Program Files\Microsoft Visual Studio\2022\Community",
+        "C:\Program Files\Microsoft Visual Studio\2022\Community",
+        "D:\Program Files\Microsoft Visual Studio\2022\Professional",
+        "C:\Program Files\Microsoft Visual Studio\2022\Professional",
+        "D:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise",
+        "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community",
+        "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community")) {
+        if (Test-Path -LiteralPath "$c\VC\Tools\MSVC") { return $c }
+    }
+    return $null
+}
+
+function Get-NewestVersionDir {
+    param([string]$Parent, [string]$Pattern)
+    if (-not (Test-Path -LiteralPath $Parent)) { return $null }
+    Get-ChildItem -LiteralPath $Parent -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $Pattern } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
+$MSVCDir = Find-VSDir
+if (-not $MSVCDir) {
+    Write-Host "[ERROR] Visual Studio C++ toolchain not found." -ForegroundColor Red
+    Write-Host "        Install VS 2017+ with 'Desktop development with C++'." -ForegroundColor Red
+    exit 1
+}
+
+$VCTools = Get-NewestVersionDir -Parent "$MSVCDir\VC\Tools\MSVC" -Pattern '^\d+(\.\d+)*$'
+if (-not $VCTools) {
+    Write-Host "[ERROR] VC tools not found under $MSVCDir\VC\Tools\MSVC" -ForegroundColor Red
+    exit 1
+}
+
 $CompilerBin = "$VCTools\bin\Hostx86\x86"
 $Compiler = Join-Path $CompilerBin "cl.exe"
 $Linker = Join-Path $CompilerBin "link.exe"
 
-$env:Path = "$CompilerBin;$MSVCDir\Common7\IDE;$env:Path"
+# Windows SDK 根目录：注册表 KitsRoot10 -> 常见目录
+$sdkRoot = $null
+foreach ($key in @("HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots",
+                   "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows Kits\Installed Roots")) {
+    if (Test-Path $key) {
+        $root = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).KitsRoot10
+        if ($root -and (Test-Path -LiteralPath $root)) { $sdkRoot = $root; break }
+    }
+}
+if (-not $sdkRoot) {
+    foreach ($c in @("D:\Windows Kits\10", "C:\Program Files (x86)\Windows Kits\10")) {
+        if (Test-Path -LiteralPath $c) { $sdkRoot = $c; break }
+    }
+}
+$sdkVer = $null
+if ($sdkRoot) {
+    $sdkVer = Get-ChildItem -LiteralPath "$sdkRoot\Include" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^10\.\d+' -and (Test-Path -LiteralPath "$sdkRoot\Lib\$($_.Name)\ucrt\x86") } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1 -ExpandProperty Name
+}
+if (-not $sdkVer) {
+    Write-Host "[ERROR] Windows SDK (10.x) not found." -ForegroundColor Red
+    exit 1
+}
+$WindowsSDKInclude = Join-Path $sdkRoot "Include\$sdkVer"
+$WindowsSDKLib = Join-Path $sdkRoot "Lib\$sdkVer"
 
-# Windows SDK
-$WindowsSDKInclude = "D:\Windows Kits\10\Include\10.0.17763.0"
-$WindowsSDKLib = "D:\Windows Kits\10\Lib\10.0.17763.0"
+$env:Path = "$CompilerBin;$MSVCDir\Common7\IDE;$env:Path"
 
 Write-Host "MSVC Directory: $MSVCDir"
 Write-Host "VC Tools: $VCTools"
