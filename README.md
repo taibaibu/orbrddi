@@ -1,10 +1,3 @@
-<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
-
-<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
-
-<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
-
----
 # ORBMDK - ORBTrace CMSIS-DAP RDDI 驱动层
 
 ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，兼容 CMSIS—DAP 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
