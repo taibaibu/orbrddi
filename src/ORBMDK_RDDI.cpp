@@ -10,8 +10,7 @@
 #include "ORBMDK_RDDI.h"
 #include "ORBMDK_HID.h"
 #include "ORBMDK_USB_Bulk.h"
-#include "ORBMDK_ITM_Decoder.h"
-#include "ORBMDK_Trace.h"
+#include "ORBMDK_OrbTrace.h"
 #include "ORBMDK_Log.h"
 
 using namespace ORBMDK;
@@ -300,7 +299,8 @@ struct RDDIContext {
     //   用途：CMSIS_DAP_Capabilities / StreamingTrace_GetSink* 判断 SWO 能力 ——
     //   本层是"探针 → 宿主"的中间层，不能替固件宣称它没有的能力（见两处调用点注释）。
     int probeCaps = -1;
-    std::string productName;
+    std::string vendorName;       // 设备自报厂商（DAP_Info 0x01），空 = 未知
+    std::string productName;      // 设备/接口自报产品名（HID 产品串 / Bulk 接口串）
     std::string serialNumber;
     std::string protocolVersion;
 
@@ -371,8 +371,7 @@ struct RDDIContext {
     std::vector<uint32_t> pcSamples;      // PC 采样值
     std::vector<uint64_t> pcTimestamps;    // PC 采样时间戳
     int pcChannelCount = 1;                // 默认 1 个通道 (DWT PC Sample)
-    struct ORBMDK_ITM_Decoder* itmDecoder = nullptr;  // ITM 解码器
-    
+
     // Trace buffers
     std::vector<uint8_t> swoBuffer;        // SWO 数据缓冲区
 
@@ -786,6 +785,18 @@ RDDI_FUNC int RDDI_Open(RDDIHandle *pHandle, const void *pDetails)
         }
     }
 
+    // ---- 设备自报的厂商串（显示名用，识别不依赖它）----
+    // 优先问设备（CMSIS-DAP `DAP_Info(0x01)`）；问不到就留空，显示时由
+    // DeviceVendor() 回落到 ORBMDK_DEVICE_VENDOR（见该函数注释）。
+    {
+        char vendor[128] = {};
+        (void)ORBMDK::DAP_GetInfo(DAP_INFO_VENDOR, vendor, sizeof(vendor));
+        if (vendor[0] != '\0') {
+            ctx->vendorName = vendor;
+            LOG_DEBUG("RDDI_Open: device vendor='%s'", ctx->vendorName.c_str());
+        }
+    }
+
     // ---- 上报给宿主的版本串 ----
     // 唯一来源 = **设备自报的 DAP_Info(0x04)**（走已连上的那条传输；DAP_GetInfo
     // 内部按当前模式分发到 HID 或 Bulk）。**不读** USB 描述符的 bcdDevice：
@@ -950,6 +961,23 @@ RDDI_FUNC int DAP_Configure(const RDDIHandle handle, const char *configFileName)
     return RDDI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------------
+// 设备自报的品牌串（只用于显示名；设备识别一律按能力特征，与此无关）
+//
+// 优先用**设备自己报的**（HID 产品串 / Bulk 接口串 / DAP_Info 厂商串，RDDI_Open 时
+// 已缓存进 ctx），问不到才回落到 ORBMDK.h 的 ORBMDK_DEVICE_*。这样接其他厂商的
+// CMSIS-DAP / trace 探针时显示名自动跟随，无需改代码。
+// ---------------------------------------------------------------------------
+static const char* DeviceVendor(const RDDIContext* ctx)
+{
+    return (ctx && !ctx->vendorName.empty()) ? ctx->vendorName.c_str() : ORBMDK_DEVICE_VENDOR;
+}
+
+static const char* DeviceProduct(const RDDIContext* ctx)
+{
+    return (ctx && !ctx->productName.empty()) ? ctx->productName.c_str() : ORBMDK_DEVICE_PRODUCT;
+}
+
 // 标准 RDDI_DAP_CONN_DETAILS 结构体
 RDDI_FUNC int DAP_Connect(const RDDIHandle handle, RDDI_DAP_CONN_DETAILS *pConnDetails)
 {
@@ -962,11 +990,11 @@ RDDI_FUNC int DAP_Connect(const RDDIHandle handle, RDDI_DAP_CONN_DETAILS *pConnD
     }
 
     if (pConnDetails) {
-        // 填充实现者信息
+        // 填充实现者信息 —— 用**设备自报的**厂商/产品串（问不到才回落宏）
         strncpy_s(pConnDetails->implementorName, sizeof(pConnDetails->implementorName),
-                   "ORBTrace", _TRUNCATE);
+                   DeviceVendor(ctx), _TRUNCATE);
         strncpy_s(pConnDetails->connectionDescription, sizeof(pConnDetails->connectionDescription),
-                   "ORBTrace CMSIS-DAP over USB HID", _TRUNCATE);
+                   DeviceProduct(ctx), _TRUNCATE);
         LOG_DEBUG("DAP_Connect: connected to %s", pConnDetails->connectionDescription);
     }
 
@@ -2434,6 +2462,7 @@ RDDI_FUNC int DAP_RegWriteRepeat(const RDDIHandle handle, const int dapId, const
 
     const int meterOn = ORBMDK_LogMeterEnabled();
     const int wordsLimit = BlockWordsLimit();
+
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
         if (chunk > wordsLimit) {
@@ -2521,6 +2550,7 @@ RDDI_FUNC int DAP_RegReadRepeat(const RDDIHandle handle, const int dapId, const 
 
     const int meterOn = ORBMDK_LogMeterEnabled();
     const int wordsLimit = BlockWordsLimit();
+
     for (int done = 0; done < numRepeats; ) {
         int chunk = numRepeats - done;
         if (chunk > wordsLimit) {
@@ -2707,7 +2737,7 @@ RDDI_FUNC int CMSIS_DAP_Identify(const RDDIHandle handle, int ifNo, int idNo,
         case 1:  // Vendor (RDDI_CMSIS_DAP_ID_VENDOR)
             ORBMDK::DAP_GetInfo(DAP_INFO_VENDOR, str, len);
             if (str[0] == '\0') {
-                strncpy_s(str, len, "ORBTrace", len - 1);
+                strncpy_s(str, len, DeviceVendor(ctx), len - 1);
             }
             break;
 
@@ -3961,7 +3991,7 @@ RDDI_FUNC int CMSIS_DAP_GetGUID(const RDDIHandle handle, int ifNo, char *guid, i
     }
 
     // CMSIS-DAP 不提供真正的 GUID，用设备标识拼一个稳定字符串。
-    snprintf(guid, (size_t)len, "ORBTrace-%s",
+    snprintf(guid, (size_t)len, "%s-%s", DeviceVendor(ctx),
              ctx->serialNumber.empty() ? "Unknown" : ctx->serialNumber.c_str());
     return RDDI_SUCCESS;
 }
@@ -5273,130 +5303,9 @@ struct PCChannelInfo {
 #define DAPV2_PC_SAMPLING_GET_DATA  0x0A
 
 // DWT PC Sample 通过 ITM HW 包发送 (srcAddr = 2)
-// ITM HW 包格式: 0bxxxxxx10 + 数据
-// PC Sample 数据: 4 字节 PC 值 (小端) 或 1 字节 0x00 (睡眠状态)
-
-/**
- * @brief 初始化 ITM 解码器
- */
-static void _initITMDecoder(RDDIContext* ctx)
-{
-    if (!ctx->itmDecoder) {
-        ctx->itmDecoder = ORBMDK_ITM_Create();
-        if (ctx->itmDecoder) {
-            ORBMDK_ITM_Init(ctx->itmDecoder);
-            // 强制同步
-            ORBMDK_ITM_ForceSync(ctx->itmDecoder, true);
-        }
-    }
-}
-
-/**
- * @brief 从 trace 数据中提取 PC 采样
- * 
- * PC 采样通过 ITM HW 包发送，源地址为 2 (DWT PC Sample)
- * 数据格式：
- * - 0x00: CPU 处于睡眠状态
- * - 1-4 字节: PC 采样值 (小端序)
- */
-static int _fetchPCSamplesFromTrace(RDDIContext* ctx, int maxSamples)
-{
-    if (!ctx || !ctx->itmDecoder) {
-        return 0;
-    }
-
-    // 从 SWO 缓冲区获取数据
-    // 实际数据应该通过 StreamingTrace 或 SWO_Data 获取
-    // 这里处理已缓存的 trace 数据
-    for (size_t i = 0; i < ctx->swoBuffer.size() && (int)ctx->pcSamples.size() < maxSamples; i++) {
-        uint8_t byte = ctx->swoBuffer[i];
-        ORBMDK_ITM_Pump(ctx->itmDecoder, byte);
-        
-        // 检查是否是 PC Sample 包
-        struct ORBMDK_ITM_Packet pkt;
-        if (ORBMDK_ITM_GetPacket(ctx->itmDecoder, &pkt)) {
-            if (pkt.type == ITM_PT_HW && pkt.srcAddr == 2) {
-                // DWT PC Sample
-                if (pkt.len == 1 && pkt.d[0] == 0x00) {
-                    // 睡眠状态 - 不记录 PC 值，但可以记录睡眠事件
-                    // ctx->pcSleepEvents.push_back(timestamp);
-                } else {
-                    // PC 采样值 (小端序)
-                    uint32_t pcValue = 0;
-                    for (int j = 0; j < pkt.len && j < 4; j++) {
-                        pcValue |= ((uint32_t)pkt.d[j]) << (j * 8);
-                    }
-                    ctx->pcSamples.push_back(pcValue);
-                }
-            }
-        }
-    }
-    
-    // 清空已处理的缓冲区
-    ctx->swoBuffer.clear();
-    
-    return (int)ctx->pcSamples.size();
-}
-
-/**
- * @brief 处理来自 USB 的 trace 数据
- * 
- * 将原始 trace 数据送入 ITM 解码器
- */
-static void _processTraceData(RDDIContext* ctx, const uint8_t* data, size_t len)
-{
-    if (!ctx || !data || len == 0) return;
-    
-    _initITMDecoder(ctx);
-    
-    for (size_t i = 0; i < len; i++) {
-        ORBMDK_ITM_Pump(ctx->itmDecoder, data[i]);
-        
-        // 检查 PC Sample
-        struct ORBMDK_ITM_Packet pkt;
-        if (ORBMDK_ITM_GetPacket(ctx->itmDecoder, &pkt)) {
-            if (pkt.type == ITM_PT_HW && pkt.srcAddr == 2) {
-                // DWT PC Sample
-                if (pkt.len == 1 && pkt.d[0] == 0x00) {
-                    // 睡眠状态
-                    ctx->pcSamples.push_back(0xFFFFFFFF);  // 特殊标记表示睡眠
-                } else if (pkt.len >= 1) {
-                    // PC 采样值 (小端序)
-                    uint32_t pcValue = 0;
-                    for (int j = 0; j < pkt.len && j < 4; j++) {
-                        pcValue |= ((uint32_t)pkt.d[j]) << (j * 8);
-                    }
-                    ctx->pcSamples.push_back(pcValue);
-                }
-            }
-        }
-    }
-}
-
-/**
- * @brief 从 USB 端点读取 trace 数据 (V2 Bulk)
- */
-static int _readTraceFromUSB(RDDIContext* ctx, int maxSamples)
-{
-    if (!ctx) return 0;
-    
-    uint8_t traceData[512];
-    int totalRead = 0;
-    
-    // 循环读取直到缓冲区满或无数据
-    while ((int)ctx->pcSamples.size() < maxSamples) {
-        int bytesRead = ORBMDK_USB_Bulk_Read(traceData, sizeof(traceData), 10);
-        if (bytesRead <= 0) break;
-        
-        _processTraceData(ctx, traceData, bytesRead);
-        totalRead += bytesRead;
-        
-        // 如果是超时，可能没有更多数据
-        if (bytesRead < (int)sizeof(traceData)) break;
-    }
-    
-    return (int)ctx->pcSamples.size();
-}
+// 说明：PC 采样原先在这里用内置 ITM 解码器从 trace 数据里抽取 DWT PC Sample。
+// 本层已改为纯传输层（HID/WinUSB + RDDI 接口），解码归 AGDI 层，故该解码链已移除。
+// PC_* 导出保留（ABI 兼容），只是不再在本地解码出采样值。
 
 RDDI_FUNC int CMSIS_DAP_PC_Capture(const RDDIHandle handle, uint8_t control)
 {
@@ -5412,9 +5321,6 @@ RDDI_FUNC int CMSIS_DAP_PC_Capture(const RDDIHandle handle, uint8_t control)
         ctx->pcSamples.clear();
         ctx->pcTimestamps.clear();
         
-        // 初始化 ITM 解码器
-        _initITMDecoder(ctx);
-
         // 发送 DAP_PC_Sampling 命令启动采样
         uint8_t cmd[3] = {
             DAPV2_PC_SAMPLING_CAPTURE,  // 命令 ID
@@ -5428,9 +5334,6 @@ RDDI_FUNC int CMSIS_DAP_PC_Capture(const RDDIHandle handle, uint8_t control)
         USB_Bulk_Mode mode = ORBMDK_USB_Bulk_GetMode();
         if (mode == USB_BULK_BULK_MODE) {
             ORBMDK_USB_Bulk_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_SHORT_MS);
-            
-            // 读取初始 trace 数据
-            _readTraceFromUSB(ctx, 256);
         } else {
             // Fallback 到 HID
             ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_SHORT_MS);
@@ -5573,12 +5476,6 @@ RDDI_FUNC int CMSIS_DAP_PC_GetData(const RDDIHandle handle, int *count, uint8_t 
         return RDDI_SUCCESS;
     }
 
-    // 从 USB 端点获取新的 trace 数据并提取 PC 采样
-    USB_Bulk_Mode mode = ORBMDK_USB_Bulk_GetMode();
-    if (mode == USB_BULK_BULK_MODE) {
-        _readTraceFromUSB(ctx, 4096);
-    }
-
     // 返回 PC 采样数据（每个 PC 值 4 字节）
     int maxCount = *count / 4;  // count 是字节数
     int copyCount = std::min(maxCount, (int)ctx->pcSamples.size());
@@ -5616,12 +5513,6 @@ RDDI_FUNC int CMSIS_DAP_PC_GetValues(const RDDIHandle handle, int *count, uint32
         return RDDI_SUCCESS;
     }
 
-    // 从 USB 端点获取新的 trace 数据并提取 PC 采样
-    USB_Bulk_Mode mode = ORBMDK_USB_Bulk_GetMode();
-    if (mode == USB_BULK_BULK_MODE) {
-        _readTraceFromUSB(ctx, *count);
-    }
-
     // 获取 PC 采样值（32-bit 地址）
     int copyCount = std::min(*count, (int)ctx->pcSamples.size());
     if (values && copyCount > 0) {
@@ -5633,4 +5524,207 @@ RDDI_FUNC int CMSIS_DAP_PC_GetValues(const RDDIHandle handle, int *count, uint32
     *count = copyCount;
 
     return RDDI_SUCCESS;
+}
+
+// ============================================================================
+// orbtrace 配置 + raw trace 流（2026-10-08 新增；见 COMPAT_ANALYSIS.md §二十三）
+//
+// 本层统一管理 USB：orbtrace 的 Trace(0x54) / Power(0x50) / Version(0x56) 三个
+// vendor 接口由 ORBMDK_OrbTrace.cpp 打开与配置，这里只做 RDDI 面的包装。
+// 全部为**新增**导出，不影响既有导出。
+// ============================================================================
+
+RDDI_FUNC int OrbTrace_Available(const RDDIHandle handle, int *available)
+{
+    if (available) {
+        *available = 0;   // 失败时也要写输出参数
+    }
+
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+
+    const int ok = ORBMDK_OrbTrace_Detect();
+    if (available) {
+        *available = ok ? 1 : 0;
+    }
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int OrbTrace_GetInfo(const RDDIHandle handle, void *info, int size)
+{
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+    if (!info || size < static_cast<int>(sizeof(ORBMDK_OrbTrace_Info))) {
+        return RDDI_BADARG;
+    }
+    return (ORBMDK_OrbTrace_GetInfo(static_cast<ORBMDK_OrbTrace_Info*>(info)) == 0)
+               ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+}
+
+RDDI_FUNC int OrbTrace_SetTraceWidth(const RDDIHandle handle, int width)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    return (ORBMDK_OrbTrace_SetTraceWidth(width) == 0) ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+}
+
+RDDI_FUNC int OrbTrace_SetTraceSWO(const RDDIHandle handle, int isManchester, int useTPIU)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    return (ORBMDK_OrbTrace_SetTraceSWO(isManchester, useTPIU) == 0) ? RDDI_SUCCESS
+                                                                     : RDDI_DAP_ERROR;
+}
+
+RDDI_FUNC int OrbTrace_SetSWOBaudrate(const RDDIHandle handle, int baud)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    if (baud <= 0) return RDDI_BADARG;
+    return (ORBMDK_OrbTrace_SetSWOBaudrate(static_cast<uint32_t>(baud)) == 0) ? RDDI_SUCCESS
+                                                                              : RDDI_DAP_ERROR;
+}
+
+RDDI_FUNC int OrbTrace_SetVoltage(const RDDIHandle handle, int channel, int millivolts)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    return (ORBMDK_OrbTrace_SetVoltage(channel, millivolts) == 0) ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+}
+
+RDDI_FUNC int OrbTrace_SetVoltageEnable(const RDDIHandle handle, int channel, int on)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    return (ORBMDK_OrbTrace_SetVoltageEnable(channel, on) == 0) ? RDDI_SUCCESS : RDDI_DAP_ERROR;
+}
+
+// config 选项串："width=4;swo=uart|manchester;tpui=0|1;baud=<Hz>"（可 NULL）
+static void _applyTraceConfig(const char* config)
+{
+    if (!config || !config[0]) return;
+
+    char buf[256];
+    strncpy_s(buf, sizeof(buf), config, _TRUNCATE);
+
+    char* next = nullptr;
+    for (char* tok = strtok_s(buf, ";", &next); tok; tok = strtok_s(nullptr, ";", &next)) {
+        while (*tok == ' ') ++tok;
+        char* eq = strchr(tok, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        const char* key = tok;
+        const char* val = eq + 1;
+
+        if (_stricmp(key, "width") == 0) {
+            ORBMDK_OrbTrace_SetTraceWidth(atoi(val));
+        } else if (_stricmp(key, "swo") == 0) {
+            const bool manch = (_stricmp(val, "manchester") == 0);
+            ORBMDK_OrbTrace_SetTraceSWO(manch ? 1 : 0, 0);
+        } else if (_stricmp(key, "tpui") == 0) {
+            ORBMDK_OrbTrace_SetTraceSWO(0, (atoi(val) != 0) ? 1 : 0);
+        } else if (_stricmp(key, "baud") == 0) {
+            ORBMDK_OrbTrace_SetSWOBaudrate(static_cast<uint32_t>(strtoul(val, nullptr, 0)));
+        }
+    }
+}
+
+RDDI_FUNC int TraceStream_Open(const RDDIHandle handle, const char *config)
+{
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+    if (ORBMDK_OrbTrace_Open() != 0) {
+        LOG_WARN("TraceStream_Open: orbtrace trace interface unavailable");
+        return RDDI_DAP_ERROR;
+    }
+    _applyTraceConfig(config);
+    LOG_INFO("TraceStream_Open: orbtrace trace stream started (config='%s')",
+             config ? config : "");
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int TraceStream_Close(const RDDIHandle handle)
+{
+    if (!GetContext(handle)) return RDDI_INVHANDLE;
+    ORBMDK_OrbTrace_Close();
+    LOG_INFO("TraceStream_Close: orbtrace trace stream stopped");
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int TraceStream_Read(const RDDIHandle handle, int *numBytes, void *buffer, int timeoutMs)
+{
+    // ⚠ *numBytes 进来时是**调用方给的缓冲区容量**，出去时是**实际读到的字节数**。
+    // 所以容量必须在任何清零动作**之前**取走 —— 先写 0 再拿它做 `<= 0` 校验，
+    // 等于每次调用都自我否决，函数恒定返回 RDDI_BADARG(1)。
+    // 上层（AGDI 的 OrbTracePump）只看得到 "TraceStream_Read 失败 (rc=0x1)"，
+    // 而流明明是打开成功的，现象是"开了却永远 0 字节"。
+    if (!numBytes || !buffer) {
+        if (numBytes) *numBytes = 0;
+        return RDDI_BADARG;
+    }
+    const int cap = *numBytes;      // 容量：清零之前取
+    if (cap <= 0) {
+        *numBytes = 0;
+        return RDDI_BADARG;
+    }
+
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        *numBytes = 0;
+        return RDDI_INVHANDLE;
+    }
+    if (!ORBMDK_OrbTrace_IsOpen()) {
+        *numBytes = 0;
+        return RDDI_DAP_ERROR;
+    }
+
+    *numBytes = 0;                  // 从这里起，失败也要给输出参数一个确定值
+    const int n = ORBMDK_OrbTrace_ReadTrace(static_cast<uint8_t*>(buffer),
+                                            static_cast<size_t>(cap), timeoutMs);
+    if (n < 0) {
+        return RDDI_DAP_ERROR;
+    }
+    *numBytes = n;
+    // 0x204 = 本轮无数据（与 StreamingTrace_WaitForEvent 同口径）
+    return (n > 0) ? RDDI_SUCCESS : 0x204;
+}
+
+RDDI_FUNC int TraceStream_Status(const RDDIHandle handle, int *count, int *status)
+{
+    if (count)  *count  = 0;
+    if (status) *status = 0;
+
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+
+    ORBMDK_OrbTrace_Info info;
+    if (ORBMDK_OrbTrace_GetInfo(&info) != 0) {
+        return RDDI_DAP_ERROR;
+    }
+
+    int st = 0;
+    if (info.opened)        st |= 0x01;   // 已打开
+    if (info.supportsOFLOW) st |= 0x02;   // trace 接口支持 OFLOW v1.0
+    if (info.powerIf >= 0)  st |= 0x04;   // 有 power 接口
+
+    if (count)  *count  = info.opened ? 1 : 0;
+    if (status) *status = st;
+    return RDDI_SUCCESS;
+}
+
+RDDI_FUNC int TraceStream_DroppedBytes(const RDDIHandle handle, unsigned long long *dropped)
+{
+    if (dropped) *dropped = 0;
+
+    RDDIContext* ctx = GetContext(handle);
+    if (!ctx) {
+        return RDDI_INVHANDLE;
+    }
+
+    // 与 TraceStream_Read 同一条路径：环的丢帧计数由 ORBMDK_OrbTrace 维护，
+    // 本层只做透出（RDDI 层不解释 trace 语义，见 COMPAT_ANALYSIS.md §二十三）。
+    return ORBMDK_OrbTrace_GetDropped(dropped) == 0 ? RDDI_SUCCESS : RDDI_DAP_ERROR;
 }

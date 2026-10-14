@@ -1,11 +1,17 @@
+<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
+
+<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+
+<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+---
 # ORBMDK_RDDI.dll 使用手册
 
-> ⚠️ **文件名带 `.bak` 属历史原因** —— 本手册内容对应**当前 0.5.0** 的导出接口，**并非过期文档**；
-> 保留后缀只是尚未改名。**API 使用请以本文为准**。
+> **本手册对应当前 0.6.0 的导出接口**（2026-10-13 复核）。**API 使用请以本文为准**。
 
 本文给出 `ORBMDK_RDDI.dll` **全部 RDDI 导出函数**的调用用例。
 
-- 导出方式：每个函数都带 `RDDI_FUNC`（`extern "C" __declspec(dllexport)`），共 **78+ 个**，纯 C ABI。
+- 导出方式：每个函数都带 `RDDI_FUNC`（`extern "C" __declspec(dllexport)`），共 **91 个**，纯 C ABI。
 - 调用方式：宿主（Keil 的 AGDI 层、或你自己的程序）用 `LoadLibrary` + `GetProcAddress` 逐个取指针调用。
 - 缓冲区、字符串一律由调用方提供，本 DLL 不跨模块传堆指针（可安全配 `/MT` 静态 CRT）。
 
@@ -15,6 +21,14 @@
 >
 > **协议支持**：**SWD 与 JTAG 均已实机验证**（JTAG 建链 / 扫链 / 寄存器访问见 [§7](#7-jtag-接口)）。
 > 走哪条由 `CMSIS_DAP_ConfigureInterface` 的配置串 `Port=SW|JTAG` 决定。
+>
+> **2026-10-08 变更（影响调用方）**：
+> - 本层已**移除全部 trace 解码器**（ITM / ETM / TPIU / Trace / OFLOW / COBS / Coverage /
+>   Symbols）—— 本层只做传输，解码归 AGDI 层。`CMSIS_DAP_PC_*` 导出**保留**，但**不再在本地
+>   解码出采样值**（见 [§8](#8-pc-采样接口)）。
+> - **新增** orbtrace 配置与 raw trace 流导出（`OrbTrace_*` / `TraceStream_*`，共 12 个，见
+>   [§10](#10-orbtrace-配置与-raw-trace-流)）。导出面 **79 → 91**
+>   （2026-10-13 补 `TraceStream_DroppedBytes`，原 90）。
 
 ---
 
@@ -29,9 +43,10 @@
 7. [JTAG 接口](#7-jtag-接口)
 8. [PC 采样接口](#8-pc-采样接口)
 9. [StreamingTrace 接口](#9-streamingtrace-接口)
-10. [日志回调](#10-日志回调)
-11. [错误码速查](#11-错误码速查)
-12. [注意事项（易踩的坑）](#12-注意事项易踩的坑)
+10. [orbtrace 配置与 raw trace 流](#10-orbtrace-配置与-raw-trace-流)
+11. [日志回调](#11-日志回调)
+12. [错误码速查](#12-错误码速查)
+13. [注意事项（易踩的坑）](#13-注意事项易踩的坑)
 
 ---
 
@@ -50,7 +65,7 @@
 //   ORBMDK_ORBTRACE_PID = 0x3443
 
 // 版本（定义于 include/ORBMDK.h）
-//   ORBMDK_VERSION_STRING = "0.5.0"
+//   ORBMDK_VERSION_STRING = "0.6.0"
 ```
 
 `RDDIHandle` 是 `int` 类型，**从 1 开始编号，0 恒为无效句柄**。
@@ -204,18 +219,27 @@ if (pfn_RDDI_GetLastError(&err, detail, sizeof(detail)) == RDDI_SUCCESS) {
 
 ## 4. DAP 基础与寄存器
 
-寄存器 ID 用头文件里的 `DAP_REG_*` 宏，例如：
+寄存器 ID 用头文件里的 `DAP_REG_*` 宏 —— 编号严格对齐 ARM `rddi_dap.h`
+（低 16 位 = 寄存器号，`bit16` = `DAP_REG_RnW`，`bit17` = `DAP_REG_WaitForValue`）：
 
-| 宏 | 含义 |
-|----|------|
-| `DAP_REG_DP_IDCODE` | DP IDCODE（读） |
-| `DAP_REG_DP_CTRL_STAT` | DP CTRL/STAT |
-| `DAP_REG_DP_SELECT` | DP SELECT（AP bank 选择） |
-| `DAP_REG_DP_RDBUFF` | DP RDBUFF |
-| `DAP_REG_AP_CSW` | AP CSW（带 `DAP_REG_RnW`） |
-| `DAP_REG_AP_TAR` | AP TAR |
-| `DAP_REG_AP_DRW` | AP DRW |
-| `DAP_REG_AP_IDR` | AP IDR |
+| 宏 | 值 | 含义 |
+|----|----|------|
+| `DAP_REG_DP_IDCODE` / `DAP_REG_DP_0x0` | 0 | DP IDCODE（读）/ ABORT（写） |
+| `DAP_REG_DP_CTRL_STAT` / `DAP_REG_DP_0x4` | 1 | DP CTRL/STAT |
+| `DAP_REG_DP_SELECT` / `DAP_REG_DP_0x8` | 2 | DP SELECT（AP bank 选择） |
+| `DAP_REG_DP_RDBUFF` / `DAP_REG_DP_0xC` | 3 | DP RDBUFF |
+| `DAP_REG_AP_CSW` / `DAP_REG_AP_0x0` | 4 | AP CSW |
+| `DAP_REG_AP_TAR` / `DAP_REG_AP_0x4` | 5 | AP TAR |
+| `DAP_REG_AP_BASE` / `DAP_REG_AP_0x8` | 6 | AP BASE（`APBANK=0xF` 时为 ROM 表基址） |
+| `DAP_REG_AP_DRW` / `DAP_REG_AP_0xC` | 7 | AP DRW；`APBANK=0xF` 时为 AP IDR（`DAP_REG_AP_IDR` 同值） |
+| `DAP_REG_DP_ABORT` | 8 | DP ABORT（写） |
+| `DAP_REG_JTAG_IDCODE` | 9 | JTAG IDCODE（读 DP 0x00） |
+| `DAP_REG_DAP_IDR` | 10 | DAP IDR（读 DP 0x00） |
+| `DAP_REG_MATCH_MASK` / `DAP_REG_MATCH_RETRY` | 16 / 17 | 虚拟寄存器（不产生总线访问） |
+
+> ⚠️ 方向由**调用的函数**决定：`DAP_ReadReg` 即读、`DAP_WriteReg` 即写，**不要**再
+> `| DAP_REG_RnW`（该标志在只读 / 只写函数里被忽略）。`DAP_REG_RnW` / `DAP_REG_WaitForValue`
+> 只用于 `DAP_RegAccessBlock`（见 §4.8）。AP bank 由调用方写 `DP SELECT` 决定，本层不改写它。
 
 ### 4.1 `DAP_GetInterfaceVersion`
 
@@ -312,9 +336,14 @@ pfn_DAP_ReadReg(hd, 0, DAP_REG_DP_CTRL_STAT, &ctrl);
 pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_CTRL_STAT, 0x50000000);
 pfn_DAP_ReadReg (hd, 0, DAP_REG_DP_RDBUFF, &ctrl);         // 读回清 sticky
 
-// 选 AP0 bank0
+// 选 AP0 bank0，读 CSW
 pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_SELECT, 0x00000000);
+pfn_DAP_ReadReg (hd, 0, DAP_REG_AP_CSW, &ctrl);            // e.g. 0x23000052
+
+// AP IDR 在 AP 地址 0xFC：先把 SELECT 的 APBANKSEL 置 0xF，再读 AP reg3（regID 7）
+pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_SELECT, 0x000000F0);
 pfn_DAP_ReadReg (hd, 0, DAP_REG_AP_IDR, &ctrl);            // e.g. 0x24770011
+pfn_DAP_WriteReg(hd, 0, DAP_REG_DP_SELECT, 0x00000000);    // 复原 bank0
 ```
 
 > 读回 `Transfer Response` 为 FAULT/WAIT/NO_ACK 时，函数返回
@@ -958,7 +987,12 @@ pfn_CMSIS_DAP_JTAG_GetIRLengths(hd, &cnt, lens);   // JTAG: 例 cnt=2, lens={4,5
 int CMSIS_DAP_PC_Capture(RDDIHandle handle, uint8_t control);
 ```
 
-`control` bit0：`1` 启动采样（清空缓存、初始化 ITM 解码器），`0` 停止。
+`control` bit0：`1` 启动采样，`0` 停止。
+
+> ⚠️ **2026-10-08 起本层不再本地解码**：原实现用内置 ITM 解码器从 trace 里抽 DWT PC Sample，
+> 该解码链已随解码器一起移除。`CMSIS_DAP_PC_*` 导出**保留**（ABI 兼容：名字 / 序号 / 签名不变），
+> 但 `PC_GetData` / `PC_GetValues` **不再返回采样值**（恒 0 条）。
+> 需要 PC 采样请在 **AGDI 层**做（ORBAGDI 已在解码 DWT PC Sample 并喂给 `AG_HistFunc`）。
 
 ```c
 pfn_CMSIS_DAP_PC_Capture(hd, 0x01);   // 启动
@@ -1028,6 +1062,10 @@ pfn_CMSIS_DAP_PC_GetData(hd, &m, raw);
 ## 9. StreamingTrace 接口
 
 `Connect` 的 `mode`：`0`=none，`1`=SWO，`2`=ETM。
+
+> ⚠️ **本层没有 ETM 通路**：`StreamingTrace_*` 只服务 **SWO 流式传输**（sink 名
+> `cmsis_dap_swo_trace`）；`mode=2` 不构成 ETM 数据来源（见 [COMPAT_ANALYSIS.md §17.9](COMPAT_ANALYSIS.md)）。
+> orbtrace 的 trace 端点走 [§10](#10-orbtrace-配置与-raw-trace-流) 的 `TraceStream_*`。
 
 ### 9.1 `StreamingTrace_Attach` / `StreamingTrace_Detach`
 
@@ -1106,7 +1144,7 @@ int StreamingTrace_GetSinkCount(RDDIHandle handle, int *count);
 
 ```c
 int sinks = 0;
-pfn_StreamingTrace_GetSinkCount(hd, &sinks);   // 2 (SWO + ETM)
+pfn_StreamingTrace_GetSinkCount(hd, &sinks);   // SWO 流式 sink（本层无 ETM sink）
 ```
 
 ### 9.7 `StreamingTrace_GetSinkDetails`
@@ -1139,9 +1177,121 @@ pfn_StreamingTrace_SetConfigItem(hd, 2, 1);            // mode = SWO
 
 ---
 
-## 10. 日志回调
+## 10. orbtrace 配置与 raw trace 流
 
-### 10.1 `RDDI_SetLogCallback`
+> **2026-10-08 新增，2026-10-13 补齐**（共 12 个导出，设计与依据见 [COMPAT_ANALYSIS.md §二十三](COMPAT_ANALYSIS.md)）。
+>
+> 本层**统一管理 USB**：orbtrace 复合设备上除 CMSIS-DAP 之外的三个 vendor 接口由本层打开与配置
+> （`bInterfaceClass = 0xFF`，按 `bInterfaceSubClass` 区分：`0x50` Power / `0x54` Trace /
+> `0x56` Version）。AGDI 只从这里取 **raw trace 字节流**，自行解码。
+>
+> ⚠️ **未实机验证**。非 orbtrace 设备上 `OrbTrace_Available` 返回 `*available = 0`，
+> 其余接口返回错误码（不崩溃，也不影响 DAP 通路）。
+
+### 10.1 设备探测与信息
+
+```c
+int OrbTrace_Available(RDDIHandle handle, int *available);        // *available: 1/0
+int OrbTrace_GetInfo  (RDDIHandle handle, void *info, int size);  // size = sizeof(ORBMDK_OrbTrace_Info)
+```
+
+```c
+#include "../include/ORBMDK_OrbTrace.h"
+
+int avail = 0;
+pfn_OrbTrace_Available(hd, &avail);
+if (avail) {
+    ORBMDK_OrbTrace_Info info;
+    pfn_OrbTrace_GetInfo(hd, &info, sizeof(info));
+    printf("orbtrace %04X:%04X '%s' sn='%s' ver='%s' traceIf=%d OFLOW=%d\n",
+           info.vid, info.pid, info.product, info.serial, info.version,
+           info.traceIf, info.supportsOFLOW);
+}
+```
+
+`ORBMDK_OrbTrace_Info` 字段：
+
+| 字段 | 说明 |
+|------|------|
+| `present` / `opened` | 1 = 找到 / 已打开 |
+| `vid` / `pid` | 设备身份（`1209:3443` 或 `1209:3442`） |
+| `traceIf` / `powerIf` / `versionIf` | 三个 vendor 接口号（`-1` = 无） |
+| `traceProtocol` | `0x00` 未知 / `0x01` TPIU raw / `0x10` OFLOW v1.0 |
+| `supportsOFLOW` | 1 = trace 接口 protocol == `0x10` |
+| `product` / `serial` / `version` | 产品名 / 序列号 / 探针版本串（已去 `"Version: "` 前缀） |
+
+### 10.2 配置 trace 源（对应 orbuculum `OrbtraceIfSet*`）
+
+```c
+int OrbTrace_SetTraceWidth   (RDDIHandle handle, int width);          // 1/2/3 (= 1/2/4-bit)；4 视作 3
+int OrbTrace_SetTraceSWO     (RDDIHandle handle, int isManchester, int useTPIU);
+int OrbTrace_SetSWOBaudrate  (RDDIHandle handle, int baud);           // Hz
+int OrbTrace_SetVoltage      (RDDIHandle handle, int channel, int millivolts);
+int OrbTrace_SetVoltageEnable(RDDIHandle handle, int channel, int on);
+```
+
+供电通道（`include/ORBMDK_OrbTrace.h`）：`ORBMDK_ORBTRACE_CH_VTREF`(0) / `CH_VTPWR`(1) /
+`CH_ALL`(0xFF)。`SetVoltage` 的毫伏须在 **900..5010** 内，否则返回 `RDDI_DAP_ERROR`。
+
+```c
+pfn_OrbTrace_SetTraceWidth(hd, 4);                              // 4-bit 并口
+pfn_OrbTrace_SetTraceSWO(hd, 0, 1);                             // UART 编码，经 TPIU
+pfn_OrbTrace_SetSWOBaudrate(hd, 2000000);
+pfn_OrbTrace_SetVoltage(hd, ORBMDK_ORBTRACE_CH_VTPWR, 3300);
+pfn_OrbTrace_SetVoltageEnable(hd, ORBMDK_ORBTRACE_CH_ALL, 1);
+```
+
+### 10.3 打开 / 读取 raw trace 流
+
+```c
+int TraceStream_Open  (RDDIHandle handle, const char *config);   // config 可为 NULL
+int TraceStream_Close (RDDIHandle handle);
+int TraceStream_Read  (RDDIHandle handle, int *numBytes, void *buffer, int timeoutMs);
+int TraceStream_Status(RDDIHandle handle, int *count, int *status);
+int TraceStream_DroppedBytes(RDDIHandle handle, unsigned long long *dropped);  // 环溢出累计丢帧字节数
+```
+
+`config` 选项串（分号分隔，**可选**）：`"width=4;swo=uart|manchester;tpui=0|1;baud=<Hz>"`。
+
+`TraceStream_Read`：`*numBytes` 进 = 缓冲容量、出 = 实际字节数；`timeoutMs`：`0` = 非阻塞、
+`<0` = 阻塞到有数据。返回 `RDDI_SUCCESS`(0) = 有数据、**`0x204`** = 本轮无数据
+（与 `StreamingTrace_WaitForEvent` 同口径）、其他 = 错误。
+
+```c
+pfn_TraceStream_Open(hd, "width=4;swo=uart;baud=2000000");
+
+uint8_t buf[8192];
+for (int i = 0; i < 100; ++i) {
+    int n = (int)sizeof(buf);
+    const int rc = pfn_TraceStream_Read(hd, &n, buf, 100);
+    if (rc == RDDI_SUCCESS && n > 0) {
+        /* buf[0..n) 是 raw trace 字节（ITM/ETM 语义由 AGDI 层解释） */
+    } else if (rc == 0x204) {
+        /* 本轮无数据 */
+    } else {
+        break;   // 出错（设备拔出 / 端点未打开）
+    }
+}
+
+pfn_TraceStream_Close(hd);
+```
+
+`TraceStream_Status` 的 `*status` 位标志：`bit0` 已打开 / `bit1` trace 接口支持 OFLOW v1.0 /
+`bit2` 有 power 接口；`*count` = 已打开(0/1)。
+
+`TraceStream_DroppedBytes`：返回**自 `TraceStream_Open` 起**环形缓冲写满（消费者跟不上生产者）
+而累计丢弃的字节数（`Open` 时清零）。`TraceStream_Read` 只能说明"读到了多少"；
+当读到的字节少于探针实际发出的量时，靠这个计数区分"探针没发"与"环满丢了"。
+
+> **注意**：`TraceStream_Read` 目前交的是 **raw USB 字节**（OFLOW / COBS 帧**未拆**）。
+> 需要纯 payload 时按 [COMPAT_ANALYSIS.md §23.2](COMPAT_ANALYSIS.md) 自行解帧
+> （COBS 去分隔 + `tag(1) | payload | sum(1)` 校验）。
+
+---
+
+## 11. 日志回调
+
+### 11.1 `RDDI_SetLogCallback`
 
 ```c
 void RDDI_SetLogCallback(RDDIHandle handle, RDDILogCallback pfn, void *context, int maxLogLevel);
@@ -1174,7 +1324,7 @@ pfn_RDDI_SetLogCallback(hd, NULL, NULL, 0);
 
 ---
 
-## 11. 错误码速查
+## 12. 错误码速查
 
 通用错误码（`RDDI_SUCCESS` = 0 表示成功）：
 
@@ -1199,7 +1349,7 @@ Keil 扩展错误码（0x2000 段）：`RDDI_DAP_ERROR`(0x2000)、`RDDI_DAP_ERRO
 
 ---
 
-## 12. 注意事项（易踩的坑）
+## 13. 注意事项（易踩的坑）
 
 1. **输出参数总是先写**：所有带标量出参的接口，即使句柄无效也会先把出参写成 `0`/空串再返回错误。
    调用方应**先看输出值、再看返回值**（AGDI 就是只看输出值）。

@@ -1663,15 +1663,21 @@ static int _bulkTransferCommand(const uint8_t* cmd, size_t cmdLen,
         return ret;
     }
 
-    // 响应同样按整包读入，再按调用方缓冲大小截断
+    // 响应读进**整个缓冲**，不能用 outLen 当上限。
+    //
+    // outLen 是**出包**长度：它只说这条命令在去路上可以占多少字节，与响应能有多长
+    // 毫无关系。读命令的去路只有 5 字节（命令头，没有负载），而它的响应要装
+    // count*4 字节数据 —— 一次 125 字的 DAP_TransferBlock 就是 5 + 500 = 505 字节。
+    // 拿 outLen 当读上限，只会取走前 outLen 字节，**剩下的留在 IN 管道里**，于是
+    // 下一条命令读到的是上一条响应的尾巴：数据看着像真的、却是错的，而且每次不一样。
+    // （被截断的响应首字节仍是命令号，所以"陈旧响应"那条冲刷重试也永远不会触发。）
+    //
+    // 放开上限**不影响速度**：_bulkRead 在设备把包发完时就返回，缓冲给多大都一样；
+    // 反而省掉了上面那些冲刷 + 重发。
     uint8_t rbuf[1024];
-    if (outLen > sizeof(rbuf)) {
-        return -1;
-    }
-    const int n = _bulkRead(rbuf, outLen, timeoutMs);
+    const int n = _bulkRead(rbuf, sizeof(rbuf), timeoutMs);
     if (n < 0) {
-        BulkTrace("DAPCommand: cmd=0x%02X outLen=%u read failed (%d)",
-                  cmd[0], (unsigned)outLen, n);
+        BulkTrace("DAPCommand: cmd=0x%02X read failed (%d)", cmd[0], n);
         return n;
     }
 
@@ -1802,7 +1808,12 @@ ORBMDK_INTERNAL int CMSIS_DAP_V2_GetInfo(uint8_t info_id, uint8_t* buffer, size_
 
     switch (info_id) {
     case DAPV2_INFO_PRODUCT_NAME:
-        strncpy_s((char*)buffer, buffer_len, "ORBTrace CMSIS-DAP", buffer_len - 1);
+        // 优先问设备（CMSIS-DAP DAP_Info(0x02)），问不到才回落品牌宏。
+        buffer[0] = '\0';
+        (void)DAP_GetInfo(DAP_INFO_PRODUCT, (char*)buffer, buffer_len);
+        if (buffer[0] == '\0') {
+            strncpy_s((char*)buffer, buffer_len, ORBMDK_DEVICE_PRODUCT, buffer_len - 1);
+        }
         return (int)strlen((char*)buffer);
 
     case DAPV2_INFO_SERIAL_NUMBER:
@@ -1828,7 +1839,11 @@ ORBMDK_INTERNAL int CMSIS_DAP_V2_GetInfo(uint8_t info_id, uint8_t* buffer, size_
     }
 
     case DAPV2_INFO_VENDOR_STRING:
-        strncpy_s((char*)buffer, buffer_len, "ORBTrace", buffer_len - 1);
+        buffer[0] = '\0';
+        (void)DAP_GetInfo(DAP_INFO_VENDOR, (char*)buffer, buffer_len);
+        if (buffer[0] == '\0') {
+            strncpy_s((char*)buffer, buffer_len, ORBMDK_DEVICE_VENDOR, buffer_len - 1);
+        }
         return (int)strlen((char*)buffer);
 
     case DAPV2_INFO_CAPABILITIES:

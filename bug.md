@@ -1,11 +1,18 @@
+<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
+
+<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+
+<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+---
 # ORBMDK 不可修复缺陷档
 
 - **收录标准**：① **本层改不了**的缺陷（根因在**探针固件 RTL** 或**第三方二进制 µVision / `CMSIS_AGDI.dll`**）；
   ② 本层**已做**改动的实现细节与实机数据留档（**附录 B**，自 `Todo.md` 迁入，避免两份数据漂移）；
   ③ **口径决策的记录**（如 B12「虚构 SWO 能力位」的否证全过程）—— 凡"做过了、有结论"的内容以本档为唯一落点。
 - **不进本档**：本层**能修且未修**的（→ `Todo.md`）；AGDI 逆向与 ABI 结论（→ `COMPAT_ANALYSIS.md`）。
-- **固件源码**：`C:\Users\taibaibu\Desktop\orbtrace-1.4.3\`；片上是 `orbtrace/debug/cmsis_dap.py`（Amaranth RTL）+ `verilog/{dbgIF,jtagIF,swdIF}.v`。
-- **最后更新**：2026-10-03（0.5.0 发版整理）
+- **固件源码**：`orbtrace-1.4.3` 源码树（本地路径随机器而定）；片上是 `orbtrace/debug/cmsis_dap.py`（Amaranth RTL）+ `verilog/{dbgIF,jtagIF,swdIF}.v`。
+- **最后更新**：2026-10-14（0.6.0 发版整理）
 
 ## B5 🟡 AGDI 不传设备信息（`rddi_Open(pDetails)` 恒 NULL）
 
@@ -312,7 +319,7 @@
     判据是"**是不是本会话第一笔**"，**与读/写无关**。**第八轮的"写挂死"实为"第二笔"**（其 S2 读已先吞掉
     第一笔）；第二/四轮"读秒回"也正是"首笔被吞"。**历轮全部数据在这条规则下自洽。**
 
-- **★★ 第十轮（2026-10-03）：根因上溯到上游固件源码 `C:\Users\taibaibu\Desktop\orbtrace-1.4.3`（探针 gateware）。**
+- **★★ 第十轮（2026-10-03）：根因上溯到上游固件源码 `orbtrace-1.4.3`（探针 gateware）。**
   探针"固件" = ECP5 gateware：`verilog/dbgIF.v` + `verilog/jtagIF.v`（`orbtrace/debug/dbgIF_wrapper.py`
   以 `Instance("dbgIF", ...)` 例化，**真正跑在探针上的就是这两份 verilog**）；命令层是 Migen 的
   `orbtrace/debug/cmsis_dap.py`。
@@ -568,7 +575,7 @@ self.txBlock.bit_select(24,8).eq(Cat(self.dbgif.ack,self.dbgif.perr,C(0,4)))
 
 ## B10 · 固件 `orbtrace-1.4.4` 与本文档基线 1.4.3 的差异核查（2026-10-03）
 
-- **口径**：`C:\Users\taibaibu\Desktop\orbtrace-1.4.4\`（**无 `.git`、无 `PKG-INFO`**，版本串由 `git describe` 生成 ⇒ 无法从树内自证出处）
+- **口径**：`orbtrace-1.4.4` 源码树（**无 `.git`、无 `PKG-INFO`**，版本串由 `git describe` 生成 ⇒ 无法从树内自证出处）
   vs 1.4.3 逐文件比对：**仅 9 个文件不同**，其余（含 `orbtrace/debug/dbgIF.py`、`verilog/ram.v`）逐字节相同。
 - **A. `verilog/dbgIF.v`（跑在探针上的状态机）**
   - `CMD_CLR_ERR`：1.4.3（`:593-594`）**只写 `dbg_state`、不清 `perr`** ⇒ 出错后 `perr` 永久粘滞；1.4.4（`:596-600`）补 `perr <= 0`。
@@ -798,3 +805,25 @@ wait 不可合并批量（占往返 49%）、`DAP_MAX_PACKET_COUNT = 1`（orbtra
 > ⚠ 行号口径：上表 `src/ORBMDK_RDDI.cpp` 的 `:2228/2315`、`:2233/2259/2320/2347` 属 2026-10-03
 > 早期引用；同日删除 SWO 虚构段（B12，位于文件后部）**未影响**这些行号，但如需精确定位，
 > 请以符号 `DAP_TransferBlock` / `ORBMDK_LogMeterAccount` 为准。
+
+## B14 ⚪ 行为变化（已记录）：`CMSIS_DAP_PC_*` 不再本地解码（2026-10-08）
+
+**背景**：本层定位为 AGDI 层的 RDDI **传输层**，trace 解码不属本层；八个解码器模块
+（ITM / ETM / TPIU / Trace / OFLOW / COBS / Coverage / Symbols）已全部删除
+（见 `COMPAT_ANALYSIS.md` §二十二）。
+
+**行为变化**：`CMSIS_DAP_PC_Capture` / `PC_GetData` / `PC_GetValues` 等**导出保留**
+（ABI 兼容：名字 / 序号 / 签名不变），但**不再在本地解码出 PC 采样值**。
+
+- **原实现**：`PC_Capture` 初始化内置 ITM 解码器；`_readTraceFromUSB` → `_processTraceData`
+  把从 USB 端点读到的原始 trace 交给 ITM 解码器，抽出 DWT PC Sample 填进 `ctx->pcSamples`。
+- **现状**：解码链随解码器一起移除，`ctx->pcSamples` 不再被填充 ⇒ `PC_GetData` /
+  `PC_GetValues` 返回 0 条。
+- **影响面：无**。该链本就是死代码 —— `_fetchPCSamplesFromTrace` 全工程无调用点；
+  且 Keil 的 AGDI 从不调用 `CMSIS_DAP_PC_*`（README「RDDI 接口」一节：elaphureLinkAGDI
+  实际只调 15 个函数，不含 `PC_*`）。
+
+**若将来需要 PC 采样**：在 **AGDI 层**做 —— ORBAGDI 的 ITM 解码器（`ORBAGDI_Itm.cpp`）
+已在解码 DWT PC Sample 并喂给 `AG_HistFunc`，无需本层参与。
+
+**口径**：这是**有意的行为变化，不是缺陷**；本层不再负责任何 trace 解码。

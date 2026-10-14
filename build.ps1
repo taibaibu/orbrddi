@@ -208,14 +208,7 @@ $Sources = @(
     @{Name="ORBMDK_HID.cpp"; Obj="$ObjDir\ORBMDK_HID.obj"},
     @{Name="ORBMDK_RDDI.cpp"; Obj="$ObjDir\ORBMDK_RDDI.obj"},
     @{Name="ORBMDK_USB_Bulk.cpp"; Obj="$ObjDir\ORBMDK_USB_Bulk.obj"},
-    @{Name="ORBMDK_COBS.cpp"; Obj="$ObjDir\ORBMDK_COBS.obj"},
-    @{Name="ORBMDK_OFLOW.cpp"; Obj="$ObjDir\ORBMDK_OFLOW.obj"},
-    @{Name="ORBMDK_ITM_Decoder.cpp"; Obj="$ObjDir\ORBMDK_ITM_Decoder.obj"},
-    @{Name="ORBMDK_TPIU_Decoder.cpp"; Obj="$ObjDir\ORBMDK_TPIU_Decoder.obj"},
-    @{Name="ORBMDK_ETM_Decoder.cpp"; Obj="$ObjDir\ORBMDK_ETM_Decoder.obj"},
-    @{Name="ORBMDK_Trace.cpp"; Obj="$ObjDir\ORBMDK_Trace.obj"},
-    @{Name="ORBMDK_Symbols.cpp"; Obj="$ObjDir\ORBMDK_Symbols.obj"},
-    @{Name="ORBMDK_Coverage.cpp"; Obj="$ObjDir\ORBMDK_Coverage.obj"}
+    @{Name="ORBMDK_OrbTrace.cpp"; Obj="$ObjDir\ORBMDK_OrbTrace.obj"}
 )
 
 foreach ($src in $Sources) {

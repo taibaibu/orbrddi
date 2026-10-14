@@ -1,3 +1,10 @@
+<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
+
+<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+
+<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+---
 # ORBMDK 兼容性分析与实现状态
 
 > 分析日期：2026-09-29
@@ -13,13 +20,13 @@
 
 | 项 | 状态 |
 |----|------|
-| 版本 | **`0.5.0`** —— 驱动自身发版号（`include/ORBMDK.h` 的 `ORBMDK_VERSION_STRING`）。⚠️ 与下表"固件版本门"里**上报给宿主的协议版本串**（设备 `DAP_Info(0x04)`，主版本归一化抬到 ≥ 2）不是一回事，**勿联动** |
+| 版本 | **`0.6.0`** —— 驱动自身发版号（`include/ORBMDK.h` 的 `ORBMDK_VERSION_STRING`）。⚠️ 与下表"固件版本门"里**上报给宿主的协议版本串**（设备 `DAP_Info(0x04)`，主版本归一化抬到 ≥ 2）不是一回事，**勿联动** |
 | 编译 | ✅ `build.ps1` 全量编译通过，**无 error、无 warning** |
 | 运行库 | ✅ **静态 CRT（`/MT`）**，产物不依赖 `MSVCP140`/`VCRUNTIME140`/UCRT（原因见第十二节） |
 | 编译器依赖 | ⚠️ **与 MSVC / UCRT 强绑定**（Annex K 安全 CRT、`#pragma comment(lib)`）：`clang-cl` 理论可行，MinGW-w64 GCC 与 VS2013 及更早不支持 —— 静态审查见 **§19** |
 | 输出 | `bin/ORBMDK_RDDI.dll` |
-| 导出符号 | `ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **78 个** |
-| 实机验证 | ⚠️ `ORBMDK_RDDI_FullTest.exe` 原 **40/40 全部通过**；后因测试自身 `DAP_REG_*` 常量陈旧（§13.5）变为 `PASSED 22 / FAILED 20` → 修复项见 **`Todo.md` §18.11** |
+| 导出符号 | `ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **91 个** |
+| 实机验证 | ✅ `ORBMDK_RDDI_FullTest.exe` 在 QM-Link CMSIS-DAP + Cortex-M4 上 **`PASSED 37 / FAILED 0 / NOT IMPLEMENTED 3`**（3 项 SWO 因探针自报 caps 无 SWO 位而跳过）；`swdprobe` **19 通过 / 0 失败**。此前因 `DAP_REG_*` 常量陈旧（§13.5）退化为 `PASSED 22 / FAILED 20`，2026-10-10 修复（`Todo.md` §18.11 已结案） |
 | 目标识别 | ✅ DP IDCODE `0x2BA01477`、AP IDR `0x24770011`（STM32F1） |
 | JTAG 通路 | ✅ **已打通**（§18.9 第九步）：`Port=JTAG` 建链成功；扫链 IDCODE `0x4BA00477`、DP CTRL/STAT `0xF0000000`、AP IDR `0x24770011`，与 OpenOCD 交叉一致；SWD 无回归。⚠️ **JTAG 侧不启用固件块传输**（实测会把探针挂死，§18.9 第十步）|
 | Keil 联调 | ✅ 官方 AGDI v1.33.24 下对话框正确显示 `IDCODE 0x2BA01477` / `ARM CoreSight SW-DP`（见 4.7） |
@@ -32,7 +39,7 @@
 | 固件版本门 | ✅ AGDI 用 `"%lu.%lu.%lu"` 解析 `Identify(idNo=4)` 并 `cmp eax,2`，主版本 ≥ 2 **只多走两步**：SWO 传输置 Stream（还需 caps `0x40`）+ 注册 streaming sink —— **函数指针表是无条件安装的**（§17.6 反汇编，§17.7 末更正块）；本层 2026-10-01 起**放开到 ≥ 2**（早年"钉 `1.0.0`"见 §17.5 A/B；放开的实机回归判据见 `Todo.md.bak` §18.10-C 阶段 5） |
 | 日志 | ✅ 单一实现 `src/ORBMDK_Log.cpp`（§8.1）：多 Sink（文件 / stdout / DebugView / 宿主回调）、`%TEMP%\ORBMDK_LOG_LEVEL` 热更新、线程安全；`RDDI_SetLogCallback` 已接通 Keil 日志窗口 |
 
-### 文档引用约定（0.5.0 整理时补）
+### 文档引用约定（0.5.0 补入，0.6.0 沿用）
 
 本文中出现的 **`Todo.md §18.x` 属历史编号**。`Todo.md` 于 2026-10-03 精简为"只列未完成项"，
 原 §18 体系已整卷移入 **`Todo.md.bak`**（历史快照；**其中 `18.10-C` 等方案的结论已被后续实验推翻，勿直接采信**）。
@@ -50,15 +57,16 @@
 
 > 实现细节与排查记录一律在 **`bug.md`**（B 系列）；本文只放**逆向结论与 ABI / 行为判定**。
 
-**导出符号分类（78 个）**
+**导出符号分类（91 个）**
 
 | 分类 | 数量 |
 |------|------|
 | RDDI 核心（Open/Close/GetLastError） | 3 |
-| DAP 基础 + 寄存器 | 20 |
-| CMSIS_DAP_* | 30 |
+| DAP 基础 + 寄存器 | 21 |
+| CMSIS_DAP_* | 35 |
 | PC_* | 6 |
 | StreamingTrace_* | 13 |
+| OrbTrace_* / TraceStream_*（orbtrace 配置 + raw trace 流） | 12 |
 | RDDI_SetLogCallback | 1 |
 
 > `ORBMDK_USB_Bulk.cpp` 中的 `ORBMDK_USB_Bulk_*` / `CMSIS_DAP_V2_*` / `ORBMDK_Bulk_*` 使用 `ORBMDK_INTERNAL`（构建 DLL 时为空宏），**不导出**，属内部接口。
@@ -323,14 +331,10 @@ orbtrace 固件 `RESP_Transfer_Process` 的响应字节为 `Cat(dbgif.ack, dbgif
 | 8 | `DAP_ReadReg` | AP 分支残留 `printf` 调试输出，且未检查 SELECT 写状态 | 改为 `LOG_DEBUG`，SELECT 写失败返回 `RDDI_DAP_ERROR` |
 | 9 | `DAP_RegReadBlock` / `DAP_RegWriteBlock` | 逐寄存器 INFO 日志（块传输可达上万条） | 移除；失败时仅输出一条 ERROR |
 
-### 4.3 解码器层
+### 4.3 解码器层（已随解码器移出，2026-10-08）
 
-| # | 文件 | 问题 | 修复 |
-|---|------|------|------|
-| 10 | `ORBMDK_ITM_Decoder.*` | 同步字节误用 `0x70`（实为溢出包）；SW/HW 长度取自 `(c>>5)&3` 而非包头 bit[1:0]；HW PC Sample 固定预取 4 字节；进入新包不重置 `len` | 按 orbuculum `itmDecoder.c` 重写状态机：48 位移位寄存器同步（5×`0x00`+`0x80`）、源包长度由 bit[1:0] 决定（`0b11`→4 字节）、`0x70` 归为溢出、补齐 TS/GTS/XTN/NISYNC/RSVD 可变长包、IDLE 态清零负载缓冲 |
-| 11 | `ORBMDK_ETM_Decoder.*` | `_decodeETMv35` 用 `len < 3` 判定，而 `_decodeETMv35ISYNC` 消费 4 字节 | 新增 `addrBytes`（默认 4），统一按 `need = 1 + addrBytes` 判定并返回缺失字节数 |
-| 12 | `ORBMDK_TPIU_Decoder.*` | `frameLen` 判定与 `GetPacket` 条件互相矛盾；`PAYLOAD` 中遇到帧起始会静默丢弃上一包 | 重写状态机，新增显式 `packetReady` 标志；`GetPacket` 只检查该标志；未取走的包计入 `stats.overflow` |
-| 13 | `ORBMDK_COBS.cpp` | `partialFrame` 存的是**编码后原始字节**而非解码结果；`DRAINING` 后未清空 `partialFrame` | 按 orbuculum `cobs.c` 实现真正的 COBS 解码（剥离块长度、还原被替换的 `0x00`）；新增 `frameReady` 标志，错误帧只排水不交付；每帧交付后复位状态 |
+原 4.3 记录的是 ITM / ETM / TPIU / COBS 解码器的修复（#10–#13）。这些模块**已全部删除**
+（见 §二十二），本层不再含任何解码器，该表不再维护。
 
 ### 4.4 SWD 初始化根因（NO_ACK）
 
@@ -678,7 +682,7 @@ AGDI 于是读到它自己栈上的残留值（>0）→ 认为有设备 → 显�
 
 **教训（升级版）**：§4.6 #18 曾宣称"全部带标量输出参数的接口已统一为先写后判"，
 但 §4.11、§4.13 又各查出一批漏网。这类问题**无法靠抽样确认**，需对着
-`ORBMDK_RDDI.h` 的 78 个导出逐个核对"是否存在未写输出参数就返回的路径"。
+`ORBMDK_RDDI.h` 的 91 个导出逐个核对"是否存在未写输出参数就返回的路径"。
 
 **建议**：单独做一轮全量复核 —— 可写静态检查脚本，对每个含指针出参的导出，
 确认其每条 `return` 路径之前都已写过该出参。
@@ -798,16 +802,15 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 | 文件 | 作用 |
 |------|------|
 | `bin/ORBMDK_RDDI.dll` | 构建产物（**x86**；部署时重命名为 AGDI 层实际加载的名字：Keil "CMSIS-DAP Debugger" 为 `CMSIS_DAP.dll`） |
-| `include/ORBMDK_RDDI.h` | RDDI 接口声明（78 个导出） |
+| `include/ORBMDK_RDDI.h` | RDDI 接口声明（91 个导出） |
 | `include/ORBMDK_HID.h` | HID 层声明 |
-| `include/ORBMDK.h` | 版本信息、ORBTrace VID/PID 统一常量 |
+| `include/ORBMDK_OrbTrace.h` | orbtrace vendor 接口（Power 0x50 / Trace 0x54 / Version 0x56）声明 |
+| `include/ORBMDK.h` | 版本信息、设备 VID/PID 表与品牌串（`ORBMDK_DEVICE_VENDOR/PRODUCT`） |
 | `src/ORBMDK_RDDI.cpp` | RDDI 实现（核心） |
 | `src/ORBMDK_HID.cpp` | HID 通信层 + DAP 命令封装 |
 | `src/ORBMDK_USB_Bulk.cpp` | USB Bulk V2 传输层 |
-| `src/ORBMDK_ITM_Decoder.cpp` | ITM 解码器 |
-| `src/ORBMDK_ETM_Decoder.cpp` | ETM 解码器 |
-| `src/ORBMDK_TPIU_Decoder.cpp` | TPIU 解码器 |
-| `src/ORBMDK_COBS.cpp` | COBS 解码 |
+| `src/ORBMDK_OrbTrace.cpp` | trace 通路：WinUSB 句柄 + 后台读线程 + 环形缓冲（只搬 raw 字节） |
+| `src/ORBMDK_Log.cpp` | 统一日志实现 |
 | `build.ps1` | 编译脚本（自动探测 VS2017+/MSVC/SDK，固定 **x86**，Keil 为 32 位进程，必须 x86）；`-Deploy` / `-DeployOnly` 兼做部署（复制 `bin\ORBMDK_RDDI.dll` 覆盖 Keil 的 `CMSIS_DAP.dll`，自动定位 `ARM\BIN` 并备份原件），原 `deploy.ps1` 已并入 |
 | `test/build_test.ps1` | 测试构建脚本（同为 x86） |
 | `test/ORBMDK_RDDI_FullTest.cpp` | 实机功能测试（40 项） |
@@ -824,7 +827,7 @@ ORBTrace `dbgIF.v CMD_PINS_WRITE` 的逆向记录。旧实现用的是 `0x20`。
 
 | 文件 | 原硬编码内容 | 现状 |
 |------|--------------|------|
-| `test/ORBMDK_RDDI_Test.cpp` | `"c:\\Users\\234896\\Desktop\\orbmdk\\ORBMDK\\bin\\ORBMDK_RDDI.dll"` | ✅ |
+| `test/ORBMDK_RDDI_Test.cpp` | `"<仓库根>\\bin\\ORBMDK_RDDI.dll"`（当时写死为本机绝对路径） | ✅ |
 | `test/ORBMDK_RDDI_FullTest.cpp` | 同上 | ✅ |
 | `test/orbprobe.cpp` / `orbprobe2.cpp` / `orbprobe3.cpp` | 同上 | ✅ |
 | `test/ORBMDK_BlockTransferTest.cpp` | 同上 | ✅ |
@@ -1847,8 +1850,13 @@ return -2;                         // …随后 _closeWinUSB() 里 WinUsb_Free +
 | `DAP_RegReadBlock` / `DAP_RegWriteBlock` | 按"同一寄存器重复 N 次"调用 | `(h, DAP_ID, numRegs, const int *regIDArray, dataArr)` | `dataArray` 收到字面量 `4` → AV |
 | `DAP_Target` | `(h, int, int*)` | `(h, const char*, char*, int)` | 未被调用，仅预防 |
 
-已按真实签名修正（崩溃消失）。**剩余两类失败**（`DAP_REG_*` 常量陈旧 → 当前
-`PASSED 22 / FAILED 20` 不再是 40/40；目标未上电致 AP FAULT）**已迁至 `Todo.md` §18.11。**
+已按真实签名修正（崩溃消失）。其中**`DAP_REG_*` 常量陈旧**导致的 `PASSED 22 / FAILED 20`
+已于 **2026-10-10 修复**：`include/ORBMDK_RDDI.h` 的枚举改回 ARM `rddi_dap.h` 的 **0..7 编号**
+（原按"字节偏移 + AP 恒带 RnW"写 —— `DAP_REG_DP_CTRL_STAT=0x04`、`DAP_REG_AP_CSW=0x10000`、
+`DAP_REG_MATCH_RETRY=0x30000` …，与 `GetRegId()` 的低 16 位解码不符；权威对照见 **§4.9**），
+`ORBMDK_RDDI_FullTest` 随之复现 `PASSED 37 / FAILED 0 / NOT IMPLEMENTED 3`
+（3 项 SWO 因探针自报 caps 无 SWO 位而跳过）→ 原 `Todo.md` §18.11 结案。
+另一类"目标未上电致 AP FAULT"属目标侧现象，非本层缺陷。
 
 > 复现崩溃定位的方法：`cdb` + `link /MAP`（见 §10）：
 > `cdb -g -G -c "g; .ecxr; kb; q" bin\ORBMDK_RDDI_FullTest.exe`
@@ -2547,7 +2555,7 @@ sink 名 `cmsis_dap_swo_trace`）。**没有** ETM/ETB/并口采集 API
 0x1003BA74  E8 54 0B 01 00   call GetDlgItem
 0x1003BA7F  6A 00 6A 04 68 4E 01 00 00 FF 70 20 FF D7
                             ; SendMessageA(hwnd, CB_SETCURSEL(0x14E), 4, 0) ⇒ 强制选中 index 4
-                            ;   (= “Serial Wire Output - UART/NRZ”)
+                            ;   (= "Serial Wire Output - UART/NRZ")
 0x1003BA8D  6A 00            push 0            ; ★ 再次硬禁用
 0x1003BA8F  68 56 04 00 00   push 0x456
 0x1003BA9D  E8 BD 0A 01 00   call EnableWindow ; EnableWindow(combo, FALSE)
@@ -2662,6 +2670,39 @@ Trace=Off;TraceBaudrate=0;TraceTransport=None;
   要么让探针自报 `0x04/0x08`，要么**本层不再按 `probeCaps` 收口**（= 主动宣称 SWO 能力）。
   这是一次**口径决策**，不是 bug —— 见 `Todo.md` §5 T1。
 - ETB / ETM 方向建议**结案**：不是 RDDI 层能补的洞，AGDI 侧连配置串模板都不存在。
+
+#### (9) ⭐ 分层定论：ETM/ETB 解码**不属本层**；自研 AGDI 已补 ETB（2026-10-08 新增）
+
+**问**："既然 §17.9(8.2) 说 ETB 是死路，那 ETM/ETB 到底该在哪一层做？本层（RDDI）能不能做 ETM 解码？"
+
+**答：不能 —— ETM 解码不属本层。**
+
+1. **本层没有 ETM/ETB 采集通路**（§17.9(4) 硬证据 D）：对外 trace 导出只有
+   `CMSIS_DAP_SWO_*` 与 `StreamingTrace_*`（SWO），**无 ETM/ETB/并口 API**。
+2. **ETM 数据的来源都不经本层**：
+   - 并行 Trace Port 需探针硬件采集 —— CMSIS-DAP 探针**无此能力**（本层只支持 SWO）；
+   - ETB 是 **MEM-AP 读 RAM**，属"调试会话"语义，由 AGDI 层发起；本层只提供
+     `DAP_*`/MEM-AP 原语，**不感知 trace 语义**。
+3. **本层内的解码器已全部移除**（2026-10-08）：原 `ORBMDK_ITM_Decoder` /
+   `ORBMDK_ETM_Decoder` / `ORBMDK_TPIU_Decoder` / `ORBMDK_Trace` / `ORBMDK_OFLOW` /
+   `ORBMDK_COBS` / `ORBMDK_Coverage` / `ORBMDK_Symbols` 已删除（它们本就未接通：
+   ETM 回调为 `nullptr`、`ORBMDK_Trace_Create/Pump` 无调用者）。本层从此只做传输，
+   详见 **§二十二**。
+
+**⚠️ 对 §17.9(8.2) 的边界修正**：那里"ETB 是死路"的结论**只对原厂 `CMSIS_AGDI.dll`** 成立
+（它没有 ETB 配置串模板、编码器只认 UART/Manchester）。**自研 AGDI 层（姊妹工程 ORBAGDI）
+可自行补通路**：
+
+- **ORBAGDI 已实现 ETB 采集**（`ORBAGDI_Etb.cpp`）：CoreSight ROM 表定位 ETB/TMC →
+  配置/激活 → `RD_DATA` 端口非自增读回 → formatter 解帧 → 复用 ITM 解码器；
+  驱动选项 `etb=1`。**ETB 通路不经本层**，本层无需改动。
+- **ETM 解码应放 AGDI 层**（ORBAGDI），参照 orbuculum `traceDecoder_etm35/etm4`；
+  真正的缺口是 **uVision Trace 窗口上报通道**（`DbgCM/TraceWinConnect` + `Trace.cpp`，
+  UVSOCK），而非解码器本身。
+
+⇒ **本层（RDDI）对 ETM/ETB 的立场**：**不做、也不需要做**。ETB 走 MEM-AP（AGDI 层），
+ETM 解码是纯软件（AGDI 层），上报走 AGDI↔uVision 的 UVSOCK。详见 ORBAGDI
+`COMPAT_ANALYSIS.md` §8 与 `bug.md` §H。
 
 复核命令：
 `python tools/pe_re.py dis "<KeilRoot>\ARM\BIN\CMSIS_AGDI.dll" 0x1003B2A0 0x100`（`0x44D` 四条件门控）
@@ -2942,18 +2983,19 @@ DP/AP 访问由本层用 `JTAG_Sequence` 自己实现（IR=0xA/0xB + 35 位 DR +
 |---|------|------|----------|
 | V1 | `src/ORBMDK_Log.cpp:60, 174, 191` | `snprintf` / `vsnprintf`（C99） | VS2015+（VS2013 无） |
 | V2 | `src/ORBMDK_HID.cpp:270,278,279,329,360,369,444,1025,1081,1092,1106,1121,1453`、`src/ORBMDK_USB_Bulk.cpp:1334` | `%zu` | UCRT，VS2015+ |
-| V3 | `src/ORBMDK_RDDI.cpp:787,898,906,2460,2469,3464,3471,3476`、`src/ORBMDK_Coverage.cpp:648-915`、`test/` 5 个文件 | `%llu`（**均配 `(unsigned long long)` 转换，类型正确**） | VS2015+ |
+| V3 | `src/ORBMDK_RDDI.cpp:787,898,906,2460,2469,3464,3471,3476`、`test/` 5 个文件 | `%llu`（**均配 `(unsigned long long)` 转换，类型正确**） | VS2015+ |
 | V4 | `src/pch.h`（`<shared_mutex>`/`<thread>`/`<atomic>`）、`ORBMDK_HID.cpp:122,1924`、`ORBMDK_USB_Bulk.cpp:107,1719` | `std::shared_mutex` / `std::thread` | VS2015 Update 2+ |
-| V5 | `include/ORBMDK_ITM_Decoder.h:10-11`、`ORBMDK_ETM_Decoder.h:10-11`、`ORBMDK_TPIU_Decoder.h:10-11` | `<cstdbool>` | C++17 已弃用、**C++20 被移除**；现 `/std:c++17` 安全，改 `c++20` 需先换掉 |
+| ~~V5~~ | ~~`include/ORBMDK_ITM_Decoder.h` 等~~ | ~~`<cstdbool>`~~ | **已消失**：相关头文件随解码器删除（§二十二） |
 
-> 两个构建脚本都声明 VS2017+，V1–V4 全部满足。真正的风险点是 **V5**：把 `/std:c++17` 改成 `c++20` 会先在这里爆。
+> 两个构建脚本都声明 VS2017+，V1–V4 全部满足。
+> 原 V5（`<cstdbool>` 在 C++20 被移除）已随解码器头文件删除而消失。
 
 ### 19.4 构建开关依赖（不加也能编，但结果不对或刷警告）
 
 | # | 开关 | 位置 | 不加会怎样 |
 |---|------|------|-----------|
 | F1 | `/utf-8` | `build.ps1:142`、`test/build_test.ps1:146` | 源码含大量中文注释/字符串；中文代码页下 MSVC 报 **C4819** 且日志串乱码 —— 最容易被"换个 IDE / 换个脚本"弄丢的开关 |
-| F2 | `/D_CRT_SECURE_NO_WARNINGS` | 仅在 `build.ps1:145`；**源码内未定义** | `fopen`/`strcpy`/`strcat`/`sscanf`（`ORBMDK_Symbols.cpp:212,410,805,806,955`、`ORBMDK_Coverage.cpp:636,701,805`）报 C4996；若再加 `/WX` 直接失败 |
+| F2 | `/D_CRT_SECURE_NO_WARNINGS` | 仅在 `build.ps1:145`；**源码内未定义** | `fopen`/`strcpy`/`strcat`/`sscanf`（现仅剩 `src/ORBMDK_HID.cpp` / `ORBMDK_USB_Bulk.cpp` / `ORBMDK_RDDI.cpp` 内少量调用）报 C4996；若再加 `/WX` 直接失败 |
 | F3 | `/EHsc` | 两个脚本 | 异常语义不定 |
 | F4 | `/MD`（测试 exe）vs `/MT`（DLL） | `build_test.ps1:146` vs `build.ps1:142` | 当前安全（纯 C ABI、缓冲区由调用方给）；**不可跨边界传堆指针/STL 对象** |
 
@@ -3062,7 +3104,7 @@ orbtrace 上 `swdprobe` 从 **19/0** 变成 **14/5**，失败形态高度一致�
 
 ### 21.1 实测（orbtrace / 目标 Cortex-M4（STM32F407RET6）/ 4 KB 缓冲 / 4~8 轮）
 
-> **笔误更正**：本节标题原写“目标 Cortex-M0+”。实测 CPUID `0x410FC241`，PartNo（bit[15:4]）`0xC24`
+> **笔误更正**：本节标题原写"目标 Cortex-M0+"。实测 CPUID `0x410FC241`，PartNo（bit[15:4]）`0xC24`
 > = **Cortex-M4** r0p1，与 **STM32F407RET6**（192 KB SRAM）一致；DP IDCODE `0x2BA01477` 亦相符。
 > 下表数据采自同一块板、同一台探针。
 > **后续**：4 KB 缓冲**正好等于该链的 TAR 自增块**（见 §21.5 与 `bug.md` B7）；改用 **32 KB** 重测的
@@ -3240,3 +3282,191 @@ bin\ORBMDK_RAM_SpeedTest.exe 0x20000000 4096 4 10000000     # ~582 / 631 kB/s
 >   AGDI / 目标侧的时间。`window wall` 与 `meter segment` 现在直接把它打出来了。
 > - 需要传输层的详细枚举/标定过程（`[BULK]` 行）时，阈值要放到 **1(INFO) 或 0(DEBUG)** ——
 >   `ORBMDK_LogTrace` 按 INFO 级过滤，阈值 2 会把 `[BULK]` 全部丢掉。
+
+## 二十二、⭐ 解码器移出本层：RDDI 只做传输（2026-10-08）
+
+**背景**：本层定位明确为 **AGDI 层的 RDDI 传输层** —— 统一管理 USB HID(V1) / WinUSB Bulk(V2)，
+只提供 `DAP_*` / `CMSIS_DAP_*` / `StreamingTrace_*` / `RDDI_*` 这些"接口 + 搬运"能力。
+trace **解码**（ITM / ETM / TPIU / …）不属本层。
+
+**做了什么**：
+
+| 项 | 内容 |
+|---|---|
+| 删除模块 | `ORBMDK_ITM_Decoder.*`、`ORBMDK_ETM_Decoder.*`、`ORBMDK_TPIU_Decoder.*`、`ORBMDK_Trace.*`、`ORBMDK_OFLOW.*`、`ORBMDK_COBS.*`、`ORBMDK_Coverage.*`、`ORBMDK_Symbols.*`（共 16 个文件） |
+| 构建 | `build.ps1` 的 `$Sources` 从 14 项减到 6 项 |
+| `pch.h` | 去掉 `ORBMDK_Trace.h` / `ORBMDK_COBS.h` / `ORBMDK_OFLOW.h` 的包含 |
+| `ORBMDK_RDDI.cpp` | 去掉 ITM / Trace 包含；删除只服务 PC 采样的 4 个静态函数（`_initITMDecoder` / `_fetchPCSamplesFromTrace` / `_processTraceData` / `_readTraceFromUSB`）与 `itmDecoder` 字段 |
+| 品牌串 | 6 处字面量集中到 `ORBMDK.h` 的 `ORBMDK_DEVICE_VENDOR` / `ORBMDK_DEVICE_PRODUCT` |
+
+**为什么可以删**（引用关系已逐一核实）：
+
+- 8 个模块里**只有 ITM 解码器**被 RDDI 使用，且仅用于 `CMSIS_DAP_PC_*`；
+- 该 PC 采样链中 `_fetchPCSamplesFromTrace` **全工程无调用点**（死代码）；
+- ETM / TPIU / Trace / OFLOW / COBS / Coverage / Symbols **没有任何调用者**；
+- 测试（`test/*.cpp`）不引用任何解码器符号。
+
+**兼容性**：移除解码器**不动**当时的导出面（仍为 **79 个**：`CMSIS_DAP_*` / `DAP_*` / `RDDI_*` /
+`StreamingTrace_*` 全部保留）。随后 §二十三 落地 12 个新导出，导出面现为 **91 个**。
+`CMSIS_DAP_PC_*` 保留（ABI 兼容），只是不再本地解码 —— 原路径本就抽不到采样值
+（行为变化记录见 `bug.md` **B14**）。
+解码的**正确归属是 AGDI 层**：ORBAGDI 已有 ITM 解码器，ETM 已移植
+（见 ORBAGDI 的 `COMPAT_ANALYSIS.md` §8 与 `bug.md` §H）。
+
+**顺带修的既有问题**（与本次清理无关，但挡住了构建验证）：`ORBMDK_HID.cpp` 用了
+`HIDP_BUTTON_CAPS::ReportCount`，该成员只在较新的 Windows SDK 里有；本机 SDK 10.0.17763
+的 `hidpi.h` 此结构只有 `Reserved[10]`，编译失败。已改为按 Usage 范围推导按钮位数
+（`IsRange ? UsageMax-UsageMin+1 : 1`），跨 SDK 可编译。
+
+**设备识别与硬编码**：识别本就按**能力特征**（接口类 0xFF + Bulk 对 / UsagePage 0xFF00 +
+`DAP_Info` 应答），VID/PID 表（`ORBMDK.h`）只决定优先级 ⇒ 接入其他厂商的 CMSIS-DAP / trace
+探针**无需改代码**。
+
+显示名（`DAP_Connect` 的实现者/描述、`CMSIS_DAP_Identify` 厂商串、`CMSIS_DAP_GetGUID` 前缀、
+`CMSIS_DAP_V2_GetInfo` 的产品/厂商串）改为**优先用设备自报串**：
+
+- 厂商：`DAP_Info(0x01)`（`RDDI_Open` 时缓存进 `ctx->vendorName`）；
+- 产品：HID 产品串 / Bulk 接口串（已缓存 `ctx->productName`）；
+- 问不到才回落 `ORBMDK.h` 的 `ORBMDK_DEVICE_VENDOR` / `ORBMDK_DEVICE_PRODUCT`。
+
+⇒ 接其他厂商探针时显示名自动跟随，连宏都不必改。
+
+**验证**：`build.ps1` 通过，产出 `bin\ORBMDK_RDDI.dll`；`pe_re.py exports` 复核导出面未减
+（当时 79 个；§二十三 落地后为 91 个）。
+
+---
+
+## 二十三、⭐ orbtrace 的 trace 流暴露给 AGDI 层（`OrbTrace_*` / `TraceStream_*`，2026-10-08 起）
+
+**需求**：USB 必须由本层（RDDI）**统一管理**；AGDI 层需要一条**稳定的 raw trace 字节流**
+（orbtrace 的 trace 端点），自行解码。与现有 SWO 通路并列、互不影响。
+
+**参考**：orbuculum 的 `Src/orbtraceIf.c`（设备 / 端点 / 控制请求）、`Src/oflow.c` 与
+`Inc/cobs.h`（OFLOW v1.0 帧格式）。
+
+**定稿口径（2026-10-14）**：本层只做 **"配置 + 搬运"** —— 交出 **raw USB 字节**，
+**不做 OFLOW/COBS 解帧**（与 §二十二 一致：解帧属 trace 语义的前置步骤，归 AGDI 层），
+也不做任何 trace 语义解码。下文 §23.2 / §23.3 的帧格式与解帧职责是**给 AGDI 层的规格说明**。
+
+### 23.1 orbtrace 的 trace 端点（来自 orbuculum）
+
+- 独立 USB 接口：`bInterfaceClass = 0xFF`、`bInterfaceSubClass = 0x54`、
+  `bInterfaceProtocol ∈ { 0x00 未知, 0x01 TPIU raw, 0x10 OFLOW v1.0 }`、`bNumEndpoints = 1`
+  （一个 **bulk IN**）。
+- 控制请求（vendor，`bRequestType = 0x41`，`wIndex` = trace 接口号）：
+  | bRequest | 名 | wValue |
+  |---|---|---|
+  | 1 | `RQ_SET_TWIDTH` | 并口宽度：`1/2/3`（1/2/4-bit）；SWO 模式用 `(isMANCH?0x10:0x12) \| (useTPIU?0x01:0)` |
+  | 2 | `RQ_SET_SPEED` | SWO 波特率相关 |
+- 数据：`bInterfaceProtocol == 0x10` 时为 **OFLOW v1.0** 帧；`0x01` 时为裸 TPIU 流。
+
+### 23.2 OFLOW v1.0 帧（来自 orbuculum `oflow.c` / `cobs.h`）
+
+USB 上先经 **COBS** 编码（`0x00` 为帧分隔符，`COBS_FRONTMATTER = 10`，单帧上限 4096），
+解出后的结构：
+
+```
++------+----------------------------+-------+
+| tag  | payload (len-2 bytes)      | sum   |
++------+----------------------------+-------+
+  1B               N                    1B
+```
+
+- `sum` = `tag` 与 payload 逐字节求和（校验；不匹配则丢帧并计数）。
+- `tag` 指示 payload 属于哪一路（ITM / ETM / …），**由 AGDI 层解释** —— 本层不解释。
+- 高精度（hires）模式按"簇"打时间戳，`OFLOW_TS_RESOLUTION = 1e9`（1 ns）。
+
+### 23.3 分层职责（定稿）
+
+```
+orbtrace ──USB bulk IN──▶ RDDI（本层）
+                          ├─ 打开 / 配置 trace 接口（vendor 控制请求）
+                          ├─ 后台读线程 → 环形缓冲（不解析、不解帧）
+                          └─ 交出 raw USB 字节流（TraceStream_Read）
+                                   │
+                                   ▼
+                          AGDI 层：COBS 解帧 + OFLOW 校验 + ITM / ETM / TPIU 语义解码 → uVision
+```
+
+**为什么解帧也归 AGDI**：本层定位是"USB 的统一管理者"，交出去的东西越接近线缆越好（raw 字节）；
+丢数据只用 `TraceStream_DroppedBytes` 量化。§二十二 已把 OFLOW/COBS 从本层移除，此处**不重新引入**
+—— 同一个帧格式不在两处各留一份实现。
+
+### 23.4 导出清单（`ORBMDK_RDDI.h`）—— 规划 vs 落地
+
+```c
+// ⚠️ 未落地（可用性改由 OrbTrace_Available 提供）：
+// 设备是否提供 orbtrace trace 端点（未打开也能问）。*available: 1/0。
+// RDDI_FUNC int TraceStream_Available(const RDDIHandle handle, int* available);
+
+// 打开 trace 端点并开始采集。config 形如
+//   "width=4;swo=uart;baud=2000000"   或   "raw=1"（跳过 OFLOW，交裸 TPIU 流）
+// 可为 NULL（用默认：宽度 4、OFLOW 优先）。
+RDDI_FUNC int TraceStream_Open(const RDDIHandle handle, const char* config);
+
+// 停止并关闭 trace 端点。
+RDDI_FUNC int TraceStream_Close(const RDDIHandle handle);
+
+// 读一批 raw trace 字节（本层不解帧；帧同步由 AGDI 侧做）。
+//   *numBytes: [in] 缓冲容量, [out] 实际字节数
+//   timeoutMs: 0 = 非阻塞; <0 = 阻塞到有数据
+//   返回 0 = 有数据; 0x204 = 本轮无数据（与 StreamingTrace_WaitForEvent 同口径）; 其他 = 错误
+RDDI_FUNC int TraceStream_Read(const RDDIHandle handle, int* numBytes, void* buffer, int timeoutMs);
+
+// 状态：*count = 已打开(0/1)；*status 位标志（描述**设备能力**，不是错误位）
+//   bit0 已打开 / bit1 trace 接口支持 OFLOW v1.0 / bit2 有 power 接口
+RDDI_FUNC int TraceStream_Status(const RDDIHandle handle, int* count, int* status);
+
+// 内部环形缓冲溢出丢掉的字节数（累计；Open 时清零）。
+// 少了的那部分字节既可能是探针没发、也可能是本层环满丢的，两者要分开才能定位，
+// 所以给一个显式的累计量，而不是塞进 Status 的位标志（那几位是设备能力）。
+RDDI_FUNC int TraceStream_DroppedBytes(const RDDIHandle handle, unsigned long long* dropped);
+
+// ⚠️ 未落地（运行中改配置改由 OrbTrace_SetTraceWidth / OrbTrace_SetTraceSWO /
+// OrbTrace_SetSWOBaudrate 三者提供）：
+// 运行中改配置（宽度 / SWO / 波特率），等价 orbuculum 的三个 Set*。
+// RDDI_FUNC int TraceStream_Configure(const RDDIHandle handle, const char* config);
+```
+
+**兼容性**：全部为**新增**导出，不动既有 79 个（`CMSIS_DAP_*` / `DAP_*` / `RDDI_*` /
+`StreamingTrace_*`），落地后导出面 **91**。AGDI 侧按名字 `GetProcAddress` **可选加载**，
+缺失即视为"无此能力"。
+
+### 23.5 实现要点
+
+1. **USB 层**（落地为新增的 `src/ORBMDK_OrbTrace.cpp`）：按 WinUSB 接口 GUID 枚举，
+   逐个 `WinUsb_Initialize` + `WinUsb_QueryInterfaceSettings` 找 `Class 0xFF /
+   SubClass 0x50 / 0x54 / 0x56` 的接口；与 DAP 接口**并存**（独立句柄，互不干扰）。
+2. **解帧**：**不在本层**（定稿口径见 §23.3）—— 本层交 raw 字节，COBS 解码与 tag/sum 校验
+   由 AGDI 侧按 §23.2 自行完成。
+3. **读线程 / 缓冲**：USB 读取与 AGDI 的 `TraceStream_Read` 解耦（内部环形缓冲 + 事件 / 超时），
+   避免 AGDI 阻塞在 USB 上。
+4. **失败语义**：无 trace 端点 / 打不开 / 设备拔出时 `Open` 返回非 0、`Read` 返回错误码，
+   **不影响 DAP 通路**。
+
+**状态（2026-10-14）**：**配置 + 读通路已实现**（交 raw 字节），导出面 79 → **91**
+（2026-10-13 补 `TraceStream_DroppedBytes`，原 90）。
+
+| 落地项 | 位置 |
+|---|---|
+| orbtrace 模块（设备 / 接口发现 + 控制请求 + raw 读） | 新增 `include/ORBMDK_OrbTrace.h`、`src/ORBMDK_OrbTrace.cpp` |
+| RDDI 导出（7 个配置 + 5 个流） | `src/ORBMDK_RDDI.cpp`、`include/ORBMDK_RDDI.h` |
+| 构建 | `build.ps1` 加入 `ORBMDK_OrbTrace.cpp`（共 7 个源文件） |
+
+已实现的配置动作（对应 orbuculum `OrbtraceIfSet*`）：
+
+| 导出 | 对应 orbuculum | 说明 |
+|---|---|---|
+| `OrbTrace_Available` | `OrbtraceIfGetDeviceList` | 是否找到 orbtrace（按 VID/PID：`1209:3443` / `1209:3442`） |
+| `OrbTrace_GetInfo` | `OrbtraceIfGet*` | 产品 / 序列号 / 版本串 / 三个接口号 / `supportsOFLOW` |
+| `OrbTrace_SetTraceWidth` | `OrbtraceIfSetTraceWidth` | 1/2/3（= 1/2/4-bit）；4 视作 3 |
+| `OrbTrace_SetTraceSWO` | `OrbtraceIfSetTraceSWO` | `(isMANCH?0x10:0x12)\|(useTPIU?1:0)` |
+| `OrbTrace_SetSWOBaudrate` | `OrbtraceIfSetSWOBaudrate` | 4 字节小端 |
+| `OrbTrace_SetVoltage` | `OrbtraceIfVoltage` | 900..5010 mV 校验 |
+| `OrbTrace_SetVoltageEnable` | `OrbtraceIfSetVoltageEn` | 通道可为 `CH_ALL` |
+
+**不在本层（定稿）**：OFLOW/COBS **解帧** —— `TraceStream_Read` 交 **raw USB 字节**，
+帧同步与 tag/sum 校验由 AGDI 层按 §23.2 自行完成（§二十二 已把 OFLOW/COBS 移出本层，不重新引入）。
+
+**⚠️ 未实机验证**（本机无 orbtrace + 目标板）：接口分类、控制请求、端点选择均按
+orbuculum 源码逐条对齐，但未在真实设备上跑过。

@@ -124,28 +124,65 @@ typedef struct _RDDI_DAP_CONN_DETAILS {
     char connectionDescription[160]; // 连接描述
 } RDDI_DAP_CONN_DETAILS;
 
+// ----------------------------------------------------------------------------
+// DAP 寄存器编号 —— 严格对齐 ARM rddi_dap.h
+// （原版拷贝见 elaphureLink-master/common/rddi_dap.h:128-144）。
+//
+//   regID 低 16 位 = 寄存器编号；bit16 = DAP_REG_RnW；bit17 = DAP_REG_WaitForValue。
+//     0..3  : DP 寄存器 A[3:2] = 0..3  (0x00 IDCODE/ABORT, 0x04 CTRL-STAT,
+//                                       0x08 SELECT/RESEND, 0x0C RDBUFF)
+//     4..7  : AP 寄存器 A[3:2] = 0..3  (0x00 CSW, 0x04 TAR, 0x08 BASE, 0x0C DRW)；
+//                                       AP bank 由调用方写 DP SELECT 决定
+//     8     : DP ABORT（写）
+//     9     : JTAG IDCODE（读 DP 0x00）
+//     10    : DAP IDR（读 DP 0x00）
+//     16/17 : MATCH_MASK / MATCH_RETRY（虚拟寄存器，不产生总线访问）
+//
+// ⚠️ 方向由**调用的函数**决定：DAP_ReadReg 即读、DAP_WriteReg 即写，不要再 | DAP_REG_RnW
+//    （RnW 在只读/只写函数里被忽略）。RnW / WaitForValue 只用于 DAP_RegAccessBlock。
+//
+// 历史问题：本枚举曾按"字节偏移 + AP 恒带 RnW"写（DP_CTRL_STAT=0x04、DP_SELECT=0x08、
+// AP_CSW=0x10000、MATCH_RETRY=0x30000 …），与实现 GetRegId()/GetRegOffset() 的
+// 低 16 位解码不符 —— 按它调用会取错寄存器（DP_CTRL_STAT 实际访问到 AP CSW、
+// DP_SELECT 落到 ABORT）。见 COMPAT_ANALYSIS.md §4.9 / §13.5、Todo.md §18.11。
+// ----------------------------------------------------------------------------
 enum {
-    DAP_REG_RnW           = 0x00010000,
-    DAP_REG_WaitForValue  = 0x00020000,
-    DAP_REG_MatchRetry    = 0x00030000,
-    DAP_REG_MatchMask     = 0x00040000,
+    DAP_REG_RnW           = 0x00010000,   // 读标志（DAP_RegAccessBlock 用）
+    DAP_REG_WaitForValue  = 0x00020000,   // 读并轮询等待匹配
 
-    DAP_REG_DP_IDCODE     = 0x00000000,
-    DAP_REG_DP_ABORT      = 0x00000000,
-    DAP_REG_DP_CTRL_STAT  = 0x00000004,
-    DAP_REG_DP_RESEND     = 0x00000008,
-    DAP_REG_DP_SELECT     = 0x00000008,
-    DAP_REG_DP_RDBUFF     = 0x0000000C,
+    DAP_REG_DP_0x0        = 0,            // IDCODE（读）/ ABORT（写）
+    DAP_REG_DP_0x4        = 1,            // CTRL/STAT
+    DAP_REG_DP_0x8        = 2,            // SELECT / RESEND
+    DAP_REG_DP_0xC        = 3,            // RDBUFF
 
-    DAP_REG_AP_CSW        = 0x00000000 | DAP_REG_RnW,
-    DAP_REG_AP_TAR        = 0x00000004 | DAP_REG_RnW,
-    DAP_REG_AP_DRW        = 0x0000000C | DAP_REG_RnW,
-    DAP_REG_AP_BASE       = 0x000000F8 | DAP_REG_RnW,
-    DAP_REG_AP_IDR        = 0x000000FC | DAP_REG_RnW,
+    DAP_REG_AP_0x0        = 4,            // CSW
+    DAP_REG_AP_0x4        = 5,            // TAR
+    DAP_REG_AP_0x8        = 6,            // BASE（APBANK=0xF 时为 ROM 表基址）
+    DAP_REG_AP_0xC        = 7,            // DRW（bank 0）/ IDR（APBANK=0xF）
 
-    DAP_REG_AP_CSW_WAIT   = DAP_REG_AP_CSW | DAP_REG_WaitForValue,
-    DAP_REG_AP_TAR_WAIT  = DAP_REG_AP_TAR | DAP_REG_WaitForValue,
-    DAP_REG_AP_DRW_WAIT  = DAP_REG_AP_DRW | DAP_REG_WaitForValue,
+    DAP_REG_DP_ABORT      = 8,
+    DAP_REG_JTAG_IDCODE   = 9,
+    DAP_REG_DAP_IDR       = 10,
+
+    DAP_REG_MATCH_MASK    = 16,
+    DAP_REG_MATCH_RETRY   = 17,
+
+    // 语义别名（值与上表相同）
+    DAP_REG_DP_IDCODE     = DAP_REG_DP_0x0,
+    DAP_REG_DP_CTRL_STAT  = DAP_REG_DP_0x4,
+    DAP_REG_DP_RESEND     = DAP_REG_DP_0x8,
+    DAP_REG_DP_SELECT     = DAP_REG_DP_0x8,
+    DAP_REG_DP_RDBUFF     = DAP_REG_DP_0xC,
+    DAP_REG_AP_CSW        = DAP_REG_AP_0x0,
+    DAP_REG_AP_TAR        = DAP_REG_AP_0x4,
+    DAP_REG_AP_BASE       = DAP_REG_AP_0x8,
+    DAP_REG_AP_DRW        = DAP_REG_AP_0xC,
+    DAP_REG_AP_IDR        = DAP_REG_AP_0xC,   // 读 IDR 前须先写 DP SELECT 选 APBANK=0xF
+
+    // DAP_RegAccessBlock 的"读并等待匹配"形式
+    DAP_REG_AP_CSW_WAIT   = DAP_REG_AP_0x0 | DAP_REG_RnW | DAP_REG_WaitForValue,
+    DAP_REG_AP_TAR_WAIT   = DAP_REG_AP_0x4 | DAP_REG_RnW | DAP_REG_WaitForValue,
+    DAP_REG_AP_DRW_WAIT   = DAP_REG_AP_0xC | DAP_REG_RnW | DAP_REG_WaitForValue,
 };
 
 enum {
@@ -297,6 +334,52 @@ RDDI_FUNC int StreamingTrace_GetSinkDetails(const RDDIHandle handle, int index, 
 // 下面两个 AGDI 从不调用（AGDI 内 0 处 call/jmp 引用），仅为导出完整性保留。
 RDDI_FUNC int StreamingTrace_GetConfigItem(const RDDIHandle handle, int item, int *value);
 RDDI_FUNC int StreamingTrace_SetConfigItem(const RDDIHandle handle, int item, int value);
+
+// ---------------------------------------------------------------------------
+// orbtrace 配置 + raw trace 流（2026-10-08 新增；见 COMPAT_ANALYSIS.md §二十三）
+//
+// 本层统一管理 USB：orbtrace 除 CMSIS-DAP 之外的三个 vendor 接口
+// （Trace 0x54 / Power 0x50 / Version 0x56）由本层打开与配置，AGDI 只取 raw
+// trace 字节流。全部为**新增**导出，不影响既有导出；AGDI 侧按名字可选加载，
+// 缺失即视为"无此能力"。
+// ---------------------------------------------------------------------------
+
+// 设备是否提供 orbtrace 接口。*available: 1/0。
+RDDI_FUNC int OrbTrace_Available(const RDDIHandle handle, int *available);
+
+// 取设备/接口信息（结构见 include/ORBMDK_OrbTrace.h 的 ORBMDK_OrbTrace_Info）。
+// size 传 sizeof(ORBMDK_OrbTrace_Info)。返回 0 成功。
+RDDI_FUNC int OrbTrace_GetInfo(const RDDIHandle handle, void *info, int size);
+
+// 配置 trace 源（对应 orbuculum 的 OrbtraceIfSet*）
+RDDI_FUNC int OrbTrace_SetTraceWidth(const RDDIHandle handle, int width);   // 1/2/3 (=1/2/4-bit)
+RDDI_FUNC int OrbTrace_SetTraceSWO(const RDDIHandle handle, int isManchester, int useTPIU);
+RDDI_FUNC int OrbTrace_SetSWOBaudrate(const RDDIHandle handle, int baud);   // Hz
+RDDI_FUNC int OrbTrace_SetVoltage(const RDDIHandle handle, int channel, int millivolts);
+RDDI_FUNC int OrbTrace_SetVoltageEnable(const RDDIHandle handle, int channel, int on);
+
+// 打开 / 关闭 trace 端点（Open 会先做设备探测）。config 可为 NULL。
+// config 选项串："width=4;swo=uart|manchester;tpui=0|1;baud=<Hz>"
+RDDI_FUNC int TraceStream_Open(const RDDIHandle handle, const char *config);
+RDDI_FUNC int TraceStream_Close(const RDDIHandle handle);
+
+// 读一批 raw trace 字节。
+//   *numBytes: [in] 缓冲容量, [out] 实际字节数
+//   timeoutMs: 0 = 非阻塞; <0 = 阻塞到有数据
+//   返回 0 = 有数据; 0x204 = 本轮无数据; 其他 = 错误
+RDDI_FUNC int TraceStream_Read(const RDDIHandle handle, int *numBytes, void *buffer, int timeoutMs);
+
+// *count = 是否已打开(0/1)；*status 位标志：bit0 已打开 / bit1 支持 OFLOW / bit2 有 power 接口
+RDDI_FUNC int TraceStream_Status(const RDDIHandle handle, int *count, int *status);
+
+// 内部环形缓冲溢出丢掉的字节数（累计；TraceStream_Open 时清零）。
+// 返回 0 = 成功。宿主没有这个导出时，AGDI 视为"本层不报丢帧"。
+//
+// 为什么必须单独一个导出：`TraceStream_Read` 只能告诉调用方"读到了多少字节"，
+// 少了的那部分既可能是探针没发、也可能是本层环满丢的 —— 两者要分开才能定位。
+// 溢出标志由 `TraceStream_Status` 的 status 位表达不了（那几位是设备能力，不是
+// 运行期计数），所以这里给一个显式的累计量。
+RDDI_FUNC int TraceStream_DroppedBytes(const RDDIHandle handle, unsigned long long *dropped);
 
 // RDDI 日志回调 —— 签名严格对齐 ARM rddi.h（返回值 void，共 4 个参数）
 RDDI_FUNC void RDDI_SetLogCallback(const RDDIHandle handle, RDDILogCallback pfn, void *context, int maxLogLevel);

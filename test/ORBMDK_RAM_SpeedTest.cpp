@@ -85,8 +85,9 @@ typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
  *     DAP_REG_AP_0x4 = 5 -> AP TAR
  *     DAP_REG_AP_0xC = 7 -> AP DRW
  *     DAP_REG_RnW    = 0x10000
- * (the same-named enum in ORBMDK_RDDI.h uses byte offsets and does NOT match
- *  the low-16-bit decoding of GetRegId() in ORBMDK_RDDI.cpp -- pass these IDs)
+ * 与 include/ORBMDK_RDDI.h 的 DAP_REG_* 现已一致 —— 该枚举早前误写成"字节偏移"，
+ * 与 GetRegId() 的低 16 位解码不符，已于 2026-10-10 按 ARM rddi_dap.h 修正
+ * （见 COMPAT_ANALYSIS.md §4.9 / Todo.md §18.11）。自带定义予以保留。
  * -------------------------------------------------------------------------- */
 #define RID_DP_CTRLSTAT 1
 #define RID_DP_SELECT   2

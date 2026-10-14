@@ -61,7 +61,7 @@
 // deprecated/ORBMDK_CMSIS_COMPAT.h # 不在 pch.h 中包含，避免与 ORBMDK_RDDI.h 冲突
 #include "../include/ORBMDK_DAPV2.h"
 #include "../include/ORBMDK_USB_Bulk.h"
-#include "../include/ORBMDK_Trace.h"
-#include "../include/ORBMDK_COBS.h"
-#include "../include/ORBMDK_OFLOW.h"
+// 说明：Trace 解码器（ITM / ETM / TPIU / Trace / OFLOW / COBS / Coverage / Symbols）
+// 已从本层移除 —— 本层只做 HID/WinUSB 传输 + RDDI 接口，解码归 AGDI 层
+// （见 COMPAT_ANALYSIS.md §17.9(9) 与 ORBAGDI/AGDI/COMPAT_ANALYSIS.md §8）。
 // deprecated/ORBMDK_AGDI_Trace.h   # AGDI Trace 由 elaphureLinkAGDI 提供

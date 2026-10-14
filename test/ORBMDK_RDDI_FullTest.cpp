@@ -300,9 +300,20 @@ int main(int argc, char* argv[]) {
     printf("Test 3: Host Status\n");
     printf("================================================================\n");
     
-    // NULL 数组应被拒绝（RDDI_BADARG = 0x0D），不能返回 0
-    TEST("CMSIS_DAP_GetDeviceIDList(NULL buffer) rejected",
-         pfn_CMSIS_DAP_GetDeviceIDList(handle, NULL, 0) != 0);
+    // NULL 数组应被拒绝（RDDI_BADARG），不能返回 0。
+    // ⚠ 这里**不能**用 TEST 宏：该宏只认 result == RDDI_SUCCESS，而本项恰恰期望**非 0**，
+    //   写成 TEST("...", expr != 0) 会把"正确拒绝"判成 FAIL（旧版即此误报）。
+    {
+        printf("  %-45s ", "CMSIS_DAP_GetDeviceIDList(NULL buffer) rejected");
+        const int rcNull = pfn_CMSIS_DAP_GetDeviceIDList(handle, NULL, 0);
+        if (rcNull != RDDI_SUCCESS) {
+            printf("PASS (result=%d)\n", rcNull);
+            g_Passed++;
+        } else {
+            printf("FAIL (result=%d)\n", rcNull);
+            g_Failed++;
+        }
+    }
     
     // =========================================================================
     // Test 4: SWD/SWJ Initialization (MUST be before register access!)
@@ -381,10 +392,19 @@ int main(int argc, char* argv[]) {
         }
         
         // 5.5 Read AP IDR (Access Port ID Register)
+        // AP IDR 在 AP 地址 0xFC：需先把 DP SELECT 的 APBANKSEL 置 0xF，
+        // 再读 AP reg3（regID 7 = DAP_REG_AP_0xC）；读完把 SELECT 恢复成 0。
+        // （本层只认 regID 0..7，不存在"0xFC 编号"，故必须靠 bank 选择到达 IDR。）
+        if (pfn_DAP_WriteReg) {
+            pfn_DAP_WriteReg(handle, 0, DAP_REG_DP_SELECT, 0x000000F0);
+        }
         TEST("DAP_ReadReg(AP_IDR)", pfn_DAP_ReadReg(handle, 0, DAP_REG_AP_IDR, &value));
         printf("    AP IDR: 0x%08X\n", value);
         if (value == 0 || value == 0xFFFFFFFF) {
             printf("    [WARNING] AP IDR invalid - check AP access!\n");
+        }
+        if (pfn_DAP_WriteReg) {
+            pfn_DAP_WriteReg(handle, 0, DAP_REG_DP_SELECT, 0x00000000);
         }
     }
     
@@ -435,21 +455,30 @@ int main(int argc, char* argv[]) {
     printf("Test 8: SWO Functions\n");
     printf("================================================================\n");
     
-    if (pfn_CMSIS_DAP_SWO_Control) {
-        TEST("CMSIS_DAP_SWO_Control(0)", pfn_CMSIS_DAP_SWO_Control(handle, 0));
-    }
-    
-    if (pfn_CMSIS_DAP_SWO_Baudrate) {
-        int swo_baud = 115200;   // 传地址，不是值
-        TEST("CMSIS_DAP_SWO_Baudrate(115200)", pfn_CMSIS_DAP_SWO_Baudrate(handle, &swo_baud));
-    }
-    
-    // 3 参：(handle, int *count, int *status)
-    int swo_count = 0;
-    int swo_status = 0;
-    if (pfn_CMSIS_DAP_SWO_Status) {
-        TEST("CMSIS_DAP_SWO_Status", pfn_CMSIS_DAP_SWO_Status(handle, &swo_count, &swo_status));
-        printf("    SWO Status: count=%d status=0x%02X\n", swo_count, swo_status);
+    // SWO 命令族（0x19/0x1A/0x1B）是**可选能力**：探针自报 caps 不含任何 SWO 位时，
+    // 它本就不实现这三条命令，应按"未实现"跳过 —— 否则会把设备能力缺口误报成驱动回归。
+    // （实测 QM-Link caps=0x31；orbtrace 1.4.3 同样无 SWO 命令族，见 bug.md B12。）
+    const int swoCaps = INFO_CAPS_SWO_UART | INFO_CAPS_SWO_MANCHESTER | INFO_CAPS_SWO_STREAMING_TRACE;
+    if ((caps & swoCaps) == 0) {
+        printf("  [SKIP] 探针未宣称 SWO 能力（caps=0x%X，无 SWO 位），SWO 三项跳过\n", caps);
+        g_NotImpl += 3;
+    } else {
+        if (pfn_CMSIS_DAP_SWO_Control) {
+            TEST("CMSIS_DAP_SWO_Control(0)", pfn_CMSIS_DAP_SWO_Control(handle, 0));
+        }
+
+        if (pfn_CMSIS_DAP_SWO_Baudrate) {
+            int swo_baud = 115200;   // 传地址，不是值
+            TEST("CMSIS_DAP_SWO_Baudrate(115200)", pfn_CMSIS_DAP_SWO_Baudrate(handle, &swo_baud));
+        }
+
+        // 3 参：(handle, int *count, int *status)
+        int swo_count = 0;
+        int swo_status = 0;
+        if (pfn_CMSIS_DAP_SWO_Status) {
+            TEST("CMSIS_DAP_SWO_Status", pfn_CMSIS_DAP_SWO_Status(handle, &swo_count, &swo_status));
+            printf("    SWO Status: count=%d status=0x%02X\n", swo_count, swo_status);
+        }
     }
 
     // =========================================================================

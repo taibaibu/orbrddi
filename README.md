@@ -1,3 +1,10 @@
+<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
+
+<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+
+<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+---
 # ORBMDK - ORBTrace CMSIS-DAP RDDI 驱动层
 
 ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，兼容 CMSIS—DAP 调试器能够作为标准 CMSIS-DAP 调试器用于 Keil uVision。
@@ -7,23 +14,25 @@ ORBMDK 提供 RDDI (Remote Debug Driver Interface) 接口，兼容 CMSIS—DAP �
 ```
 Keil uVision (IDE)
        │
-       ▼ (通过 KEIL AGDI)
+       ▼ (通过 KEIL AGDI: CMSIS_AGDI.dll)
    ORBMDK_RDDI.dll (RDDI 接口)
        │
        ▼
-   ORBMDK_RDDI       # RDDI 层实现
+   ORBMDK_RDDI (src/ORBMDK_RDDI.cpp)   # RDDI 层实现（唯一业务层）
        │
-       ├─ USB HID (V1) ──────→ ORBTrace 调试器
-       └─ USB Bulk (V2) ──────→ ORBTrace 调试器
-              │
-              ▼ (SWD/SWO)
-         ITM/ETM/SWO/TPIU
-              │
-              ▼ (Trace 解码)
-         独立解码器实现
-              │
-              ▼
-         Trace 数据输出
+       ├─ ORBMDK_HID.cpp      ── USB HID  (V1) DAP 通道 ──┐
+       ├─ ORBMDK_USB_Bulk.cpp ── USB Bulk (V2) DAP 通道 ──┼──→ ORBTrace 探针
+       └─ ORBMDK_OrbTrace.cpp ── vendor 接口（trace 通路）┘
+                                  Trace 0x54 / Power 0x50 / Version 0x56
+                                          │
+                                          ▼ (SWD / JTAG / SWO)
+                                  目标 MCU 的调试与 trace 字节流
+                                          │
+                                          ▼
+                       RDDI 接口 —— 本层到此为止（只搬运，不解码）
+                                          │
+                                          ▼
+                                AGDI 层（ORBAGDI）做协议与 trace 解码
 ```
 
 **注意**:
@@ -35,37 +44,23 @@ Keil uVision (IDE)
 ```
 ORBMDK/
 ├── include/                     # 头文件
-│   ├── ORBMDK.h                # 主头文件、版本信息、ORBTrace VID/PID
-│   ├── ORBMDK_COBS.h           # COBS 帧同步解码
-│   ├── ORBMDK_Coverage.h       # 代码覆盖率分析接口
+│   ├── ORBMDK.h                # 主头文件、版本信息、设备 VID/PID 与品牌串
 │   ├── ORBMDK_DAP.h            # CMSIS-DAP 协议定义
 │   ├── ORBMDK_DAPV2.h          # CMSIS-DAP V2 Bulk 协议定义
-│   ├── ORBMDK_ETM_Decoder.h    # ETM 解码器
 │   ├── ORBMDK_HID.h            # USB HID 层定义
-│   ├── ORBMDK_ITM_Decoder.h    # ITM 解码器
 │   ├── ORBMDK_Log.h            # 统一日志接口
-│   ├── ORBMDK_OFLOW.h          # OFLOW 时间戳协议解码
-│   ├── ORBMDK_RDDI.h           # RDDI 接口定义（78 个导出）
-│   ├── ORBMDK_Symbols.h        # 符号解析接口 (Objdump/DWARF)
-│   ├── ORBMDK_TPIU_Decoder.h   # TPIU 解码器
-│   ├── ORBMDK_Trace.h          # Trace 解码器定义
+│   ├── ORBMDK_OrbTrace.h       # orbtrace 配置接口（Trace/Power/Version 端点）
+│   ├── ORBMDK_RDDI.h           # RDDI 接口定义（91 个导出）
 │   └── ORBMDK_USB_Bulk.h       # USB Bulk V2 传输层定义
 ├── src/                         # 源代码
 │   ├── pch.h / pch.cpp         # 预编译头
 │   ├── ORBMDK_DLL.cpp          # DLL 入口点
-│   ├── ORBMDK_HID.cpp          # USB HID 通信层 + DAP 命令封装
-│   ├── ORBMDK_RDDI.cpp         # RDDI 实现（核心）
-│   ├── ORBMDK_USB_Bulk.cpp     # USB Bulk V2 传输层
-│   ├── ORBMDK_Trace.cpp        # Trace 解码器适配层
-│   ├── ORBMDK_ITM_Decoder.cpp  # ITM 解码器实现
+│   ├── ORBMDK_HID.cpp          # 传输层 V1：USB HID + DAP 命令封装
+│   ├── ORBMDK_RDDI.cpp         # RDDI 实现（核心；OrbTrace_* / TraceStream_* 在此薄包装）
 │   ├── ORBMDK_Log.cpp          # 统一日志实现（多 Sink / 级别热更新）
-│   ├── ORBMDK_ETM_Decoder.cpp  # ETM 解码器实现
-│   ├── ORBMDK_TPIU_Decoder.cpp # TPIU 解码器实现
-│   ├── ORBMDK_COBS.cpp         # COBS 编解码
-│   ├── ORBMDK_OFLOW.cpp        # OFLOW 协议解码
-│   ├── ORBMDK_Coverage.cpp     # 代码覆盖率分析
-│   └── ORBMDK_Symbols.cpp      # 符号解析实现
-├── obj/                         # 编译中间文件
+│   ├── ORBMDK_OrbTrace.cpp     # 传输层 trace 通路：独立 WinUSB 句柄 + 后台读线程 + 环形缓冲
+│   └── ORBMDK_USB_Bulk.cpp     # 传输层 V2：USB Bulk
+├── obj/                         # 编译中间文件（build.ps1 运行时生成）
 ├── test/                        # 测试 / 诊断工具（10 个 .cpp + 1 个构建脚本，清单见"验证"）
 │   ├── ORBMDK_RDDI_FullTest.cpp # 全面功能测试（40 项，含完整导出扫描）
 │   ├── ORBMDK_BlockTransferTest.cpp # 块传输提速 / 越界验证
@@ -93,8 +88,9 @@ ORBMDK/
 ├── bug.md                       # 实现细节 · 缺陷定性 · 排查笔记（JTAG 相关见 B9 / B11.8）
 ├── Todo.md                      # 未完成项（只列待办，不写实现细节）
 ├── PATCH_orbtrace-1.4.3_JTAG_fixes.txt  # 固件侧 JTAG 可选修复补丁（基于 orbtrace 1.4.3，含完整代码）
-├── Usage.md.bak                 # 历史快照（不参与构建 / 部署）
-└── Todo.md.bak                  # 历史快照（不参与构建 / 部署）
+├── Usage.md                     # 驱动的 API 使用手册（快速开始 + 各导出函数调用示例）
+├── Todo.md.bak                  # 历史快照（不参与构建 / 部署）
+└── LICENSE                      # BSD 2-Clause
 ```
 
 ### 文档导航
@@ -105,7 +101,7 @@ ORBMDK/
 | `COMPAT_ANALYSIS.md` | ABI 兼容性结论、历史现场记录 | 需要"为什么这么写"的依据 |
 | `bug.md` | 实现细节、缺陷定性、排查笔记（JTAG 相关见 B9 / B11.8） | 复现某现象、查根因 |
 | `Todo.md` | **只有未完成项** | 想知道还差什么 |
-| `Usage.md.bak` | 驱动的 API 使用手册（快速开始 + 各导出函数调用示例） | 想集成、或直接调本层 DLL 时 |
+| `Usage.md` | 驱动的 API 使用手册（快速开始 + 各导出函数调用示例） | 想集成、或直接调本层 DLL 时 |
 | `PATCH_orbtrace-1.4.3_JTAG_fixes.txt` | 探针固件（orbtrace 门级 Verilog + Amaranth）侧的可选改动 | 想让固件侧 JTAG 通路更完备时 |
 
 ## 构建
@@ -118,7 +114,8 @@ ORBMDK/
 
 输出文件：`bin\ORBMDK_RDDI.dll`（MSVC **x86**，无 error / 无 warning）
 
-构建脚本会自动探测工具链，无需手改路径：
+构建脚本会自动探测工具链，无需手改路径：VS 安装位置走 `vswhere`（再回落常见安装目录），
+VC 工具集与 Windows SDK 各取最高版本；链接用 `/MT` 静态 CRT，产物零运行库依赖。
 
 ## 安装
 
@@ -192,9 +189,13 @@ DAP_ReadReg(AP_IDR)       PASS   AP IDR: 0x24770011
 TEST SUMMARY: PASSED 40 / FAILED 0 / ALL TESTS PASSED
 ```
 
-> ⚠️ **当前复现结果是 `PASSED 22 / FAILED 20`**，原因是**测试程序自身**的 `DAP_REG_*` 常量与
-> `include/ORBMDK_DAP.h` 编号脱节，**不是驱动回归**（见 `COMPAT_ANALYSIS.md` §13.5）。
-> 该项已列为 0.5.0 **发版阻塞项** → `Todo.md` §**18.11**。
+> ✅ **2026-10-10 已修复**：此前退化为 `PASSED 22 / FAILED 20` 的根因是 `DAP_REG_*` 常量与
+> `rddi_dap.h` 编号语义不符 —— `include/ORBMDK_RDDI.h` 的枚举曾按"字节偏移 + AP 恒带 RnW"写
+> （`DAP_REG_DP_CTRL_STAT=0x04`、`DAP_REG_AP_CSW=0x10000`、`DAP_REG_MATCH_RETRY=0x30000` …），
+> 与实现 `GetRegId()` 的低 16 位解码不符，已按 ARM `rddi_dap.h` 改回 **0..7 编号**
+> （依据见 `COMPAT_ANALYSIS.md` §4.9 / §13.5；`Todo.md` §18.11 已结案）。
+> 当前在 **QM-Link CMSIS-DAP + Cortex-M4** 上复现为
+> `PASSED 37 / FAILED 0 / NOT IMPLEMENTED 3`（3 项 SWO 因探针自报 caps 无 SWO 位而跳过）。
 
 ---
 
@@ -333,24 +334,26 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - 内存读写（字节、半字、字、块）
 - 核心寄存器访问
 - 目标复位
-- **Trace 数据采集** (ITM/ETM/SWO/TPIU)
-- **PC 采样** (ETM/ITM PC Sampling) ✅ 已实现
+- **trace 字节流搬运**（SWO / orbtrace trace 端点；本层只搬运，不解码）
 
 > **断点 / 观察点 / Flash 编程**由上层 elaphureLinkAGDI 通过组合 `DAP_RegAccessBlock` /
 > `DAP_RegReadRepeat` / `DAP_RegWriteRepeat` 实现，不属于 ORBMDK（RDDI 层）的职责。
 
 ### RDDI 接口
 
-`ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **78 个**，按 `GetProcAddress` 导出：
+`ORBMDK_RDDI.h` 中带 `RDDI_FUNC` 的导出函数共 **91 个**，按 `GetProcAddress` 导出：
 
 | 分类 | 数量 |
 |------|------|
 | RDDI 核心（Open/Close/GetLastError） | 3 |
-| DAP 基础 + 寄存器 | 20 |
-| CMSIS_DAP_* | 30 |
+| DAP 基础 + 寄存器 | 21 |
+| CMSIS_DAP_* | 35 |
 | PC_*（PC 采样） | 6 |
 | StreamingTrace_* | 13 |
+| **OrbTrace_* / TraceStream_*（orbtrace 配置 + raw trace 流）** | **12** |
 | RDDI_SetLogCallback | 1 |
+
+> 合计以 `tools/pe_re.py exports` 为准（当前 **91** = 上表各项之和）。
 
 其中 elaphureLinkAGDI **实际只调用 15 个**：
 
@@ -363,115 +366,40 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 > 完整的调用点清单（文件:行 + 所在 AGDI 函数）见 [COMPAT_ANALYSIS.md 第二节](COMPAT_ANALYSIS.md)。
 > 其余导出（`StreamingTrace_*`、`CMSIS_DAP_SWO_*`、`CMSIS_DAP_JTAG_*`、`CMSIS_DAP_PC_*` 等）服务于其他宿主，不影响 Keil 调试链路。
 
-### Trace 功能
+### Trace 功能（只搬运，不解码）
 
-#### SWO (Serial Wire Output)
-| 模式 | 说明 |
-|------|------|
-| UART | 异步串行输出 (115200-921600 baud) |
-| Manchester | Manchester 编码同步输出 |
+本层**不内置任何 trace 解码器**（ITM / ETM / TPIU / SWO 解码均已移除，见
+[`COMPAT_ANALYSIS.md` §二十二](COMPAT_ANALYSIS.md)）。本层负责把 trace 字节流**搬**到 AGDI 层，
+解码由 AGDI 层完成。
 
-#### ITM (Instrumentation Trace Macrocell)
-- 32 个激励端口 (Port 0-31)
-- 时间戳支持
-- 支持 printf 调试
-
-#### ETM (Embedded Trace Macrocell)
-- 指令流跟踪（v3.5 基本可用；v4 部分 opcode 未实现）
-- 分支跟踪
-- 完整程序执行记录
-- **PC Sampling** - 程序计数器采样（硬件断点辅助）
-
-> ⚠️ ETM 解码器为骨架实现，`FuncReturn` / `ExceptionReturn` / `Prefix` 等分支尚未处理，需结合具体 ETM 配置与实机 trace 数据完善。
-
-**ETM v3.5 支持：**
-- A-SYNC 同步检测
-- ISYNC 指令同步
-- 分支地址编码 (8/11/19 位偏移)
-- 周期计数 (CYCCNT)
-- 上下文 ID 追踪
-- 异常入口/出口追踪
-
-**ETM v4.x 支持：**
-- 短地址编码 (IS0/IS1)
-- 长地址编码 (32/64-bit)
-- 原子指令序列
-- 条件分支
-- 函数返回
-- 异常追踪
-
-#### TPIU (Trace Port Interface Unit)
-- 并行 trace 端口 (1/2/4 bit)
-- SWO 模式输出
-- 可配置时钟分频
-
-### Trace 解码器 ✅
-
-独立实现的 trace 解码器，无需外部依赖：
-
-| 解码器 | 说明 | 状态 |
-|--------|------|------|
-| COBS | Consistent Overhead Byte Stuffing - 帧同步 | ✅ 完整（按 orbuculum 对齐） |
-| OFLOW | 带时间戳的 trace 数据流协议 | ✅ |
-| ITM | ITM 激励数据解码 (SW/HW/TS/GTS/XTN/NISYNC) | ✅ 状态机完整 |
-| ETM | ETM 指令流解码 (v3.5/v4.x) | ⚠️ v3.5 基本可用；v4 部分 opcode 未实现 |
-| SWO | SWO UART/Manchester 数据解码 | ✅ |
-| TPIU | 并行 trace 端口数据解析 | ✅ 状态机自洽 |
-
-**解码器特性：**
-
-- ITM: 支持 PC Sample、DWT 事件、软件 printf
-- ETM: 支持分支跟踪、周期计数、上下文切换
-- TPIU: 支持 Manchester/NRZ 异步解码
-- 所有解码器都提供统计信息
-
-### 代码覆盖率分析 ✅
-
-基于 ETM trace 数据实现完整的代码覆盖率统计：
-
-**覆盖数据类型：**
-
-| 类型 | 说明 |
-|------|------|
-| 指令执行记录 | 记录每个地址的执行计数 |
-| 分支覆盖分析 | 统计条件分支的执行情况 |
-| 函数调用追踪 | 记录函数调用关系和成本 |
-| 基本块覆盖 | 追踪代码块执行情况 |
-| 周期计数 | 记录指令执行周期数 |
-
-**报告格式：**
-
-| 格式 | 说明 |
-|------|------|
-| KCacheGrind | Callgrind 格式，用于可视化分析 |
-| 文本 | 简化文本报告 |
-| JSON | 结构化 JSON 输出 |
-| GCOV | GCC 覆盖率格式 |
-
-**分析维度：**
-
-- 指令覆盖率 (Instruction Coverage)
-- 分支覆盖率 (Branch Coverage)
-- 函数覆盖率 (Function Coverage)
-- 行覆盖率 (Line Coverage)
-
-### 符号解析 ✅
-
-支持两种模式解析 ELF/DWARF 符号信息：
-
-| 模式 | 依赖 | 特点 |
+| 通路 | 机制 | 状态 |
 |------|------|------|
-| Objdump 模式 | arm-none-eabi-objdump | 简单可靠 |
-| DWARF 模式 | libdwarf/libelf | 高性能，直接解析 |
+| SWO | CMSIS-DAP `DAP_SWO_*` 命令族（`CMSIS_DAP_SWO_*` 导出） | 已实现 |
+| orbtrace trace 端点 | **本层统一管理 USB**：复合设备上 `bInterfaceClass=0xFF` 的三个 vendor 接口按 `bInterfaceSubClass` 分（`0x50` Power / `0x54` Trace / `0x56` Version），与 DAP 句柄并存；trace 由后台读线程 + 环形缓冲搬运，raw 交付（`OrbTrace_*` / `TraceStream_*` 导出） | 配置与读通路已实现（未实机验证），见 §二十三 / [`Usage.md` §10](Usage.md) |
 
-**功能：**
+### Trace 解码器（已从本层移除，2026-10-08）
 
-- 地址 → 函数名/文件名/行号 查找
-- 汇编指令文本生成
-- 函数边界识别
-- 源码行映射
-- C++ 名称 demangling
-- 工具路径自动检测 (Keil/GCC)
+本层**只做传输**（USB HID / WinUSB Bulk + RDDI 接口），不再内置任何 trace 解码器。
+原八个模块已删除：
+
+| 原模块 | 去向 |
+|--------|------|
+| ITM / ETM / TPIU / Trace | 解码归 **AGDI 层**（ORBAGDI 已有 ITM；ETM 已移植） |
+| OFLOW / COBS | 本层不做解帧：交 raw 字节，帧同步与校验归 **AGDI 层**（§23.3 定稿） |
+| Coverage / Symbols | 依赖 ETM，随解码一起移出 |
+
+`CMSIS_DAP_PC_*` 导出**保留**（ABI 兼容），但不再在本地解码 PC 采样值 ——
+原实现用内置 ITM 解码器抽 DWT PC Sample，已随解码链移除。
+
+解码器移除**不影响**既有导出面（`CMSIS_DAP_*` / `DAP_*` / `RDDI_*` / `StreamingTrace_*` 未改名、未删除，
+当时仍为 79 个）；随后新增 orbtrace 配置 / raw trace 流 **12 个**导出
+（`OrbTrace_*` 7 + `TraceStream_*` 5，2026-10-08 落地；`TraceStream_DroppedBytes` 于 2026-10-13 补，
+导出面 79 → **91**，见 [`COMPAT_ANALYSIS.md` §二十三](COMPAT_ANALYSIS.md)）。
+
+### 代码覆盖率分析 / 符号解析（已从本层移除，2026-10-08）
+
+原 `ORBMDK_Coverage.*` / `ORBMDK_Symbols.*` 依赖 ETM 解码结果，随解码一起移出本层。
+覆盖率统计与符号解析属"分析"职责，应放在 AGDI 层或独立工具里，不放传输层。
 
 ## USB 传输实现
 
@@ -522,9 +450,9 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 
 **实现细节**：
 - 通过 ITM HW 包 (srcAddr=2) 接收 DWT PC Sample
-- ITM 解码器 (`ORBMDK_ITM_Decoder`) 解析 trace 数据
-- 支持睡眠状态检测 (0x00 = 睡眠)
-- 支持 1-4 字节 PC 值 (小端序)
+- ⚠ 2026-10-08 起**本层不再解码**：原 `ORBMDK_ITM_Decoder` 已随解码器一起移除；
+  `CMSIS_DAP_PC_*` 导出保留（ABI 兼容），但不再在本地抽出采样值。解码归 AGDI 层。
+- 采样值格式（供 AGDI 层参照）：1-4 字节小端 PC 值；单字节 `0x00` = 睡眠状态
 
 ---
 
@@ -537,32 +465,67 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - WinUSB (USB Bulk V2 传输)
 - SetupAPI
 
-### Trace 数据流
+### Trace 数据流（本层只搬运，不解码）
 
 ```
 目标 MCU
    │
-   ├── ITM ──────────┐
-   ├── ETM ──────────┼──→ TPIU ──→ SWO ──→ 主机
-   └── DWT ─────────┘
-                        │
-                        ▼
-                  USB HID/Bulk
-                        │
-                        ▼
-                  COBS 解码
-                        │
-                        ▼
-                  OFLOW 解码 (带时间戳)
-                        │
-                        ▼
-                  ITM/ETM/SWO 解码
-                        │
-                        ▼
-                  应用数据输出
+   ├── ITM ──┐
+   ├── ETM ──┼──→ TPIU ──→ SWO / 并行 Trace 口
+   └── DWT ──┘
+                          │
+                          ▼
+                  ORBTrace 探针（gateware）
+                          │
+   ┌──────────────────────┴─────────────────────────┐
+   │ CMSIS-DAP (SWD / JTAG)                          │ trace 端点 (bInterfaceSubClass = 0x54)
+   ▼                                                 ▼
+ORBMDK_HID.cpp / ORBMDK_USB_Bulk.cpp        ORBMDK_OrbTrace.cpp  ← 后台读线程 + 环形缓冲
+   │                                                 │
+   └──────────────────────┬──────────────────────────┘
+                          ▼
+              ORBMDK_RDDI.dll（只搬运，不解码）
+                          │
+   ┌──────────────────────┴─────────────────────────┐
+   │ DAP_* / CMSIS_DAP_* → 目标访问 / 断点 / 下载     │ TraceStream_Read         → raw 字节流
+   │                                                │ TraceStream_DroppedBytes → 丢帧字节数
+   └──────────────────────┬─────────────────────────┘
+                          ▼
+   AGDI 层（ORBAGDI）：COBS / OFLOW 解帧 + ITM / ETM / SWO 解码 → 应用数据输出
 ```
 
 ## 版本记录
+
+> 以下各条为**发布当时**的快照（导出数、模块清单以该条为准）；跨版本的最新口径见最新条目与正文。
+
+### 0.6.0（2026-10-14）—— 架构收敛：本层只做传输
+
+**架构**
+
+- 分层固定为：Keil µVision → AGDI（`CMSIS_AGDI.dll`）→ `ORBMDK_RDDI.dll` → 探针。
+  本层**只做传输**（USB HID / WinUSB Bulk + RDDI 接口）；全部 trace 解码器
+  （ITM / ETM / TPIU / Trace / OFLOW / COBS / Coverage / Symbols）已于 2026-10-08 移除，解码归 AGDI 层。
+- 传输层三分支收敛在 `src/ORBMDK_RDDI.cpp` 之下：
+  `ORBMDK_HID.cpp`（V1/HID）、`ORBMDK_USB_Bulk.cpp`（V2/Bulk）、`ORBMDK_OrbTrace.cpp`（trace 通路）。
+- `ORBMDK_OrbTrace.cpp`：orbtrace 复合设备的三个 vendor 接口由本层**统一管理**
+  （独立 WinUSB 句柄，与 DAP 句柄并存）；raw trace 走后台读线程 + 环形缓冲，AGDI 只取字节流。
+
+**接口**
+
+- 导出面 **79 → 91**：新增 `OrbTrace_*` 7 个 + `TraceStream_*` 5 个，其中 `TraceStream_DroppedBytes`
+  （环溢出丢帧字节数，2026-10-13 补）是"静默丢数据"的唯一出口。
+- 分类计数：RDDI 核心 3 / `DAP_*` 21 / `CMSIS_DAP_*` 35 / `CMSIS_DAP_PC_*` 6 /
+  `StreamingTrace_*` 13 / `OrbTrace_*`+`TraceStream_*` 12 / `RDDI_SetLogCallback` 1。
+
+**修复**
+
+- 传输层块传输响应长度校验（`src/ORBMDK_HID.cpp`，2026-10-13）：响应短于 `count` 个字时**报错**，
+  不再"拷多少算多少"；一并修掉 V2 侧 IN 读上限误用出包长度导致的"响应尾部混入上一条数据"。
+
+**兼容性**
+
+- 宿主：Keil µVision + 官方 `CMSIS_AGDI.dll` v1.33.24；探针固件：orbtrace 1.4.3。
+- 编译器：MSVC（x86，静态 CRT `/MT`），产物零运行库依赖。
 
 ### 0.5.0（2026-10-03）—— 首次文档化发版
 
@@ -580,7 +543,14 @@ echo 0 > %TEMP%\ORBMDK_LOG_LEVEL
 - `ORBMDK_RDDI_FullTest` 因**测试自身**常量陈旧，复现为 `22/20`（**发版阻塞**，§18.11）。
 - `Trace Enable` 走不通：探针固件 1.4.3 **无 SWO 命令族**（定性见 `bug.md` **B12**），需刷 1.4.4。
 - 多调试器并存时无法指定目标；设备拔出无探活。
-- 并列 Trace 端口 / ETB 在 AGDI v1.33.24 里**无代码路径**（建议结案）。
+- 并列 Trace 端口 / ETB 在**原厂** `CMSIS_AGDI.dll` v1.33.24 里**无代码路径**（建议结案）；
+  **自研 AGDI 层（ORBAGDI）已实现 ETB 采集**（`etb=1`，走 MEM-AP，不经本层）。
+  ETM/ETB 解码不属本层，见 `COMPAT_ANALYSIS.md` §17.9(9)。
+- **本层已移除全部 trace 解码器**（ITM/ETM/TPIU/Trace/OFLOW/COBS/Coverage/Symbols，
+  2026-10-08），只做 HID/WinUSB 传输 + RDDI 接口；导出面 **79 个未变**。
+  显示名（厂商/产品）改为**优先用设备自报串**（HID 产品串 / Bulk 接口串 / `DAP_Info(0x01/0x02)`），
+  问不到才回落 `ORBMDK.h` 的 `ORBMDK_DEVICE_VENDOR` / `ORBMDK_DEVICE_PRODUCT` ——
+  接其他厂商探针显示名自动跟随（识别本就按能力特征，与 VID/PID 无关）。
 
 **兼容性**
 

@@ -6,7 +6,9 @@
  * debuggers using CMSIS-DAP protocol over USB HID.
  *
  * Architecture:
- *   Keil uVision (AGDI) -> ORBMDK_AGDI -> ORBMDK_RDDI -> USB HID -> ORBTrace
+ *   Keil uVision -> AGDI (CMSIS_AGDI.dll) -> ORBMDK_RDDI -> USB -> ORBTrace
+ *                                          -> HID(V1) / WinUSB Bulk(V2) / orbtrace trace 端点
+ *   本层只做传输（配置 + 搬运，交 raw 字节）：trace 解码归 AGDI 层。
  */
 
 #pragma once
@@ -27,16 +29,16 @@
 #define ORBMDK_INTERNAL                 // 静态库或直接包含时不导出
 #endif
 
-// Version info —— 驱动自身发版号（0.5.0）
+// Version info —— 驱动自身发版号（0.6.0）
 //
 // ⚠ 与下面"上报给宿主的版本串"（Identify(idNo=4) / DAP_Info 那条）**是两回事**：
 //   那条是 **CMSIS-DAP 协议版本**，主版本经归一化**抬到 >= 2**（§17.5/§17.6 的那道门控，
 //   2026-10-01 放开，见 Todo.md.bak §18.10-C），**不要**与本版本号联动。
 //   本版本号只经 ORBMDK_GetVersionString() / ORBMDK_GetVersion() 暴露，AGDI 不使用。
 #define ORBMDK_VERSION_MAJOR  0
-#define ORBMDK_VERSION_MINOR  5
+#define ORBMDK_VERSION_MINOR  6
 #define ORBMDK_VERSION_PATCH  0
-#define ORBMDK_VERSION_STRING "0.5.0"
+#define ORBMDK_VERSION_STRING "0.6.0"
 
 // ----------------------------------------------------------------------------
 // 上报给宿主的版本串（Identify(idNo=4) / DAP_Info）
@@ -130,6 +132,18 @@ static inline void ORBMDK_NormalizeProtocolVersion(const char* raw, char* out, s
     X(0xC251) /* Keil             */       \
     X(0x1366) /* Segger           */       \
     X(0x0483) /* ST               */
+
+// ----------------------------------------------------------------------------
+// 设备品牌串 —— **只用于显示名 / 兜底身份，不参与设备识别**
+//
+// 识别一律按能力特征（接口类 0xFF + Bulk 对 / UsagePage 0xFF00 + DAP_Info 应答），
+// VID/PID 表只决定优先级（见上）。所以接入**其他厂商**的 CMSIS-DAP / trace 探针
+// 无需改任何代码；下面这组串仅在"问不到设备"时兜底。
+//
+// ⚠ 想换品牌：只改这里一处，**不要**在别处再写字面量（历史上有 6 处散落）。
+// ----------------------------------------------------------------------------
+#define ORBMDK_DEVICE_VENDOR   "ORBTrace"
+#define ORBMDK_DEVICE_PRODUCT  "ORBTrace CMSIS-DAP"
 
 struct ORBMDK_VidPidPair { uint16_t vid; uint16_t pid; };
 

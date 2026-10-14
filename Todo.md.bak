@@ -581,3 +581,6 @@ Keil 独有，ORBTrace 用不到 —— 不实现。
 - [x] 18.3 日志模块统一（§8）—— 2026-09-30 完成（单实现 + 会话分隔标记）
 - [x] 18.4 状态 LED 实机确认（§11.2）—— 2026-10-01 完成
 - [x] 18.9 JTAG 通路打通（§18.9 第九步）—— 2026-09-30 完成（扫链 + DP/AP 访问均通）
+- [x] 18.11 `DAP_REG_*` 常量与 `rddi_dap.h` 编号语义不符 —— 2026-10-10 完成
+      （`include/ORBMDK_RDDI.h` 枚举按 ARM `rddi_dap.h` 改回 0..7 编号，见 `COMPAT_ANALYSIS.md` §4.9；
+      `ORBMDK_RDDI_FullTest` 在 QM-Link + Cortex-M4 上复现 `PASSED 37 / FAILED 0 / NOT IMPLEMENTED 3`）

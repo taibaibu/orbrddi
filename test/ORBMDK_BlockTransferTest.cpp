@@ -78,10 +78,11 @@ typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
  *     DAP_REG_AP_0xC = 7  -> AP DRW
  *     DAP_REG_RnW    = 0x10000
  *
- * Careful: the same-named enum in ORBMDK_RDDI.h uses byte offsets
- * (e.g. DAP_REG_AP_DRW = 0x0C), which do NOT match the low-16-bit decoding
- * convention of GetRegId() in ORBMDK_RDDI.cpp. This test passes the official
- * ARM IDs.
+ * 这些值与 include/ORBMDK_RDDI.h 的 DAP_REG_* 现已一致 —— 该枚举早前误写成
+ * "字节偏移 + AP 恒带 RnW"（DAP_REG_AP_DRW = 0x0C 等），与 GetRegId() 的低 16 位
+ * 解码不符，已于 2026-10-10 按 ARM rddi_dap.h 修正
+ * （见 COMPAT_ANALYSIS.md §4.9 / Todo.md §18.11）。
+ * 本文件保留自带定义，以免测试与头文件耦合。
  * -------------------------------------------------------------------------- */
 #define RID_DP_CTRLSTAT 1
 #define RID_DP_SELECT   2
@@ -95,7 +96,7 @@ typedef int (*PFN_DAP_RegWriteRepeat)(RDDIHandle, int, int, int, const int*);
 #define CSW_32BIT_INC   0x23000052
 
 #define GUARD_WORDS     8
-#define MAX_WORDS       64
+#define MAX_WORDS       4096    /* must cover the TAR auto-increment block probe */
 #define CANARY          0xA5A5A5A5u
 
 static int g_Passed = 0;
@@ -357,6 +358,35 @@ static double RunRound(const char* tag, uint32_t addr,
     bool ok = (cst == RDDI_SUCCESS && cconn == RDDI_SUCCESS && conn == RDDI_SUCCESS && powered);
 
     if (ok) {
+        /* ------------------------------------------------------------------
+         * TAR auto-increment block size.
+         *
+         * RunCase arms TAR ONCE and then issues a single DAP_RegWriteRepeat for
+         * n words, so the pattern is written through the AP's auto-increment
+         * with nothing re-arming it.  The AP only guarantees the increment over
+         * a limited address block (OpenOCD: "requires at least 10 bits used for
+         * TAR autoincrement"), and past that it wraps back to the block start -
+         * silently, with every call reporting success.  The pattern is
+         * 0x10000000+i, so the FIRST index that does not match IS the wrap
+         * point, i.e. the block size in words.
+         *
+         * Why it matters: Dap::MemBulk re-arms TAR every 1 KB (256 words), and
+         * the AGDI flash path is documented as issuing 1024-word calls
+         * (bug.md B7 - "one AGDI call is 4096 B, 9 x 126 B").  If the block is
+         * 256 words, the former sits exactly on the edge and the latter crosses
+         * it four times.
+         * ------------------------------------------------------------------ */
+        static const int blockProbe[] = { 256, 512, 768, 1024, 1025, 2048, 4096 };
+        printf("\n  ---- TAR auto-increment block probe (write side) ----\n");
+        printf("       first mismatch index = block size in words\n");
+        for (int i = 0; i < (int)(sizeof(blockProbe) / sizeof(blockProbe[0])); ++i) {
+            const double us = RunCase(a, h, addr, blockProbe[i], false);
+            if (us >= 0.0) {
+                printf("       n=%-5d no wrap up to here (%d words = %d B)\n",
+                       blockProbe[i], blockProbe[i], blockProbe[i] * 4);
+            }
+        }
+
         for (int i = 0; i < nSizes; i++) {
             const double us = RunCase(a, h, addr, sizes[i], true);
             if (us < 0) {

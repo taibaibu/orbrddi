@@ -182,8 +182,15 @@ static bool _hidReportLayout(PHIDP_PREPARSED_DATA pp, HIDP_REPORT_TYPE type,
         std::vector<HIDP_BUTTON_CAPS> caps(numButtonCaps);
         USHORT n = numButtonCaps;
         if (HidP_GetButtonCaps(type, caps.data(), &n, pp) == HIDP_STATUS_SUCCESS && n > 0) {
+            // 按钮每位 1 bit，位数 = 本报告里的按钮个数。
+            // ⚠ 不直接用 HIDP_BUTTON_CAPS::ReportCount：该成员只在较新的 SDK 里有，
+            //   10.0.17763 的 hidpi.h 此结构只有 Reserved[10]（无 BitSize/ReportCount）。
+            //   按 Usage 范围自行推导，跨 SDK 都能编译。
+            const USHORT btnCount = caps[0].IsRange
+                ? (USHORT)(caps[0].Range.UsageMax - caps[0].Range.UsageMin + 1)
+                : (USHORT)1;
             *reportId = caps[0].ReportID;
-            *payloadLen = (uint16_t)((caps[0].ReportCount + 7) / 8);
+            *payloadLen = (uint16_t)((btnCount + 7) / 8);
         }
     }
     return *payloadLen != 0;
@@ -239,26 +246,35 @@ static bool _hidProbeReportPlan(HANDLE hDevice, HidReportPlan* plan, bool quiet)
         return false;
     }
 
-    // 报告ID前缀：ID 非 0 必有；ID 为 0 时按"声明长度 == 负载+1"判定（0x00 也占一字节）
+    // 报告ID前缀：ID 非 0 必有；ID 为 0 时按"声明长度 != caps 负载"判定
+    // （声明比 caps 负载大 1 -> 前缀占 1 字节；两者相等 -> 无前缀）。
+    //
+    // ⚠ 不能直接采信 caps 推导的 payload：**数组型(Array)输出**描述符会被 HidP 报成
+    //    按钮 cap（Usage 范围 = 元素个数），而按钮分支按"每按钮 1 bit"折算，于是
+    //    64 个 8-bit 数组元素被算成 8 字节（实测 QM-Link CMSIS-DAP：OUT=65 却算出 8，
+    //    随后 WriteFile 被驱动以 err=87 拒收，整条链路全挂）。
+    //    声明长度 declared 才是驱动强制的写长度，故一律以它反推负载：
+    //      有报告ID前缀 -> payload = declared - 1；无 -> payload = declared。
     plan->reportId   = rid;
-    plan->payloadMax = payload;
-    plan->payloadOff = (rid != 0 || declared == payload + 1) ? 1 : 0;
-    plan->writeLen   = (uint16_t)(payload + plan->payloadOff);
+    plan->payloadOff = (rid != 0 || declared != payload) ? 1 : 0;
+    plan->writeLen   = declared;
+    plan->payloadMax = (declared > plan->payloadOff) ? (size_t)(declared - plan->payloadOff) : 0;
 
-    // IN 方向是否带报告ID前缀（决定响应要不要补占位字节）
+    // IN 方向是否带报告ID前缀（决定响应要不要补占位字节）。
+    // 判据同 OUT：caps 负载可能因数组型描述符偏小，故用"声明长度 != caps 负载"。
     uint8_t  inRid = 0;
     uint16_t inPayload = 0;
     const bool inOk = _hidReportLayout(pp, HidP_Input, caps.NumberInputValueCaps,
                                        caps.NumberInputButtonCaps, &inRid, &inPayload);
-    plan->readHasPrefix = inOk && (inRid != 0 || caps.InputReportByteLength == inPayload + 1);
+    plan->readHasPrefix = inOk && (inRid != 0 || caps.InputReportByteLength != inPayload);
 
     HidD_FreePreparsedData(pp);
 
-    if (plan->writeLen != declared) {
+    if (payload + plan->payloadOff != declared) {
         if (!quiet) {
-            LOG_HID_WARN("HID 报告长度与声明不符：负载 %u + 前缀 %zu = %u，声明 %u",
-                         (unsigned)payload, plan->payloadOff, (unsigned)plan->writeLen,
-                         (unsigned)declared);
+            LOG_HID_WARN("HID 报告负载以声明长度为准：caps 算出 %u，声明 %u -> 负载 %zu（前缀 %zu）",
+                         (unsigned)payload, (unsigned)declared,
+                         plan->payloadMax, plan->payloadOff);
         }
     }
 
@@ -547,7 +563,7 @@ static bool ReadDeviceInfo(HANDLE hDevice)
     if (HidD_GetProductString(hDevice, productBuffer, sizeof(productBuffer))) {
         WideCharToMultiByte(CP_ACP, 0, productBuffer, -1, g_productName, sizeof(g_productName), nullptr, nullptr);
     } else {
-        strcpy_s(g_productName, "ORBTrace");
+        strcpy_s(g_productName, ORBMDK_DEVICE_VENDOR);
     }
 
     wchar_t serialBuffer[256] = {};
@@ -1638,15 +1654,22 @@ int DAP_TransferBlock(int dapId, uint16_t count, uint8_t request,
         return DAP_RES_ERROR;
     }
 
-    if (readData && respLen > 5) {
+    if (readData) {
+        // 响应必须装得下 count 个字。**短了要报错，不能"拷多少算多少"** ——
+        // 那样调用方拿到的是"新数据 + 它缓冲区里的旧值"的混合，是最难查的一类静默错误
+        // （2026-10-13：V2 侧 IN 读上限误用出包长度，症状就是每 16 字节里有 3 字节
+        //   是上一条响应的尾巴）。
+        const size_t need = 5u + static_cast<size_t>(count) * 4u;
+        if (respLen < need) {
+            LOG_HID_ERROR("DAP_TransferBlock: short response (got %zu byte(s), "
+                          "need %zu for %u word(s))",
+                          respLen, need, static_cast<unsigned>(count));
+            return DAP_RES_ERROR;
+        }
         // 必须按**请求的字数**截断：HID 每次返回整个报告（64/65 字节），
         // (respLen-5)/4 可能比 count 多 1 个字，直接按响应长度 memcpy
         // 会越界写调用方的缓冲区（历史上正是这里踩坏了 AGDI 的数据）。
-        size_t availWords = (respLen - 5) / 4;
-        if (availWords > count) {
-            availWords = count;
-        }
-        memcpy(readData, &resp[5], availWords * 4);
+        memcpy(readData, &resp[5], static_cast<size_t>(count) * 4u);
     }
 
     return status;
@@ -1862,8 +1885,30 @@ int DAP_SWO_Baudrate(uint32_t baudrate)
     uint8_t resp[4] = {};
     size_t respLen = sizeof(resp);
     int result = ORBMDK_HID_DAPCommand(cmd, sizeof(cmd), resp, &respLen, ORBMDK_TIMEOUT_CMD_MS);
-    if (result != 0 || respLen < 3) return -1;
-    return resp[2] == 0 ? 0 : -1;
+
+    // 失败必须留原始证据。上层（AGDI）只看到 `CMSIS_DAP_SWO_Baudrate` 返回
+    // `RDDI_DAP_ERROR`(0x2000) —— 一个通用码，**分不开**下面三种成因：
+    //   * 传输层失败（result != 0，比如命令根本没发出去）
+    //   * 响应太短（respLen < 3，协议/固件对不上）
+    //   * 探针明确拒绝（resp[2] = DAP_ERROR）
+    // 而这三者要往完全不同的方向查。实测症状：AGDI 的 SWO 波特率阶梯从 2 MHz
+    // 一路试到 125 kHz 全被拒，日志里只有 `rc=8192`，看不出是哪一种。
+    //
+    // 用 ERROR 级：本层默认日志级别就是 ERROR（见 ORBMDK_Log.cpp），WARN 会被
+    // 静默丢掉，而这条恰恰是"SWO 为什么起不来"的唯一线索。
+    if (result != 0 || respLen < 3) {
+        LOG_HID_ERROR("DAP_SWO_Baudrate(%u): 传输层失败 result=%d respLen=%zu "
+                      "resp=[%02X %02X %02X %02X]",
+                      baudrate, result, respLen, resp[0], resp[1], resp[2], resp[3]);
+        return -1;
+    }
+    if (resp[2] != 0) {
+        LOG_HID_ERROR("DAP_SWO_Baudrate(%u): 探针返回 status=%u，原始响应 "
+                      "[%02X %02X %02X %02X] len=%zu",
+                      baudrate, resp[2], resp[0], resp[1], resp[2], resp[3], respLen);
+        return -1;
+    }
+    return 0;
 }
 
 int DAP_SWO_Control(uint8_t control, uint8_t* status)

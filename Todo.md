@@ -1,21 +1,26 @@
+<h1 style="color:red">🔴🔴🔴 最高警告（MAX） 🔴🔴🔴</h1>
+
+<h1 style="color:red">任何偏离 <code>&lt;ORBAGDI 源码树&gt;\AGDI\DbgCM</code> 实现方法的实现皆为风险。</h1>
+
+<h1 style="color:red">PDSC 是 KEIL 核心流程，严禁硬编码，软开关；功能应做就做，行到行兼容。</h1>
+
+---
 # ORBMDK 待办
 
 **本文件只列未完成项。** 已完成的改动、核查结论、实现细节一律不写入 ——
 实现细节/排查笔记 → **`bug.md`**；AGDI 逆向与 ABI 结论 → **`COMPAT_ANALYSIS.md`**；代码内注释就地说明。
 
-> 当前版本 **0.5.0**（2026-10-03）。
+> 当前版本 **0.6.0**（2026-10-14）。
 > 条目标签 `18.x` 沿用历史编号，与 `Todo.md.bak` 及 `COMPAT_ANALYSIS.md` 的旧引用一一对应，便于交叉检索；
-> 已决"**不做**"（18.7a / 18.7b）与**已完成**（18.2 / 18.3 / 18.4 / 18.6 / 18.9 / 18.15）条目仍留在 `Todo.md.bak`。
-
-## 发版阻塞（0.5.0）
-
-- [ ] **18.11 测试程序 `DAP_REG_*` 常量与 `rddi_dap.h` 编号语义不符**：`test/ORBMDK_RDDI_FullTest.cpp`
-      仍按旧编号声明，导致 `ORBMDK_RDDI_FullTest` 由 **40/40 退化为 `PASSED 22 / FAILED 20`**
-      （`COMPAT_ANALYSIS.md` §一 / §13.5）。**是测试自身的问题，不是驱动回归** —— 但发版前必须修好，
-      否则 README"验证"一节的 40/40 无法复现。
+> 已决"**不做**"（18.7a / 18.7b）与**已完成**（18.2 / 18.3 / 18.4 / 18.6 / 18.9 / 18.11 / 18.15）条目仍留在 `Todo.md.bak`。
+>
+> **发版阻塞：无**（原唯一阻塞项 18.11 已于 2026-10-10 结案，留档见 `Todo.md.bak` 的"✅ 已完成"）。
 
 ## 3. 其它待办
 
+- [ ] **T6（2026-10-14）orbtrace 通路实机验证**：接口分类（`0x50`/`0x54`/`0x56`）、vendor 控制请求、
+  端点选择均按 orbuculum 源码逐条对齐，但本机无 orbtrace + 目标板，**从未跑过**
+  （`COMPAT_ANALYSIS.md` §二十三 末节）。
 - [ ] **18.1 多台调试器同时插入时无法指定用哪一台**：枚举到多个候选时按固定顺序取第一个，
       无 UI / 参数可选（详见 `Todo.md.bak` §18.1）。
 - [ ] **18.14 设备拔出后适配器下拉框仍显示**：`IsConnected` 无拔出探活（无热插拔通知）。
@@ -77,8 +82,23 @@
       （1.4.4 的 SWO 实装质量未经验证）与 `0x7f` 原子命令。
       参考：1.4.3↔1.4.4 命令层差异清单见 `bug.md` B10-D；门控返工记录（V2 下 `productName` 取到的是
       Bulk 接口名 `CMSIS-DAP v2`，身份判据只能靠 VID/PID）见 B12 末节。
-- [ ] **T2（建议结案）**：ETM / 并口 / ETB —— §17.9(8.2) 已证明 AGDI 侧连配置串模板都不存在，
-      RDDI 层再补也无处挂载。除非换 AGDI 版本或自研上游，不建议立项。
+- [x] **T2（已结案）**：ETM / 并口 / ETB —— 本层不做、也不参与（§17.9(8.2) 已证明原厂 AGDI
+      侧连配置串模板都不存在）。自研 AGDI 层（ORBAGDI）已实现 ETB 采集，见其
+      `COMPAT_ANALYSIS.md` §8 / `bug.md` §H。
+- [x] **T3（分层定论，2026-10-08）**：本层只做传输（HID/WinUSB + RDDI 接口），
+      **trace 解码不属本层**；原八个解码器模块已全部删除（`COMPAT_ANALYSIS.md` §二十二）。
+      导出面 79 个未变（后由 T4 增至 91）。
+- [x] **T4（2026-10-08，已实现 / 未实机验证）**：orbtrace 配置 + raw trace 流已落地 ——
+      新增 `ORBMDK_OrbTrace.h/cpp`（设备 / 接口发现 + 控制请求 + raw 读）与 **12 个导出**
+      （`OrbTrace_*` 7 个 + `TraceStream_*` 5 个），导出面 79 → **91**。
+      **USB 由本层统一管理**，AGDI 只取 raw 字节流。设计见 `COMPAT_ANALYSIS.md` **§二十三**。
+- [x] **T4b（2026-10-13，补）**：新增 `TraceStream_DroppedBytes` —— 环溢出丢帧字节数
+      （`ORBMDK_OrbTrace_GetDropped`，`TracePipe::dropped`）。**"静默丢数据"的唯一出口**：
+      原先只在关流时打一行日志，AGDI 层看不到，字节数偏少时分不出"探针没发"和"环满丢了"。
+      导出面 90 → **91**（`pe_re.py exports` 复核）。消费方 = ORBAGDI 的 P0-C。
+- [x] **T5（2026-10-14 结案：不做）**：OFLOW / COBS **解帧** —— 定稿归 AGDI 层
+      （`COMPAT_ANALYSIS.md` §23.3）：本层交 raw USB 字节，帧同步与 tag/sum 校验由 AGDI 侧做，
+      同一帧格式不在两处各留一份实现。若日后确需本层解帧，按 §23.2 补 COBS + tag/sum 即可。
 - **已放开（2026-10-01）**：**18.10-B / 18.10-C**「SWO 流式（上报版本主版本抬到 ≥ 2 + caps `0x40`）」
   —— **代码已放开两道门控**（`include/ORBMDK.h` 的归一化 + `CMSIS_DAP_Capabilities` 按 `probeCaps` 收口）。
   完整方案与一键回退步骤见 `Todo.md.bak` §18.10-B / §18.10-C。
