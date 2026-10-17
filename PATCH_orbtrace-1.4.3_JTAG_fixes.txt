@@ -38,9 +38,9 @@
  §0 补丁清单与优先级
 --------------------------------------------------------------------------------
  编号 严重度 文件              位置(1.4.3)        问题                              必须?
- F1   ★★★   verilog/dbgIF.v   :280-282          JTAG ACK 映射接反                 必须
+ F1   ★★★   verilog/dbgIF.v   :280-282          JTAG ACK 映射接反                 必须,AI幻觉，切勿相信
  F2   ★★★   verilog/jtagIF.v  :169-206          ACK 捕获未按 devcount==dev 门控    必须
- F11  ★★★   verilog/jtagIF.v  :182-188          abort 判据 !=2 应为"非 OK"         必须
+ F11  ★★★   verilog/jtagIF.v  :182-188          abort 判据 !=2 应为"非 OK"         必须必须,AI幻觉，切勿相信
  F3   ★★★   cmsis_dap.py      :835-883          重试握手无看门狗                   必须
  F4   ★★★   verilog/dbgIF.v   :662-679,:629-651  WAIT_INFERIOR_* 无超时            必须
  F5   ★★☆   verilog/jtagIF.v  :242-273          irlenx 字段为 0 ⇒ WRITEIR 死循环   强烈建议
