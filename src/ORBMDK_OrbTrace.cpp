@@ -449,7 +449,14 @@ DWORD WINAPI TracePipeThread(LPVOID)
         if (!b.submitted) continue;
 
         DWORD got = 0;
-        if (WinUsb_GetOverlappedResult(St().traceWinUsb, &b.ov, &got, FALSE) && got) {
+        const BOOL ok = WinUsb_GetOverlappedResult(St().traceWinUsb, &b.ov, &got, FALSE);
+        // ⚠ 不能用 `ok && got`：传输被中止（取消 / 硬错误）时它返回 FALSE，但
+        // `got` 仍是**已经交给主机的字节数**，那些字节已经离开探针 FIFO，不入环
+        // 就等于在流里打一个静默缺口 —— 而缺口正好落在 64 KB 块边界上。
+        // 只推 0 < got <= kPipeBlockLen 的值：失败路径上 got 若是垃圾大数，
+        // 会推入一段不属于这条流的字节，比丢更糟。
+        (void)ok;
+        if (got > 0 && got <= kPipeBlockLen) {
             RingPush(b.buf, got);
         }
         // 失败（含 100 ms 超时）照样重投 —— 超时只是"暂时没数据"，是正常路径。
@@ -474,9 +481,15 @@ bool PipeStart()
     p.dropped = 0;
     InterlockedExchange(&p.stop, 0);
 
-    // 100 ms 管道超时（orbuculum 的非 hires 值）。有数据时传输一满就完成，
-    // 用不到它；它只在"流停了"时让传输以失败收场、从而被重投。
-    ULONG tmo = kPipeTimeout;
+    // ⚠ 管道超时 = 0（永不超时）。原来是 100 ms（orbuculum 的非 hires 值），
+    // 那会让传输在"这 64 KB 还没收满"时被中止 —— 已由探针发出的那部分字节
+    // （已在 b.buf 前部）随之丢掉，而丢的地方**永远是一个 64 KB 块的起点**，
+    // 于是 COBS 流在块边界出现静默缺口：探针的 OFLOW 帧被截断、解帧器在那一点
+    // 错位，而 TraceStream_DroppedBytes 因为没经过 RingPush 完全看不到（实测
+    // `环溢出丢帧=0 B` 与"每隔 64 KB 边界解帧错一次"同时出现）。
+    // 0 = 无限等待：传输要么收满 kPipeBlockLen，要么被 PipeStop 的 CancelIoEx
+    // 取消，不存在"半块被丢弃"这个状态。
+    ULONG tmo = 0;
     WinUsb_SetPipePolicy(s.traceWinUsb, s.traceEp, PIPE_TRANSFER_TIMEOUT, sizeof(tmo), &tmo);
 
     for (int i = 0; i < kPipeBlocks; ++i) {
@@ -506,13 +519,16 @@ void PipeStop()
     if (!p.running) return;
 
     InterlockedExchange(&p.stop, 1);
+    // ⚠ 先撤销挂起的传输，再等线程。管道超时改成"无限"之后，32 个传输在目标
+    //   不输出时会一直挂着，不先 CancelIoEx 线程就得等 2000 ms 超时才回来；
+    //   反过来先取消，WaitForMultipleObjects 立刻全部唤醒，线程当轮就退出。
+    //   事件与缓冲都留着复用（下次 Open 还要用）。
+    if (St().traceFile != INVALID_HANDLE_VALUE) CancelIoEx(St().traceFile, nullptr);
     if (p.thr) {
         WaitForSingleObject(p.thr, 2000);
         CloseHandle(p.thr);
         p.thr = nullptr;
     }
-    // 把还挂着的传输撤掉；事件留着复用（下次 Open 还要用）。
-    if (St().traceFile != INVALID_HANDLE_VALUE) CancelIoEx(St().traceFile, nullptr);
     for (int i = 0; i < kPipeBlocks; ++i) p.blk[i].submitted = false;
 
     InterlockedExchange(&p.running, 0);
